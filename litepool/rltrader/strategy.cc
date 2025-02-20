@@ -37,7 +37,7 @@ void Strategy::quote(int buy_spread, int sell_spread, int buy_percent, int sell_
 
 	double buy_volume = initBalance * buy_percent / buy_denom;
 	double sell_volume = initBalance * sell_percent / sell_denom;
-        int skew = static_cast<int>(leverage);
+        int skew = static_cast<int>(2.0 * leverage);
         buy_spread = std::max(0, buy_spread + skew);
         sell_spread = std::max(0, sell_spread - skew);
         

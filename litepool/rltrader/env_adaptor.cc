@@ -14,8 +14,8 @@ EnvAdaptor::EnvAdaptor(Strategy& strat, BaseExchange& exch):
 }
 
 bool EnvAdaptor::next() {
-    std::fill_n(state.begin(), 196, 0);
-    for (int ii=0; ii < 2; ++ii) {
+    std::fill_n(state.begin(), 490, 0);
+    for (int ii=0; ii < 5; ++ii) {
         OrderBook book;
         size_t read_slot;
         if(this->exchange.next_read(read_slot, book)) {
@@ -37,7 +37,7 @@ bool EnvAdaptor::next() {
     return true;
 }
 
-void EnvAdaptor::getState(std::array<double, 196>& st) {
+void EnvAdaptor::getState(std::array<double, 490>& st) {
     st = state;
 }
 
@@ -56,7 +56,7 @@ void EnvAdaptor::reset() {
     auto trade_ptr = std::make_unique<TradeSignalBuilder>();
     trade_builder = std::move(trade_ptr);
     this->strategy.reset();
-    std::fill_n(state.begin(), 196, 0);
+    std::fill_n(state.begin(), 490, 0);
 }
 
 

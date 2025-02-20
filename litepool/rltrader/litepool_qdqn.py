@@ -66,7 +66,7 @@ class LSTMFeatureExtractor(BaseFeaturesExtractor):
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         lstm_input = observations  
         batch_size = observations.shape[0]
-        lstm_input = lstm_input.view(batch_size, 2, 98)  
+        lstm_input = lstm_input.view(batch_size, 5, 98)  
         if self.hidden is None or lstm_input.shape[0] != self.hidden[0].shape[1]:
             self.hidden = (
                 torch.zeros(1, batch_size, self.lstm_hidden_size).to(observations.device),
@@ -143,11 +143,11 @@ env = litepool.make("RlTrader-v0", env_type="gymnasium",
                           symbol="BTC-PERPETUAL",
                           tick_size=0.5,
                           min_amount=10,
-                          maker_fee=0.0000,
+                          maker_fee=-0.0001,
                           taker_fee=0.0005,
                           foldername="./train_files/", 
                           balance=0.01,
-                          start=100000,
+                          start=20000,
                           max=360001)
 
 env.spec.id = 'RlTrader-v0'
@@ -174,5 +174,5 @@ if os.path.exists("litepool_qrdqn.zip"):
     print("QRDQN saved model loaded")
 else:
     model = QRDQN("MlpPolicy", env, train_freq=32, batch_size=64, target_update_interval=1000, policy_kwargs=policy_kwargs, verbose=1)
-model.learn(300000000, callback=ResetHiddenStateCallback())
+model.learn(30000000, callback=ResetHiddenStateCallback())
 model.save("litepool_qrdqn")

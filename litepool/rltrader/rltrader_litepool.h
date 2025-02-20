@@ -56,7 +56,7 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) StateSpec(const Config& conf) {
-    return MakeDict("obs"_.Bind(Spec<double>({196})),
+    return MakeDict("obs"_.Bind(Spec<double>({490})),
                     "info:mid_price"_.Bind(Spec<double>({-1})),
                     "info:balance"_.Bind(Spec<double>({-1})),
                     "info:unrealized_pnl"_.Bind(Spec<double>({-1})),
@@ -82,7 +82,7 @@ using RlTraderEnvSpec = EnvSpec<RlTraderEnvFns>;
 
 class RlTraderEnv : public Env<RlTraderEnvSpec> {
  protected:
-  int spreads[4] = {0, 2, 4, 10};
+  int spreads[4] = {0, 1, 3, 8};
   int state_{0};
   bool isDone = true;
   bool is_prod = false;
@@ -99,7 +99,6 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   int start_read = 0;
   int max_read = 0;
   long long steps = 0;
-  double previous_buy_sell_diff = 0;
   double previous_rpnl = 0;
   double previous_upnl = 0;
   double previous_fees = 0;
@@ -152,7 +151,6 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
 
   void Reset() override {
     steps = 0;
-    previous_buy_sell_diff = 0;
     previous_rpnl = 0;
     previous_upnl = 0;
     previous_fees = 0;
@@ -167,7 +165,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
       auto sell_action = action % 4;
       auto buy_spread = spreads[buy_action];
       auto sell_spread = spreads[sell_action];
-      int base_vol = 2;
+      int base_vol = 5;
       adaptor_ptr->quote(buy_spread, sell_spread, base_vol, base_vol);
       isDone = !adaptor_ptr->next();
       ++steps;
@@ -175,12 +173,12 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   }
 
   void WriteState() {
-    std::array<double, 196> data;
+    std::array<double, 490> data;
     adaptor_ptr->getState(data);
     State state = Allocate(1);
 
     if (!isDone) {
-      assert(data.size() == 98*2);
+      assert(data.size() == 98*5);
     }
     
     std::unordered_map<std::string, double> info;
@@ -198,17 +196,6 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     auto pnl = info["realized_pnl"] - previous_rpnl; 
     auto upnl = info["unrealized_pnl"]- previous_upnl;
     state["reward"_] = (previous_fees - info["fees"]); + pnl + upnl;
-
-    auto buy_sell_diff = 0.0;
-
-    if (info["leverage"] > 0) {
-	buy_sell_diff = (info["curr_price"] - info["avg_buy_price"]) / info["curr_price"];
-    } else if (info["leverage"] < 0) {
-	buy_sell_diff = (info["avg_sell_price"] - info["curr_price"]) / info["curr_price"];
-    } else { buy_sell_diff = 0; }
-
-    state["reward"_] += buy_sell_diff - previous_buy_sell_diff;
-    previous_buy_sell_diff = buy_sell_diff;
     previous_rpnl = info["realized_pnl"];
     previous_upnl = info["unrealized_pnl"];
     previous_fees = info["fees"];
