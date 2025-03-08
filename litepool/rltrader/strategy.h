@@ -13,7 +13,7 @@ namespace RLTrader {
 			
 		void reset();
 
-		void quote(int buy_spread, int sell_spread, int buy_percent, int sell_percent,
+		void quote(int buy_spread, int sell_spread, const double& buy_percent, const double& sell_percent,
 		           FixedVector<double, 20>& bid_prices, FixedVector<double, 20>& ask_prices);
 
 		Position& getPosition() { return position; }

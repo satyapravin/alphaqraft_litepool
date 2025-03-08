@@ -280,7 +280,10 @@ void DeribitClient::place_order(const std::string& side,
                               double size,
                               const std::string& label,
                               const std::string& type) {
-    if (!trading_connected_) return;
+    if (!trading_connected_) {
+	    std::cout << "disconnected deribit markets!" << std::endl;
+	    return;
+    }
     
     json order_msg = {
         {"jsonrpc", "2.0"},

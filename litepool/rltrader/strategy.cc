@@ -21,13 +21,13 @@ void Strategy::reset() {
 	double initQty = 0;
 	double avgPrice = 0;
 	this->exchange.fetchPosition(initQty, avgPrice);
-        //std::cout << "initial quantity=" << initQty << std::endl;
-        //std::cout << "initial price=" << avgPrice << std::endl;
+        std::cout << "initial quantity=" << initQty << std::endl;
+        std::cout << "initial price=" << avgPrice << std::endl;
 	this->position.reset(initQty, avgPrice);
 	this->order_id = 0;
 }
 
-void Strategy::quote(int buy_spread, int sell_spread, int buy_percent, int sell_percent,
+void Strategy::quote(int buy_spread, int sell_spread, const double& buy_percent, const double& sell_percent,
                      FixedVector<double, 20>& bid_prices, FixedVector<double, 20>& ask_prices) {
 	auto posInfo = position.getPositionInfo(bid_prices[0], ask_prices[0]);
 	auto leverage = posInfo.leverage;
@@ -37,7 +37,7 @@ void Strategy::quote(int buy_spread, int sell_spread, int buy_percent, int sell_
 
 	double buy_volume = initBalance * buy_percent / buy_denom;
 	double sell_volume = initBalance * sell_percent / sell_denom;
-        int skew = static_cast<int>(2.0 * leverage);
+        int skew = static_cast<int>(leverage);
         buy_spread = std::max(0, buy_spread + skew);
         sell_spread = std::max(0, sell_spread - skew);
         
@@ -51,10 +51,11 @@ void Strategy::quote(int buy_spread, int sell_spread, int buy_percent, int sell_
 
 void Strategy::sendGrid(int levels, int start_level, const double& amount,
 	                    OrderSide side, FixedVector<double, 20>& refPrices) {
+	int spreads[4] = {0, 2, 4, 10};
         for (int ii = 0; ii < levels; ++ii) {
 	     auto trade_amount = instrument.getTradeAmount(amount, refPrices[0]);
              if (trade_amount >= instrument.getMinAmount()) {
-             	this->exchange.quote(std::to_string(++order_id), side, refPrices[ii + start_level], trade_amount);
+             	this->exchange.quote(std::to_string(++order_id), side, refPrices[ii + start_level + spreads[ii]], trade_amount);
              }
         }
 }

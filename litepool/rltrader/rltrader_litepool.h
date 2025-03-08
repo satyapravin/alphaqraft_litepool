@@ -72,8 +72,8 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) ActionSpec(const Config& conf) {
-    std::tuple<int, int> bounds = {0, 15};
-    return MakeDict("action"_.Bind(Spec<int>({-1}, bounds)));
+    return MakeDict("action"_.Bind(Spec<float>({10}, {{-1., -1., -1., -1., -1., -1., -1., -1., 1, 1},
+				                      { 1.,  1.,  1.,  1.,  1.,  1.,  1.,  1., 5, 5}})));
   }
 };
 
@@ -82,7 +82,7 @@ using RlTraderEnvSpec = EnvSpec<RlTraderEnvFns>;
 
 class RlTraderEnv : public Env<RlTraderEnvSpec> {
  protected:
-  int spreads[4] = {0, 1, 3, 8};
+  int spreads[4] = {0, 2, 4, 10};
   int state_{0};
   bool isDone = true;
   bool is_prod = false;
@@ -159,14 +159,35 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     WriteState();
   }
 
-  void Step(const Action& action_dict) override {
-      auto action = static_cast<int>(action_dict["action"_][0]);
-      int buy_action = static_cast<int>(action / 4);
-      auto sell_action = action % 4;
+  static u_int select_action(const std::vector<double>& logits) {
+      auto maxLogitIt = std::max_element(logits.begin(), logits.end());
+      return std::distance(logits.begin(), maxLogitIt);
+  }
+
+  void Step(const Action& action_dict) override { 
+      std::vector<double> buyActionLogits { static_cast<double>(action_dict["action"_][0]), 
+	                                    static_cast<double>(action_dict["action"_][1]),
+	                                    static_cast<double>(action_dict["action"_][2]),
+	                                    static_cast<double>(action_dict["action"_][3])
+				          };
+
+
+      std::vector<double> sellActionLogits { static_cast<double>(action_dict["action"_][4]), 
+	                                     static_cast<double>(action_dict["action"_][5]),
+	                                     static_cast<double>(action_dict["action"_][6]),
+	                                     static_cast<double>(action_dict["action"_][7])
+				           };
+
+      auto buy_action = select_action(buyActionLogits);
+      auto sell_action = select_action(sellActionLogits);
       auto buy_spread = spreads[buy_action];
       auto sell_spread = spreads[sell_action];
-      int base_vol = 5;
-      adaptor_ptr->quote(buy_spread, sell_spread, base_vol, base_vol);
+
+      auto buy_vol = static_cast<double>(action_dict["action"_][8]);
+      auto sell_vol = static_cast<double>(action_dict["action"_][9]);
+      buy_vol = 1.0;
+      sell_vol = 1.0;
+      adaptor_ptr->quote(buy_spread, sell_spread, buy_vol, sell_vol);
       isDone = !adaptor_ptr->next();
       ++steps;
       WriteState();
@@ -195,7 +216,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
 
     auto pnl = info["realized_pnl"] - previous_rpnl; 
     auto upnl = info["unrealized_pnl"]- previous_upnl;
-    state["reward"_] = (previous_fees - info["fees"]); + pnl + upnl;
+    state["reward"_] = (previous_fees - info["fees"]) +  pnl +  upnl;
     previous_rpnl = info["realized_pnl"];
     previous_upnl = info["unrealized_pnl"];
     previous_fees = info["fees"];

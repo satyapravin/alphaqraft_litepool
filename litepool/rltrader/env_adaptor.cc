@@ -1,6 +1,7 @@
 #include "env_adaptor.h"
 #include <algorithm>
 #include <iostream>
+#include <algorithm>  
 
 using namespace RLTrader;
 
@@ -21,7 +22,6 @@ bool EnvAdaptor::next() {
         if(this->exchange.next_read(read_slot, book)) {
             this->strategy.next();
             computeState(book);
-	    #include <algorithm>  // Required for std::copy
 
            
             std::copy(book.bid_prices.begin(), book.bid_prices.end(), bid_prices.begin());
@@ -41,7 +41,7 @@ void EnvAdaptor::getState(std::array<double, 490>& st) {
     st = state;
 }
 
-void EnvAdaptor::quote(int buy_spread, int sell_spread, int buy_percent, int sell_percent) {
+void EnvAdaptor::quote(int buy_spread, int sell_spread, const double& buy_percent, const double& sell_percent) {
     this->strategy.quote(buy_spread, sell_spread, buy_percent, sell_percent, bid_prices, ask_prices);
 }
 
@@ -83,10 +83,7 @@ void EnvAdaptor::computeInfo(OrderBook &book) {
     info["trade_count"] = static_cast<double>(tradeInfo.buy_trades + tradeInfo.sell_trades);
     info["drawdown"] = drawdown;
     info["fees"] = posInfo.fees;
-    info["avg_buy_price"] = tradeInfo.average_buy_price;
-    info["avg_sell_price"] = tradeInfo.average_sell_price;
-    info["avg_price"] = posInfo.averagePrice;
-    info["curr_price"] = (bid_price + ask_price) * 0.5;
+    info["delta_amount"] = tradeInfo.buy_amount - tradeInfo.sell_amount;
 }
 
 

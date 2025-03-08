@@ -1,6 +1,7 @@
 #include "market_signal_builder.h"
 #include <numeric>
-
+#include <map>
+#include <cmath>
 #include "orderbook.h"
 #include "rl_macros.h"
 
@@ -12,9 +13,17 @@ MarketSignalBuilder::MarketSignalBuilder()
                previous_bid_amounts(30),
                previous_ask_amounts(30),
                previous_price_signal{},
-               raw_price_diff_signals(std::make_unique<price_signal_repository>()),                      // price
-               raw_spread_signals(std::make_unique<spread_signal_repository>()),                         // spread
-               raw_volume_signals(std::make_unique<volume_signal_repository>())                          // volume
+               ewma_price_signal_30{},
+               ewma_price_signal_60{},
+               ewma_price_signal_120{},
+               ewma_price_signal_300{},
+               raw_price_diff_signals(std::make_unique<price_signal_repository>()),                    
+               raw_spread_signals(std::make_unique<spread_signal_repository>()),                        
+               raw_volume_signals(std::make_unique<volume_signal_repository>()),                         
+               ewma_diff_signals_30(std::make_unique<price_signal_repository>()),                         
+               ewma_diff_signals_60(std::make_unique<price_signal_repository>()),                         
+               ewma_diff_signals_120(std::make_unique<price_signal_repository>()),                         
+               ewma_diff_signals_300(std::make_unique<price_signal_repository>())
 {
     
 }
@@ -62,7 +71,11 @@ std::vector<double> MarketSignalBuilder::add_book(OrderBook& book) {
     insert_signals(retval, *raw_price_diff_signals);
     insert_signals(retval, *raw_spread_signals);
     insert_signals(retval, *raw_volume_signals);
-    
+    insert_signals(retval, *ewma_diff_signals_30);
+    insert_signals(retval, *ewma_diff_signals_60);
+    insert_signals(retval, *ewma_diff_signals_120);
+    insert_signals(retval, *ewma_diff_signals_300);
+
     previous_bid_prices.addRow(book.bid_prices);
     previous_ask_prices.addRow(book.ask_prices);
     previous_bid_amounts.addRow(book.bid_sizes);
@@ -97,6 +110,8 @@ void MarketSignalBuilder::compute_signals(const OrderBook& book) {
                           cum_ask_sizes,
                           cum_bid_amounts,
                           cum_ask_amounts);
+
+    compute_ewma_signals(repo);
 
     compute_spread_signals(repo);
 
@@ -336,4 +351,146 @@ void MarketSignalBuilder::compute_price_signals(price_signal_repository& raw_pri
     raw_price_diff_signals->ask_fill_price_signal_4 = raw_price_repo.ask_fill_price_signal_4 - previous_price_signal.ask_fill_price_signal_4;
 
     previous_price_signal = raw_price_repo;
+}
+
+void compute_ewma_lagged(double lag, price_signal_repository& ewma_price_signal, const price_signal_repository& repo) {
+    double ewma = 2.0 / (1 + lag);
+    double ewma_rolling = 1.0 - ewma;
+
+    ewma_price_signal.mid_price_signal = ewma_rolling * ewma_price_signal.mid_price_signal + ewma * repo.mid_price_signal;
+
+    ewma_price_signal.vwap_bid_price_signal_0 = ewma_rolling * ewma_price_signal.vwap_bid_price_signal_0 + ewma * repo.vwap_bid_price_signal_0;
+    ewma_price_signal.vwap_bid_price_signal_1 = ewma_rolling * ewma_price_signal.vwap_bid_price_signal_1 + ewma * repo.vwap_bid_price_signal_1;
+    ewma_price_signal.vwap_bid_price_signal_2 = ewma_rolling * ewma_price_signal.vwap_bid_price_signal_2 + ewma * repo.vwap_bid_price_signal_2;
+    ewma_price_signal.vwap_bid_price_signal_3 = ewma_rolling * ewma_price_signal.vwap_bid_price_signal_3 + ewma * repo.vwap_bid_price_signal_3;
+    ewma_price_signal.vwap_bid_price_signal_4 = ewma_rolling * ewma_price_signal.vwap_bid_price_signal_4 + ewma * repo.vwap_bid_price_signal_4;
+
+    ewma_price_signal.vwap_ask_price_signal_0 = ewma_rolling * ewma_price_signal.vwap_ask_price_signal_0 + ewma * repo.vwap_ask_price_signal_0;
+    ewma_price_signal.vwap_ask_price_signal_1 = ewma_rolling * ewma_price_signal.vwap_ask_price_signal_1 + ewma * repo.vwap_ask_price_signal_1;
+    ewma_price_signal.vwap_ask_price_signal_2 = ewma_rolling * ewma_price_signal.vwap_ask_price_signal_2 + ewma * repo.vwap_ask_price_signal_2;
+    ewma_price_signal.vwap_ask_price_signal_3 = ewma_rolling * ewma_price_signal.vwap_ask_price_signal_3 + ewma * repo.vwap_ask_price_signal_3;
+    ewma_price_signal.vwap_ask_price_signal_4 = ewma_rolling * ewma_price_signal.vwap_ask_price_signal_4 + ewma * repo.vwap_ask_price_signal_4;
+
+    ewma_price_signal.micro_price_signal_0 = ewma_rolling * ewma_price_signal.micro_price_signal_0 + ewma * repo.micro_price_signal_0;
+    ewma_price_signal.micro_price_signal_0 = ewma_rolling * ewma_price_signal.micro_price_signal_1 + ewma * repo.micro_price_signal_1;
+    ewma_price_signal.micro_price_signal_0 = ewma_rolling * ewma_price_signal.micro_price_signal_2 + ewma * repo.micro_price_signal_2;
+    ewma_price_signal.micro_price_signal_0 = ewma_rolling * ewma_price_signal.micro_price_signal_3 + ewma * repo.micro_price_signal_3;
+    ewma_price_signal.micro_price_signal_0 = ewma_rolling * ewma_price_signal.micro_price_signal_4 + ewma * repo.micro_price_signal_4;
+
+    ewma_price_signal.norm_vwap_bid_price_signal_0 = ewma_rolling * ewma_price_signal.norm_vwap_bid_price_signal_0 + ewma * repo.norm_vwap_bid_price_signal_0;
+    ewma_price_signal.norm_vwap_bid_price_signal_1 = ewma_rolling * ewma_price_signal.norm_vwap_bid_price_signal_1 + ewma * repo.norm_vwap_bid_price_signal_1;
+    ewma_price_signal.norm_vwap_bid_price_signal_2 = ewma_rolling * ewma_price_signal.norm_vwap_bid_price_signal_2 + ewma * repo.norm_vwap_bid_price_signal_2;
+    ewma_price_signal.norm_vwap_bid_price_signal_3 = ewma_rolling * ewma_price_signal.norm_vwap_bid_price_signal_3 + ewma * repo.norm_vwap_bid_price_signal_3;
+    ewma_price_signal.norm_vwap_bid_price_signal_4 = ewma_rolling * ewma_price_signal.norm_vwap_bid_price_signal_4 + ewma * repo.norm_vwap_bid_price_signal_4;
+
+    ewma_price_signal.norm_vwap_ask_price_signal_0 = ewma_rolling * ewma_price_signal.norm_vwap_ask_price_signal_0 + ewma * repo.norm_vwap_ask_price_signal_0;
+    ewma_price_signal.norm_vwap_ask_price_signal_1 = ewma_rolling * ewma_price_signal.norm_vwap_ask_price_signal_1 + ewma * repo.norm_vwap_ask_price_signal_1;
+    ewma_price_signal.norm_vwap_ask_price_signal_2 = ewma_rolling * ewma_price_signal.norm_vwap_ask_price_signal_2 + ewma * repo.norm_vwap_ask_price_signal_2;
+    ewma_price_signal.norm_vwap_ask_price_signal_3 = ewma_rolling * ewma_price_signal.norm_vwap_ask_price_signal_3 + ewma * repo.norm_vwap_ask_price_signal_3;
+    ewma_price_signal.norm_vwap_ask_price_signal_4 = ewma_rolling * ewma_price_signal.norm_vwap_ask_price_signal_4 + ewma * repo.norm_vwap_ask_price_signal_4;
+
+    ewma_price_signal.bid_fill_price_signal_0 = ewma_rolling * ewma_price_signal.bid_fill_price_signal_0 + ewma * repo.bid_fill_price_signal_0;
+    ewma_price_signal.bid_fill_price_signal_1 = ewma_rolling * ewma_price_signal.bid_fill_price_signal_1 + ewma * repo.bid_fill_price_signal_1;
+    ewma_price_signal.bid_fill_price_signal_2 = ewma_rolling * ewma_price_signal.bid_fill_price_signal_2 + ewma * repo.bid_fill_price_signal_2;
+    ewma_price_signal.bid_fill_price_signal_3 = ewma_rolling * ewma_price_signal.bid_fill_price_signal_3 + ewma * repo.bid_fill_price_signal_3;
+    ewma_price_signal.bid_fill_price_signal_4 = ewma_rolling * ewma_price_signal.bid_fill_price_signal_4 + ewma * repo.bid_fill_price_signal_4;
+
+    ewma_price_signal.ask_fill_price_signal_0 = ewma_rolling * ewma_price_signal.ask_fill_price_signal_0 + ewma * repo.ask_fill_price_signal_0;
+    ewma_price_signal.ask_fill_price_signal_1 = ewma_rolling * ewma_price_signal.ask_fill_price_signal_1 + ewma * repo.ask_fill_price_signal_1;
+    ewma_price_signal.ask_fill_price_signal_2 = ewma_rolling * ewma_price_signal.ask_fill_price_signal_2 + ewma * repo.ask_fill_price_signal_2;
+    ewma_price_signal.ask_fill_price_signal_3 = ewma_rolling * ewma_price_signal.ask_fill_price_signal_3 + ewma * repo.ask_fill_price_signal_3;
+    ewma_price_signal.ask_fill_price_signal_4 = ewma_rolling * ewma_price_signal.ask_fill_price_signal_4 + ewma * repo.ask_fill_price_signal_4;
+}
+
+void norm_ewma_signals(price_signal_repository& output, price_signal_repository& value, const price_signal_repository& base) {
+    output.mid_price_signal = base.mid_price_signal - value.mid_price_signal;
+    if (std::abs(value.mid_price_signal) > 0) output.mid_price_signal /= std::abs(value.mid_price_signal);
+
+    output.vwap_bid_price_signal_0 = base.vwap_bid_price_signal_0 - value.vwap_bid_price_signal_0;
+    if (std::abs(value.vwap_bid_price_signal_0) > 0) output.vwap_bid_price_signal_0 /= std::abs(value.vwap_bid_price_signal_0);
+    output.vwap_bid_price_signal_1 = base.vwap_bid_price_signal_1 - value.vwap_bid_price_signal_1;
+    if (std::abs(value.vwap_bid_price_signal_1) > 0) output.vwap_bid_price_signal_1 /= std::abs(value.vwap_bid_price_signal_1);
+    output.vwap_bid_price_signal_2 = base.vwap_bid_price_signal_2 - value.vwap_bid_price_signal_2;
+    if (std::abs(value.vwap_bid_price_signal_2) > 0) output.vwap_bid_price_signal_2 /= std::abs(value.vwap_bid_price_signal_2);
+    output.vwap_bid_price_signal_3 = base.vwap_bid_price_signal_3 - value.vwap_bid_price_signal_3;
+    if (std::abs(value.vwap_bid_price_signal_3) > 0) output.vwap_bid_price_signal_3 /= std::abs(value.vwap_bid_price_signal_3);
+    output.vwap_bid_price_signal_4 = base.vwap_bid_price_signal_4 - value.vwap_bid_price_signal_4;
+    if (std::abs(value.vwap_bid_price_signal_4) > 0) output.vwap_bid_price_signal_4 /= std::abs(value.vwap_bid_price_signal_4);
+
+    output.vwap_ask_price_signal_0 = base.vwap_ask_price_signal_0 - value.vwap_ask_price_signal_0;
+    if (std::abs(value.vwap_ask_price_signal_0) > 0) output.vwap_ask_price_signal_0 /= std::abs(value.vwap_ask_price_signal_0);
+    output.vwap_ask_price_signal_1 = base.vwap_ask_price_signal_1 - value.vwap_ask_price_signal_1;
+    if (std::abs(value.vwap_ask_price_signal_1) > 0) output.vwap_ask_price_signal_1 /= std::abs(value.vwap_ask_price_signal_1);
+    output.vwap_ask_price_signal_2 = base.vwap_ask_price_signal_2 - value.vwap_ask_price_signal_2;
+    if (std::abs(value.vwap_ask_price_signal_2) > 0) output.vwap_ask_price_signal_2 /= std::abs(value.vwap_ask_price_signal_2);
+    output.vwap_ask_price_signal_3 = base.vwap_ask_price_signal_3 - value.vwap_ask_price_signal_3;
+    if (std::abs(value.vwap_ask_price_signal_3) > 0) output.vwap_ask_price_signal_3 /= std::abs(value.vwap_ask_price_signal_3);
+    output.vwap_ask_price_signal_4 = base.vwap_ask_price_signal_4 - value.vwap_ask_price_signal_4;
+    if (std::abs(value.vwap_ask_price_signal_4) > 0) output.vwap_ask_price_signal_4 /= std::abs(value.vwap_ask_price_signal_4);
+
+    output.micro_price_signal_0 = base.micro_price_signal_0 - value.micro_price_signal_0;
+    if (std::abs(value.micro_price_signal_0) > 0) output.micro_price_signal_0 /= std::abs(value.micro_price_signal_0);
+    output.micro_price_signal_1 = base.micro_price_signal_1 - value.micro_price_signal_1;
+    if (std::abs(value.micro_price_signal_1) > 0) output.micro_price_signal_1 /= std::abs(value.micro_price_signal_1);
+    output.micro_price_signal_2 = base.micro_price_signal_2 - value.micro_price_signal_2;
+    if (std::abs(value.micro_price_signal_2) > 0) output.micro_price_signal_2 /= std::abs(value.micro_price_signal_2);
+    output.micro_price_signal_3 = base.micro_price_signal_3 - value.micro_price_signal_3;
+    if (std::abs(value.micro_price_signal_3) > 0) output.micro_price_signal_3 /= std::abs(value.micro_price_signal_3);
+    output.micro_price_signal_4 = base.micro_price_signal_4 - value.micro_price_signal_4;
+    if (std::abs(value.micro_price_signal_4) > 0) output.micro_price_signal_4 /= std::abs(value.micro_price_signal_4);
+
+    output.norm_vwap_bid_price_signal_0 = base.norm_vwap_bid_price_signal_0 - value.norm_vwap_bid_price_signal_0;
+    if (std::abs(value.norm_vwap_bid_price_signal_0) > 0) output.norm_vwap_bid_price_signal_0 /= std::abs(value.norm_vwap_bid_price_signal_0);
+    output.norm_vwap_bid_price_signal_1 = base.norm_vwap_bid_price_signal_1 - value.norm_vwap_bid_price_signal_1;
+    if (std::abs(value.norm_vwap_bid_price_signal_1) > 0) output.norm_vwap_bid_price_signal_1 /= std::abs(value.norm_vwap_bid_price_signal_1);
+    output.norm_vwap_bid_price_signal_2 = base.norm_vwap_bid_price_signal_2 - value.norm_vwap_bid_price_signal_2;
+    if (std::abs(value.norm_vwap_bid_price_signal_2) > 0) output.norm_vwap_bid_price_signal_2 /= std::abs(value.norm_vwap_bid_price_signal_2);
+    output.norm_vwap_bid_price_signal_3 = base.norm_vwap_bid_price_signal_3 - value.norm_vwap_bid_price_signal_3;
+    if (std::abs(value.norm_vwap_bid_price_signal_3) > 0) output.norm_vwap_bid_price_signal_3 /= std::abs(value.norm_vwap_bid_price_signal_3);
+    output.norm_vwap_bid_price_signal_4 = base.norm_vwap_bid_price_signal_4 - value.norm_vwap_bid_price_signal_4;
+    if (std::abs(value.norm_vwap_bid_price_signal_4) > 0) output.norm_vwap_bid_price_signal_4 /= std::abs(value.norm_vwap_bid_price_signal_4);
+
+    output.norm_vwap_ask_price_signal_0 = base.norm_vwap_ask_price_signal_0 - value.norm_vwap_ask_price_signal_0;
+    if (std::abs(value.norm_vwap_ask_price_signal_0) > 0) output.norm_vwap_ask_price_signal_0 /= std::abs(value.norm_vwap_ask_price_signal_0);
+    output.norm_vwap_ask_price_signal_1 = base.norm_vwap_ask_price_signal_1 - value.norm_vwap_ask_price_signal_1;
+    if (std::abs(value.norm_vwap_ask_price_signal_1) > 0) output.norm_vwap_ask_price_signal_1 /= std::abs(value.norm_vwap_ask_price_signal_1);
+    output.norm_vwap_ask_price_signal_2 = base.norm_vwap_ask_price_signal_2 - value.norm_vwap_ask_price_signal_2;
+    if (std::abs(value.norm_vwap_ask_price_signal_2) > 0) output.norm_vwap_ask_price_signal_2 /= std::abs(value.norm_vwap_ask_price_signal_2);
+    output.norm_vwap_ask_price_signal_3 = base.norm_vwap_ask_price_signal_3 - value.norm_vwap_ask_price_signal_3;
+    if (std::abs(value.norm_vwap_ask_price_signal_3) > 0) output.norm_vwap_ask_price_signal_3 /= std::abs(value.norm_vwap_ask_price_signal_3);
+    output.norm_vwap_ask_price_signal_4 = base.norm_vwap_ask_price_signal_4 - value.norm_vwap_ask_price_signal_4;
+    if (std::abs(value.norm_vwap_ask_price_signal_4) > 0) output.norm_vwap_ask_price_signal_4 /= std::abs(value.norm_vwap_ask_price_signal_4);
+
+    output.bid_fill_price_signal_0 = base.bid_fill_price_signal_0 - value.bid_fill_price_signal_0;
+    if (std::abs(value.bid_fill_price_signal_0) > 0) output.bid_fill_price_signal_0 /= std::abs(value.bid_fill_price_signal_0);
+    output.bid_fill_price_signal_1 = base.bid_fill_price_signal_1 - value.bid_fill_price_signal_1;
+    if (std::abs(value.bid_fill_price_signal_1) > 0) output.bid_fill_price_signal_1 /= std::abs(value.bid_fill_price_signal_1);
+    output.bid_fill_price_signal_2 = base.bid_fill_price_signal_2 - value.bid_fill_price_signal_2;
+    if (std::abs(value.bid_fill_price_signal_2) > 0) output.bid_fill_price_signal_2 /= std::abs(value.bid_fill_price_signal_2);
+    output.bid_fill_price_signal_3 = base.bid_fill_price_signal_3 - value.bid_fill_price_signal_3;
+    if (std::abs(value.bid_fill_price_signal_3) > 0) output.bid_fill_price_signal_3 /= std::abs(value.bid_fill_price_signal_3);
+    output.bid_fill_price_signal_4 = base.bid_fill_price_signal_4 - value.bid_fill_price_signal_4;
+    if (std::abs(value.bid_fill_price_signal_4) > 0) output.bid_fill_price_signal_4 /= std::abs(value.bid_fill_price_signal_4);
+
+    output.ask_fill_price_signal_0 = base.ask_fill_price_signal_0 - value.ask_fill_price_signal_0;
+    if (std::abs(value.ask_fill_price_signal_0) > 0) output.ask_fill_price_signal_0 /= std::abs(value.ask_fill_price_signal_0);
+    output.ask_fill_price_signal_1 = base.ask_fill_price_signal_1 - value.ask_fill_price_signal_1;
+    if (std::abs(value.ask_fill_price_signal_1) > 0) output.ask_fill_price_signal_1 /= std::abs(value.ask_fill_price_signal_1);
+    output.ask_fill_price_signal_2 = base.ask_fill_price_signal_2 - value.ask_fill_price_signal_2;
+    if (std::abs(value.ask_fill_price_signal_2) > 0) output.ask_fill_price_signal_2 /= std::abs(value.ask_fill_price_signal_2);
+    output.ask_fill_price_signal_3 = base.ask_fill_price_signal_3 - value.ask_fill_price_signal_3;
+    if (std::abs(value.ask_fill_price_signal_3) > 0) output.ask_fill_price_signal_3 /= std::abs(value.ask_fill_price_signal_3);
+    output.ask_fill_price_signal_4 = base.ask_fill_price_signal_4 - value.ask_fill_price_signal_4;
+    if (std::abs(value.ask_fill_price_signal_4) > 0) output.ask_fill_price_signal_4 /= std::abs(value.ask_fill_price_signal_4);
+}
+
+void MarketSignalBuilder::compute_ewma_signals(const price_signal_repository& repo) {
+    compute_ewma_lagged(30, ewma_price_signal_30, repo);
+    compute_ewma_lagged(60, ewma_price_signal_60, repo);
+    compute_ewma_lagged(120, ewma_price_signal_120, repo);
+    compute_ewma_lagged(300, ewma_price_signal_300, repo);
+    norm_ewma_signals(*ewma_diff_signals_30, ewma_price_signal_30, repo);
+    norm_ewma_signals(*ewma_diff_signals_60, ewma_price_signal_60, ewma_price_signal_30);
+    norm_ewma_signals(*ewma_diff_signals_120, ewma_price_signal_120, ewma_price_signal_60);
+    norm_ewma_signals(*ewma_diff_signals_300, ewma_price_signal_300, ewma_price_signal_120);
 }

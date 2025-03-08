@@ -132,6 +132,8 @@ private:
                                 const FixedVector<double, 20>& cum_bid_amounts,
                                 const FixedVector<double, 20>& cum_ask_amounts);
 
+    void compute_ewma_signals(const price_signal_repository& repo);
+    
     void compute_spread_signals(const price_signal_repository& repo) const;
 
     void compute_volume_signals(const FixedVector<double, 20>& bid_sizes,
@@ -140,13 +142,26 @@ private:
                                 const FixedVector<double, 20>& cum_ask_sizes) const;
 
 private:
+    double ewma_30 = 2.0 / 16.0;
+    double ewma_60 = 2.0 / 61.0;
+    double ewma_120 = 2.0 / 121.0;
+    double ewma_300 = 2.0 / 301.0;
+
     TemporalTable previous_bid_prices;
     TemporalTable previous_ask_prices;
     TemporalTable previous_bid_amounts;
     TemporalTable previous_ask_amounts;
     price_signal_repository previous_price_signal;
+    price_signal_repository ewma_price_signal_30;
+    price_signal_repository ewma_price_signal_60;
+    price_signal_repository ewma_price_signal_120;
+    price_signal_repository ewma_price_signal_300;
     std::unique_ptr<price_signal_repository> raw_price_diff_signals;
     std::unique_ptr<spread_signal_repository> raw_spread_signals;
     std::unique_ptr<volume_signal_repository> raw_volume_signals;
+    std::unique_ptr<price_signal_repository> ewma_diff_signals_30;
+    std::unique_ptr<price_signal_repository> ewma_diff_signals_60;
+    std::unique_ptr<price_signal_repository> ewma_diff_signals_120;
+    std::unique_ptr<price_signal_repository> ewma_diff_signals_300;
 };
 }

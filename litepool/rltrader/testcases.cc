@@ -215,7 +215,7 @@ TEST_CASE("test of OrderBook and signals") {
 
 		auto signals = builder.add_book(book);
 
-		if (ii > 30) {
+		if (ii > 3000) {
 			CHECK(std::all_of(signals.begin(), signals.end(), [](const double& val) {return std::isfinite(val);}));
 			CHECK(std::count_if(signals.begin(), signals.end(), [](const double& val) { return std::abs(val) == 0.0;}) <= 4);
 			CHECK(std::all_of(signals.begin(), signals.end(), [](const double& val) { return std::abs(val) < 100;}));
