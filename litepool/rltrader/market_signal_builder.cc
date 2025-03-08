@@ -372,10 +372,10 @@ void compute_ewma_lagged(double lag, price_signal_repository& ewma_price_signal,
     ewma_price_signal.vwap_ask_price_signal_4 = ewma_rolling * ewma_price_signal.vwap_ask_price_signal_4 + ewma * repo.vwap_ask_price_signal_4;
 
     ewma_price_signal.micro_price_signal_0 = ewma_rolling * ewma_price_signal.micro_price_signal_0 + ewma * repo.micro_price_signal_0;
-    ewma_price_signal.micro_price_signal_0 = ewma_rolling * ewma_price_signal.micro_price_signal_1 + ewma * repo.micro_price_signal_1;
-    ewma_price_signal.micro_price_signal_0 = ewma_rolling * ewma_price_signal.micro_price_signal_2 + ewma * repo.micro_price_signal_2;
-    ewma_price_signal.micro_price_signal_0 = ewma_rolling * ewma_price_signal.micro_price_signal_3 + ewma * repo.micro_price_signal_3;
-    ewma_price_signal.micro_price_signal_0 = ewma_rolling * ewma_price_signal.micro_price_signal_4 + ewma * repo.micro_price_signal_4;
+    ewma_price_signal.micro_price_signal_1 = ewma_rolling * ewma_price_signal.micro_price_signal_1 + ewma * repo.micro_price_signal_1;
+    ewma_price_signal.micro_price_signal_2 = ewma_rolling * ewma_price_signal.micro_price_signal_2 + ewma * repo.micro_price_signal_2;
+    ewma_price_signal.micro_price_signal_3 = ewma_rolling * ewma_price_signal.micro_price_signal_3 + ewma * repo.micro_price_signal_3;
+    ewma_price_signal.micro_price_signal_4 = ewma_rolling * ewma_price_signal.micro_price_signal_4 + ewma * repo.micro_price_signal_4;
 
     ewma_price_signal.norm_vwap_bid_price_signal_0 = ewma_rolling * ewma_price_signal.norm_vwap_bid_price_signal_0 + ewma * repo.norm_vwap_bid_price_signal_0;
     ewma_price_signal.norm_vwap_bid_price_signal_1 = ewma_rolling * ewma_price_signal.norm_vwap_bid_price_signal_1 + ewma * repo.norm_vwap_bid_price_signal_1;
