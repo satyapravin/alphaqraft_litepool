@@ -54,6 +54,9 @@ class RecurrentActor(nn.Module):
         return (h_0, c_0)
 
     def forward(self, state, hidden=None):
+        if isinstance(state, np.ndarray):
+            state = torch.tensor(state, dtype=torch.float32, device=next(self.parameters()).device)
+
         x = F.relu(self.fc1(state))
 
         batch_size = state.shape[0] if state.dim() > 1 else 1
@@ -74,12 +77,7 @@ class RecurrentActor(nn.Module):
         normal_dist = torch.distributions.Normal(mean, std)
         action = mean if deterministic else normal_dist.rsample()
         action = torch.tanh(action)  
-        return action
-
-    def _predict(self, state, deterministic=False):
-        action = self.sample(state, deterministic=deterministic) 
-        print(action)
-        return action
+        return action, hidden
 
     def set_training_mode(self, mode: bool):
         self.train(mode)
@@ -141,6 +139,20 @@ class CustomFQFDSACPolicy(SACPolicy):
     def forward(self, obs, hidden, deterministic=False):
         return self.actor.sample(obs, hidden, deterministic)
 
+    def predict(self, observation, state=None, episode_start=None, deterministic=False):
+        if state is None:
+            batch_size = observation.shape[0] if isinstance(observation, np.ndarray) else 1
+            state = self.actor.init_hidden(batch_size, device=observation.device if torch.is_tensor(observation) else "cuda")
+
+        if isinstance(observation, np.ndarray):
+            observation = torch.tensor(observation, dtype=torch.float32, device=next(self.actor.parameters()).device)
+
+        action, new_state = self.actor.sample(observation, state, deterministic=deterministic)
+        return action.detach().cpu().numpy(), new_state 
+
+    @property
+    def optimizer(self):
+        return self.actor_optimizer 
 
 # ---------------------------
 # 4. Improved Training Step with Persistent Hidden States
