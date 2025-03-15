@@ -31,6 +31,8 @@ namespace RLTrader {
         // Processes order cancellation
         virtual void cancelOrders() = 0;
 
+	virtual bool isDummy() = 0;
+
         [[nodiscard]] virtual const std::map<std::string, Order>& getBidOrders() const = 0;
 
         [[nodiscard]] virtual const std::map<std::string, Order>& getAskOrders() const = 0;

@@ -15,7 +15,7 @@ EnvAdaptor::EnvAdaptor(Strategy& strat, BaseExchange& exch):
 }
 
 bool EnvAdaptor::next() {
-    std::fill_n(state.begin(), 490, 0);
+    std::fill_n(state.begin(), 242*5, 0);
     for (int ii=0; ii < 5; ++ii) {
         OrderBook book;
         size_t read_slot;
@@ -37,7 +37,7 @@ bool EnvAdaptor::next() {
     return true;
 }
 
-void EnvAdaptor::getState(std::array<double, 490>& st) {
+void EnvAdaptor::getState(std::array<double, 242*5>& st) {
     st = state;
 }
 
@@ -56,7 +56,7 @@ void EnvAdaptor::reset() {
     auto trade_ptr = std::make_unique<TradeSignalBuilder>();
     trade_builder = std::move(trade_ptr);
     this->strategy.reset();
-    std::fill_n(state.begin(), 490, 0);
+    std::fill_n(state.begin(), 242*5, 0);
 }
 
 
@@ -98,6 +98,7 @@ void EnvAdaptor::computeState(OrderBook& book)
     auto position_signals = position_builder->add_info(position_info, bid_price, ask_price);
     TradeInfo trade_info = strategy.getPosition().getTradeInfo();
     auto trade_signals = trade_builder->add_trade(trade_info, bid_price, ask_price);
+    
     std::copy_n(state.begin(), market_signals.size(), market_signals.begin());
     std::copy_n(state.begin() + market_signals.size(), position_signals.size(), position_signals.begin());
     std::copy_n(state.begin() + market_signals.size() + position_signals.size(), trade_signals.size(), market_signals.begin());

@@ -17,6 +17,8 @@ namespace RLTrader {
         // Resets the exchange's state
         void reset() override;
 
+	bool isDummy() override { return false; }
+
         // Advances to the next row in the data
         bool next_read(size_t& slot, OrderBook& book) override;
 

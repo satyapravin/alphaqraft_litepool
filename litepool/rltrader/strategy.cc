@@ -37,11 +37,12 @@ void Strategy::quote(int buy_spread, int sell_spread, const double& buy_percent,
 
 	double buy_volume = initBalance * buy_percent / buy_denom;
 	double sell_volume = initBalance * sell_percent / sell_denom;
-        int skew = static_cast<int>(leverage);
+        int skew = static_cast<int>(10 * leverage);
         buy_spread = std::max(0, buy_spread + skew);
         sell_spread = std::max(0, sell_spread - skew);
-        
-        this->exchange.cancelOrders();
+       
+        if (this->exchange.isDummy())	
+            this->exchange.cancelOrders();
 
         if (buy_volume > 0 && buy_spread >= 0 && buy_spread < 20)
         	this->sendGrid(1, buy_spread, buy_volume, OrderSide::BUY, bid_prices);
@@ -51,11 +52,15 @@ void Strategy::quote(int buy_spread, int sell_spread, const double& buy_percent,
 
 void Strategy::sendGrid(int levels, int start_level, const double& amount,
 	                    OrderSide side, FixedVector<double, 20>& refPrices) {
-	int spreads[4] = {0, 2, 4, 10};
         for (int ii = 0; ii < levels; ++ii) {
-	     auto trade_amount = instrument.getTradeAmount(amount, refPrices[0]);
+	     auto idx = ii + start_level;
+             if (idx + 1 < 20) {
+                 double spread = std::abs(refPrices[idx] - refPrices[idx + 1]);
+		 if (spread * 0.95 > instrument.getTickSize()) ++idx;
+	     }
+	     auto trade_amount = instrument.getTradeAmount(amount, refPrices[idx]);
              if (trade_amount >= instrument.getMinAmount()) {
-             	this->exchange.quote(std::to_string(++order_id), side, refPrices[ii + start_level + spreads[ii]], trade_amount);
+             	this->exchange.quote(std::to_string(++order_id), side, refPrices[idx], trade_amount);
              }
         }
 }

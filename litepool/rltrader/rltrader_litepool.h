@@ -16,6 +16,7 @@
 #define LITEPOOL_RLTRADER_RLTRADER_LITEPOOL_H_
 
 #include <memory>
+#include <deque>
 #include <vector>
 #include <algorithm>
 #include <iostream>
@@ -35,6 +36,12 @@
 
 namespace fs = std::filesystem;
 namespace rltrader {
+
+struct InfoData {
+    double rpnl;
+    double upnl;
+    double fees;
+};
 
 class RlTraderEnvFns {
  public:
@@ -56,7 +63,7 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) StateSpec(const Config& conf) {
-    return MakeDict("obs"_.Bind(Spec<double>({490})),
+    return MakeDict("obs"_.Bind(Spec<double>({242*5})),
                     "info:mid_price"_.Bind(Spec<double>({-1})),
                     "info:balance"_.Bind(Spec<double>({-1})),
                     "info:unrealized_pnl"_.Bind(Spec<double>({-1})),
@@ -82,7 +89,7 @@ using RlTraderEnvSpec = EnvSpec<RlTraderEnvFns>;
 
 class RlTraderEnv : public Env<RlTraderEnvSpec> {
  protected:
-  int spreads[4] = {0, 2, 4, 10};
+  int spreads[4] = {0, 1, 3, 10};
   int state_{0};
   bool isDone = true;
   bool is_prod = false;
@@ -99,9 +106,9 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   int start_read = 0;
   int max_read = 0;
   long long steps = 0;
-  double previous_rpnl = 0;
-  double previous_upnl = 0;
-  double previous_fees = 0;
+  int max_deque_size = 1;
+  std::deque<InfoData> info_data;
+  double reward = 0.0;
   std::unique_ptr<RLTrader::BaseInstrument> instr_ptr;
   std::unique_ptr<RLTrader::BaseExchange> exchange_ptr;
   std::unique_ptr<RLTrader::Strategy> strategy_ptr;
@@ -151,9 +158,8 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
 
   void Reset() override {
     steps = 0;
-    previous_rpnl = 0;
-    previous_upnl = 0;
-    previous_fees = 0;
+    reward = 0.0;
+    this->info_data.clear();
     adaptor_ptr->reset();
     isDone = false;
     WriteState();
@@ -185,8 +191,6 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
 
       auto buy_vol = static_cast<double>(action_dict["action"_][8]);
       auto sell_vol = static_cast<double>(action_dict["action"_][9]);
-      buy_vol = 1.0;
-      sell_vol = 1.0;
       adaptor_ptr->quote(buy_spread, sell_spread, buy_vol, sell_vol);
       isDone = !adaptor_ptr->next();
       ++steps;
@@ -194,12 +198,12 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   }
 
   void WriteState() {
-    std::array<double, 490> data;
+    std::array<double, 242*5> data;
     adaptor_ptr->getState(data);
     State state = Allocate(1);
 
     if (!isDone) {
-      assert(data.size() == 98*5);
+      assert(data.size() == 242*5);
     }
     
     std::unordered_map<std::string, double> info;
@@ -213,15 +217,33 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     state["info:drawdown"_] = info["drawdown"];
     state["info:fees"_] = info["fees"];
 
+    InfoData curr_data;
+    curr_data.rpnl = info["realized_pnl"];
+    curr_data.upnl = info["unrealized_pnl"];
+    curr_data.fees = info["fees"];
 
-    auto pnl = info["realized_pnl"] - previous_rpnl; 
-    auto upnl = info["unrealized_pnl"]- previous_upnl;
-    state["reward"_] = (previous_fees - info["fees"]) +  pnl +  upnl;
-    previous_rpnl = info["realized_pnl"];
-    previous_upnl = info["unrealized_pnl"];
-    previous_fees = info["fees"];
+    if (isDone || steps % 301 == 0) {
+        auto reward = curr_data.rpnl + curr_data.upnl - curr_data.fees;
+        if (reward > 0) reward /= (0.0001 + std::abs(info["drawdown"]));
+    }
+    else if (info_data.size() < max_deque_size) {
+        reward = curr_data.rpnl + curr_data.upnl - curr_data.fees;
+    } else {
+	auto prev_data = info_data.front();
+	double rpnl = curr_data.rpnl - prev_data.rpnl;
+	double upnl = curr_data.upnl - prev_data.upnl;
+	double fees = curr_data.fees - prev_data.fees;
+	reward = rpnl + upnl - fees;
+    }
+
+    info_data.push_back(curr_data);
+    if (info_data.size() > max_deque_size) {
+         info_data.pop_front();
+    }
+
+    state["reward"_] = reward;
+
     state["obs"_].Assign(data.begin(), data.size());
-    if (isDone) return;
   }
 
   bool IsDone() override { return isDone; }
