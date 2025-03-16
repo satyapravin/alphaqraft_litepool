@@ -79,6 +79,18 @@ class RecurrentActor(nn.Module):
         action = torch.tanh(action)  
         return action, hidden
 
+    def action_log_prob(self, state, hidden=None):
+        mean, std, hidden = self.forward(state, hidden)
+        normal_dist = torch.distributions.Normal(mean, std)
+
+        raw_action = normal_dist.rsample()
+        action = torch.tanh(raw_action)
+
+        log_prob = normal_dist.log_prob(raw_action) - torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(dim=-1, keepdim=True)
+        return action, log_prob
+
+
     def set_training_mode(self, mode: bool):
         self.train(mode)
 
@@ -98,14 +110,15 @@ class TransformerCritic(nn.Module):
         self.transformer_layer = nn.TransformerEncoderLayer(d_model=transformer_dim, nhead=num_heads)
         self.transformer = nn.TransformerEncoder(self.transformer_layer, num_layers=2)
         self.fc2 = nn.Linear(transformer_dim, 256)
-        self.q_out = nn.Linear(256, 1)  # Single Q-value output
+        self.q_1_out = nn.Linear(256, 1)  
+        self.q_2_out = nn.Linear(256, 1)  
 
     def forward(self, state, action):
         x = torch.cat([state, action], dim=-1)
         x = F.relu(self.fc1(x)).unsqueeze(0)  
         x = self.transformer(x).squeeze(0)
         x = F.relu(self.fc2(x))
-        return self.q_out(x)
+        return self.q_1_out(x), self.q_2_out(x)
 
     def set_training_mode(self, mode: bool):
         self.train(mode) 
@@ -124,6 +137,7 @@ class CustomFQFDSACPolicy(SACPolicy):
         # Initialize LSTM-based Actor
         self.actor = RecurrentActor(state_dim, action_dim)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=3e-4)
+        self.actor.optimizer = self.actor_optimizer
         self.actor_scheduler = CosineAnnealingLR(self.actor_optimizer, T_max=100000, eta_min=1e-5)
 
         # Initialize Transformer-based Critic
@@ -131,6 +145,7 @@ class CustomFQFDSACPolicy(SACPolicy):
         self.critic_target = TransformerCritic(state_dim, action_dim)
 
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=3e-4)
+        self.critic.optimizer = self.critic_optimizer
         self.critic_scheduler = CosineAnnealingLR(self.critic_optimizer, T_max=100000, eta_min=1e-5)
 
         # Copy weights to target network
@@ -166,7 +181,7 @@ class CustomFQFDSAC(SAC):
         next_states = replay_data.next_observations
         dones = replay_data.dones
 
-        hidden_actor = None  
+        hidden_actor = None
         hidden_critic = None
 
         with torch.no_grad():
@@ -175,23 +190,19 @@ class CustomFQFDSAC(SAC):
             target_quantiles = rewards + (1 - dones) * self.gamma * next_q_values
 
         current_q_values = self.critic(states, actions)
-
         critic_loss = F.smooth_l1_loss(current_q_values, target_quantiles)
 
-        self.critic_optimizer.zero_grad()
+        self.policy.critic_optimizer.zero_grad()
         critic_loss.backward()
-        self.critic_optimizer.step()
-        self.critic_scheduler.step()
+        self.policy.critic_optimizer.step()
 
         new_actions, log_probs, hidden_actor = self.actor.sample(states, hidden_actor)
         q_values_new = self.critic(states, new_actions)
         actor_loss = (self.alpha * log_probs - q_values_new.mean()).mean()
 
-        self.actor_optimizer.zero_grad()
+        self.policy.optimizer.zero_grad()
         actor_loss.backward()
-        self.actor_optimizer.step()
-        self.actor_scheduler.step()
-
+        self.policy.optimizer.step()
         return {"critic_loss": critic_loss.item(), "actor_loss": actor_loss.item(), "entropy_loss": log_probs.mean().item()}
 
 
@@ -285,8 +296,8 @@ env = litepool.make("RlTrader-v0", env_type="gymnasium",
                           taker_fee=0.0005,
                           foldername="./train_files/", 
                           balance=1.0,
-                          start=1,
-                          max=3601*50)
+                          start=7200,
+                          max=3601*5)
 
 env.spec.id = 'RlTrader-v0'
 
@@ -313,13 +324,16 @@ model = CustomFQFDSAC(
     device=device)
 
 if os.path.exists("sac_fqf_rltrader.zip"):
-    model = SAC.load("sac_fqf_rltrader.zip")
+    model = CustomFQFDSAC.load("sac_fqf_rltrader.zip", env=env, device=device)
+    model.ent_coef = "auto"
+    model.log_ent_coef = torch.tensor(0.0, requires_grad=True, device=model.device)
+    model.ent_coef_optimizer = torch.optim.Adam([model.log_ent_coef], lr=1e-4)
 
     if os.path.exists("replay_fqf_buffer.pkl"):
         model.load_replay_buffer("replay_fqf_buffer.pkl")
     print("saved fqf model loaded")
 
 for i in range(0, 50):
-    model.learn(3605*32*50)
+    model.learn(3605*32)
     model.save("sac_fqf_rltrader")
     model.save_replay_buffer("replay_fqf_buffer.pkl")

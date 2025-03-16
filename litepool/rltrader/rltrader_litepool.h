@@ -79,8 +79,8 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) ActionSpec(const Config& conf) {
-    return MakeDict("action"_.Bind(Spec<float>({10}, {{-1., -1., -1., -1., -1., -1., -1., -1., 1, 1},
-				                      { 1.,  1.,  1.,  1.,  1.,  1.,  1.,  1., 5, 5}})));
+    return MakeDict("action"_.Bind(Spec<float>({8}, {{-1., -1., -1., -1., -1., -1., -1., -1.},
+				                     { 1.,  1.,  1.,  1.,  1.,  1.,  1.,  1.}})));
   }
 };
 
@@ -89,7 +89,7 @@ using RlTraderEnvSpec = EnvSpec<RlTraderEnvFns>;
 
 class RlTraderEnv : public Env<RlTraderEnvSpec> {
  protected:
-  int spreads[4] = {0, 1, 3, 10};
+  int spreads[4] = {0, 2, 4, 10};
   int state_{0};
   bool isDone = true;
   bool is_prod = false;
@@ -189,9 +189,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
       auto buy_spread = spreads[buy_action];
       auto sell_spread = spreads[sell_action];
 
-      auto buy_vol = static_cast<double>(action_dict["action"_][8]);
-      auto sell_vol = static_cast<double>(action_dict["action"_][9]);
-      adaptor_ptr->quote(buy_spread, sell_spread, buy_vol, sell_vol);
+      adaptor_ptr->quote(buy_spread, sell_spread, 2, 2);
       isDone = !adaptor_ptr->next();
       ++steps;
       WriteState();
@@ -223,17 +221,18 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     curr_data.fees = info["fees"];
 
     if (isDone || steps % 301 == 0) {
-        auto reward = curr_data.rpnl + curr_data.upnl - curr_data.fees;
+        auto reward = curr_data.rpnl + std::min(0.0, curr_data.upnl) - curr_data.fees;
         if (reward > 0) reward /= (0.0001 + std::abs(info["drawdown"]));
     }
     else if (info_data.size() < max_deque_size) {
-        reward = curr_data.rpnl + curr_data.upnl - curr_data.fees;
+        reward = curr_data.rpnl + std::min(0.0, curr_data.upnl) - curr_data.fees;
     } else {
 	auto prev_data = info_data.front();
 	double rpnl = curr_data.rpnl - prev_data.rpnl;
 	double upnl = curr_data.upnl - prev_data.upnl;
 	double fees = curr_data.fees - prev_data.fees;
-	reward = rpnl + upnl - fees;
+	double count = info["trade_count"] / steps - 0.05;
+	reward = rpnl + std::min(0.0, upnl) - fees + std::min(0.0, count);
     }
 
     info_data.push_back(curr_data);
