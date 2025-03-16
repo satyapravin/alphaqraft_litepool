@@ -33,50 +33,54 @@ from litepool.python.protocol import LitePool
 
 device = torch.device("cuda")
 
-# ---------------------------
-# 1. Recurrent Actor with Multi-Layer LSTM
-# ---------------------------
+# ------------------
+# 1. Recurrent Actor 
+# ------------------
 class RecurrentActor(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=256, lstm_hidden_dim=128, num_layers=2):
+    def __init__(self, state_dim=1210, action_dim=3, hidden_dim=256, gru_hidden_dim=128, num_layers=2):
         super(RecurrentActor, self).__init__()
-        self.lstm_hidden_dim = lstm_hidden_dim
+        self.gru_hidden_dim = gru_hidden_dim
         self.num_layers = num_layers
+        self.time_steps = 5 
+        self.feature_dim = 242
 
-        self.fc1 = nn.Linear(state_dim, hidden_dim)
-        self.lstm = nn.LSTM(hidden_dim, lstm_hidden_dim, num_layers=num_layers, batch_first=True, dropout=0.2)
-        self.fc2 = nn.Linear(lstm_hidden_dim, hidden_dim)
+        self.fc1 = nn.Linear(self.feature_dim, hidden_dim) 
+        self.gru = nn.GRU(hidden_dim, gru_hidden_dim, num_layers=num_layers, batch_first=True, dropout=0.2)
+        self.fc2 = nn.Linear(gru_hidden_dim, hidden_dim)
         self.mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Linear(hidden_dim, action_dim)
 
     def init_hidden(self, batch_size, device):
-        h_0 = torch.zeros(self.num_layers, batch_size, self.lstm_hidden_dim, device=device)
-        c_0 = torch.zeros(self.num_layers, batch_size, self.lstm_hidden_dim, device=device)
-        return (h_0, c_0)
+        return torch.zeros(self.num_layers, batch_size, self.gru_hidden_dim, device=device)
 
     def forward(self, state, hidden=None):
         if isinstance(state, np.ndarray):
             state = torch.tensor(state, dtype=torch.float32, device=next(self.parameters()).device)
 
-        x = F.relu(self.fc1(state))
+        batch_size = state.shape[0]
+        state = state.view(batch_size, self.time_steps, self.feature_dim) 
 
-        batch_size = state.shape[0] if state.dim() > 1 else 1
-        if hidden is None or isinstance(hidden, bool):
+        x = F.relu(self.fc1(state)) 
+
+        if hidden is None:
             hidden = self.init_hidden(batch_size, state.device)
 
-        x, hidden = self.lstm(x.unsqueeze(0) if state.dim() == 1 else x.unsqueeze(1), hidden)
-        x = F.relu(self.fc2(x.squeeze(0) if state.dim() == 1 else x.squeeze(1)))
+        x, hidden = self.gru(x, hidden)  # Process sequence
+        x = F.relu(self.fc2(x[:, -1, :]))  # Take last timestep output
 
         mean = self.mean(x)
         log_std = self.log_std(x).clamp(-20, 2)
         std = log_std.exp()
+        return mean, std, hidden
 
-        return mean, std, hidden 
+    def set_training_mode(self, mode: bool):
+        self.train(mode)
 
     def sample(self, state, hidden=None, deterministic=False):
         mean, std, hidden = self.forward(state, hidden)
         normal_dist = torch.distributions.Normal(mean, std)
         action = mean if deterministic else normal_dist.rsample()
-        action = torch.tanh(action)  
+        action = torch.tanh(action)
         return action, hidden
 
     def action_log_prob(self, state, hidden=None):
@@ -91,37 +95,39 @@ class RecurrentActor(nn.Module):
         return action, log_prob
 
 
-    def set_training_mode(self, mode: bool):
-        self.train(mode)
-
-
 # ---------------------------
 # 2. Transformer-Based Twin Critic
 # ---------------------------
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-
 class TransformerCritic(nn.Module):
-    def __init__(self, state_dim, action_dim, transformer_dim=128, num_heads=4):
+    def __init__(self, state_dim=1210, action_dim=3, transformer_dim=128, num_heads=4):
         super(TransformerCritic, self).__init__()
-        self.fc1 = nn.Linear(state_dim + action_dim, transformer_dim)
-        self.transformer_layer = nn.TransformerEncoderLayer(d_model=transformer_dim, nhead=num_heads)
+        self.time_steps = 5
+        self.feature_dim = 242
+
+        self.fc1 = nn.Linear(self.feature_dim + action_dim, transformer_dim)
+
+        self.transformer_layer = nn.TransformerEncoderLayer(d_model=transformer_dim, nhead=num_heads, batch_first=True)
         self.transformer = nn.TransformerEncoder(self.transformer_layer, num_layers=2)
+
         self.fc2 = nn.Linear(transformer_dim, 256)
-        self.q_1_out = nn.Linear(256, 1)  
-        self.q_2_out = nn.Linear(256, 1)  
+        self.q_1_out = nn.Linear(256, 1)
+        self.q_2_out = nn.Linear(256, 1)
 
     def forward(self, state, action):
-        x = torch.cat([state, action], dim=-1)
-        x = F.relu(self.fc1(x)).unsqueeze(0)  
-        x = self.transformer(x).squeeze(0)
-        x = F.relu(self.fc2(x))
+        batch_size = state.shape[0]
+
+        state = state.view(batch_size, self.time_steps, self.feature_dim)  
+        action = action.unsqueeze(1).expand(-1, self.time_steps, -1)  # Expand action to match sequence length
+
+        x = torch.cat([state, action], dim=-1)  
+        x = F.relu(self.fc1(x))
+
+        x = self.transformer(x) 
+        x = F.relu(self.fc2(x[:, -1, :]))  
         return self.q_1_out(x), self.q_2_out(x)
 
     def set_training_mode(self, mode: bool):
-        self.train(mode) 
+        self.train(mode)
 
 
 # ---------------------------
@@ -131,43 +137,33 @@ class CustomFQFDSACPolicy(SACPolicy):
     def __init__(self, observation_space, action_space, lr_schedule, **kwargs):
         super(CustomFQFDSACPolicy, self).__init__(observation_space, action_space, lr_schedule, **kwargs)
 
-        state_dim = observation_space.shape[0]
+        state_dim = observation_space.shape[0]  # Expecting 1210 (5 * 242)
         action_dim = action_space.shape[0]
 
-        # Initialize LSTM-based Actor
         self.actor = RecurrentActor(state_dim, action_dim)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=3e-4)
         self.actor.optimizer = self.actor_optimizer
-        self.actor_scheduler = CosineAnnealingLR(self.actor_optimizer, T_max=100000, eta_min=1e-5)
 
-        # Initialize Transformer-based Critic
         self.critic = TransformerCritic(state_dim, action_dim)
         self.critic_target = TransformerCritic(state_dim, action_dim)
 
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=3e-4)
         self.critic.optimizer = self.critic_optimizer
-        self.critic_scheduler = CosineAnnealingLR(self.critic_optimizer, T_max=100000, eta_min=1e-5)
-
-        # Copy weights to target network
         self.critic_target.load_state_dict(self.critic.state_dict())
 
     def forward(self, obs, hidden, deterministic=False):
         return self.actor.sample(obs, hidden, deterministic)
 
-    def predict(self, observation, state=None, episode_start=None, deterministic=False):
+    def predict(self, observation, state=None, deterministic=False):
         if state is None:
-            batch_size = observation.shape[0] if isinstance(observation, np.ndarray) else 1
-            state = self.actor.init_hidden(batch_size, device=observation.device if torch.is_tensor(observation) else "cuda")
+            batch_size = observation.shape[0] if torch.is_tensor(observation) else 1
+            state = self.actor.init_hidden(batch_size, device=device)
 
         if isinstance(observation, np.ndarray):
             observation = torch.tensor(observation, dtype=torch.float32, device=next(self.actor.parameters()).device)
 
         action, new_state = self.actor.sample(observation, state, deterministic=deterministic)
-        return action.detach().cpu().numpy(), new_state 
-
-    @property
-    def optimizer(self):
-        return self.actor_optimizer 
+        return action.detach().cpu().numpy(), new_state
 
 # ---------------------------
 # 4. Improved Training Step with Persistent Hidden States
@@ -292,11 +288,11 @@ env = litepool.make("RlTrader-v0", env_type="gymnasium",
                           symbol="BTC-PERPETUAL",
                           tick_size=0.5,
                           min_amount=10,
-                          maker_fee=-0.0001,
+                          maker_fee=-0.00001,
                           taker_fee=0.0005,
                           foldername="./train_files/", 
                           balance=1.0,
-                          start=7200,
+                          start=720000,
                           max=3601*5)
 
 env.spec.id = 'RlTrader-v0'
@@ -312,7 +308,7 @@ model = CustomFQFDSAC(
     env,
     batch_size=256,
     buffer_size=1000000,                
-    learning_rate=3e-4,
+    learning_rate=1e-4,
     gamma=0.99,
     tau=0.005,
     learning_starts=100,        

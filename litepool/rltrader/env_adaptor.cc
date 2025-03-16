@@ -83,7 +83,7 @@ void EnvAdaptor::computeInfo(OrderBook &book) {
     info["trade_count"] = static_cast<double>(tradeInfo.buy_trades + tradeInfo.sell_trades);
     info["drawdown"] = drawdown;
     info["fees"] = posInfo.fees;
-    info["delta_amount"] = tradeInfo.buy_amount - tradeInfo.sell_amount;
+    info["average_price"] = posInfo.averagePrice;
 }
 
 

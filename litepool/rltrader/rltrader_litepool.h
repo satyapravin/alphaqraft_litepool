@@ -106,7 +106,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   int start_read = 0;
   int max_read = 0;
   long long steps = 0;
-  int max_deque_size = 1;
+  int max_deque_size = 5;
   std::deque<InfoData> info_data;
   double reward = 0.0;
   std::unique_ptr<RLTrader::BaseInstrument> instr_ptr;
@@ -189,7 +189,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
       auto buy_spread = spreads[buy_action];
       auto sell_spread = spreads[sell_action];
 
-      adaptor_ptr->quote(buy_spread, sell_spread, 2, 2);
+      adaptor_ptr->quote(buy_spread, sell_spread, 5, 5);
       isDone = !adaptor_ptr->next();
       ++steps;
       WriteState();
@@ -220,19 +220,22 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     curr_data.upnl = info["unrealized_pnl"];
     curr_data.fees = info["fees"];
 
-    if (isDone || steps % 301 == 0) {
-        auto reward = curr_data.rpnl + std::min(0.0, curr_data.upnl) - curr_data.fees;
+    if (isDone) {
+        auto reward = curr_data.rpnl + curr_data.upnl - curr_data.fees;
         if (reward > 0) reward /= (0.0001 + std::abs(info["drawdown"]));
     }
     else if (info_data.size() < max_deque_size) {
-        reward = curr_data.rpnl + std::min(0.0, curr_data.upnl) - curr_data.fees;
+        reward = curr_data.rpnl + curr_data.upnl; 
     } else {
-	auto prev_data = info_data.front();
-	double rpnl = curr_data.rpnl - prev_data.rpnl;
-	double upnl = curr_data.upnl - prev_data.upnl;
-	double fees = curr_data.fees - prev_data.fees;
-	double count = info["trade_count"] / steps - 0.05;
-	reward = rpnl + std::min(0.0, upnl) - fees + std::min(0.0, count);
+        if (steps % 5 == 0) {
+	    auto prev_data = info_data.front();
+            double rpnl = curr_data.rpnl - prev_data.rpnl;
+            double upnl = curr_data.upnl - prev_data.upnl;
+            double fees = curr_data.fees - prev_data.fees;
+            reward = rpnl + upnl - fees;
+	} else {
+            reward = info["leverage"] * (info["mid_price"] - info["average_price"]) / info["balance"];
+        }
     }
 
     info_data.push_back(curr_data);
