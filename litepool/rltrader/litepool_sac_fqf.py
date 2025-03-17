@@ -62,11 +62,11 @@ class RecurrentActor(nn.Module):
 
         x = F.relu(self.fc1(state)) 
 
-        if hidden is None:
+        if hidden is None or hidden.shape[1] != batch_size:
             hidden = self.init_hidden(batch_size, state.device)
 
-        x, hidden = self.gru(x, hidden)  # Process sequence
-        x = F.relu(self.fc2(x[:, -1, :]))  # Take last timestep output
+        x, hidden = self.gru(x, hidden)  
+        x = F.relu(self.fc2(x[:, -1, :]))
 
         mean = self.mean(x)
         log_std = self.log_std(x).clamp(-20, 2)
@@ -154,7 +154,7 @@ class CustomFQFDSACPolicy(SACPolicy):
     def forward(self, obs, hidden, deterministic=False):
         return self.actor.sample(obs, hidden, deterministic)
 
-    def predict(self, observation, state=None, deterministic=False):
+    def predict(self, observation, state=None, episode_start=None, deterministic=False):
         if state is None:
             batch_size = observation.shape[0] if torch.is_tensor(observation) else 1
             state = self.actor.init_hidden(batch_size, device=device)
@@ -164,7 +164,6 @@ class CustomFQFDSACPolicy(SACPolicy):
 
         action, new_state = self.actor.sample(observation, state, deterministic=deterministic)
         return action.detach().cpu().numpy(), new_state
-
 # ---------------------------
 # 4. Improved Training Step with Persistent Hidden States
 # ---------------------------
@@ -288,7 +287,7 @@ env = litepool.make("RlTrader-v0", env_type="gymnasium",
                           symbol="BTC-PERPETUAL",
                           tick_size=0.5,
                           min_amount=10,
-                          maker_fee=-0.00001,
+                          maker_fee=-0.0001,
                           taker_fee=0.0005,
                           foldername="./train_files/", 
                           balance=1.0,
@@ -321,9 +320,9 @@ model = CustomFQFDSAC(
 
 if os.path.exists("sac_fqf_rltrader.zip"):
     model = CustomFQFDSAC.load("sac_fqf_rltrader.zip", env=env, device=device)
-    model.ent_coef = "auto"
-    model.log_ent_coef = torch.tensor(0.0, requires_grad=True, device=model.device)
-    model.ent_coef_optimizer = torch.optim.Adam([model.log_ent_coef], lr=1e-4)
+    #model.ent_coef = "auto"
+    #model.log_ent_coef = torch.tensor(0.0, requires_grad=True, device=model.device)
+    #model.ent_coef_optimizer = torch.optim.Adam([model.log_ent_coef], lr=1e-4)
 
     if os.path.exists("replay_fqf_buffer.pkl"):
         model.load_replay_buffer("replay_fqf_buffer.pkl")

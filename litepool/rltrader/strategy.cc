@@ -32,8 +32,8 @@ void Strategy::quote(int buy_spread, int sell_spread, const double& buy_percent,
 	auto posInfo = position.getPositionInfo(bid_prices[0], ask_prices[0]);
 	auto leverage = posInfo.leverage;
         auto initBalance = position.getInitialBalance();
-        double buy_denom = 50;
-        double sell_denom = 50;
+        double buy_denom = 500;
+        double sell_denom = 500;
 
 	double buy_volume = initBalance * buy_percent / buy_denom;
 	double sell_volume = initBalance * sell_percent / sell_denom;
