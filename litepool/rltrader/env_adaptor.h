@@ -10,7 +10,12 @@ class EnvAdaptor {
 public:
     EnvAdaptor(Strategy& strat, BaseExchange& exch);
     ~EnvAdaptor()  = default;
-    void quote(int buy_spread, int sell_spread, const double& buy_percent, const double& sell_percent) ;
+    
+    void quote(const std::vector<double>& buy_spreads, 
+	       const std::vector<double>& sell_spreads, 
+	       const std::vector<double>& buy_volumes, 
+	       const std::vector<double>& sell_volumes);
+
     void reset() ;
     bool next() ;
     void getInfo(std::unordered_map<std::string, double>& info) ;

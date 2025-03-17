@@ -157,12 +157,12 @@ TEST_CASE("env adaptor test") {
 	adaptor.next();
 	adaptor.getState(state);
 	CHECK(state.size() == 242*5);
-	adaptor.quote(1, 1, 10, 10);
+	adaptor.quote({0.01}, {0.01}, {0.01}, {0.01});
 
 	for (int ii=0; ii < 500; ++ii) {
 		adaptor.next();
 		adaptor.getState(state);
-		adaptor.quote(0, 0, 10, 10);
+	        adaptor.quote({0.0}, {0.0}, {0.01}, {0.01});
 	}
 
 	adaptor.next();
@@ -656,7 +656,7 @@ TEST_CASE("test of inverse strategy") {
 	exch.next_read(slot, book);
 	InverseInstrument instr("BTC", 0.5, 10.0, 0, 0.0005);
 	Strategy strategy(instr, exch, 0.015, 5);
-	strategy.quote(2, 2, 1, 1, book.bid_prices, book.ask_prices);
+	strategy.quote({0.01}, {0.01}, {0.01}, {0.01}, book.bid_prices, book.ask_prices);
 	exch.next_read(slot, book);
 	const auto& bids = exch.getBidOrders();
 	const auto& asks = exch.getAskOrders();
@@ -671,7 +671,7 @@ TEST_CASE("test of normal strategy") {
 	exch.next_read(slot, book);
 	NormalInstrument instr("BTCUSDT", 0.1, .0001, -0.0001, 0.0075);
 	Strategy strategy(instr, exch, 2000,  5);
-	strategy.quote(2, 2, 1, 1, book.bid_prices, book.ask_prices);
+	strategy.quote({0.01}, {0.01}, {0.01}, {0.01}, book.bid_prices, book.ask_prices);
 	exch.next_read(slot, book);
 	const auto& bids = exch.getBidOrders();
 	const auto& asks = exch.getAskOrders();

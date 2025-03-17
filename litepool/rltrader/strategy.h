@@ -13,8 +13,12 @@ namespace RLTrader {
 			
 		void reset();
 
-		void quote(int buy_spread, int sell_spread, const double& buy_percent, const double& sell_percent,
-		           FixedVector<double, 20>& bid_prices, FixedVector<double, 20>& ask_prices);
+		void quote(const std::vector<double>& buy_spreads, 
+			   const std::vector<double>& sell_spreads, 
+			   const std::vector<double>& buy_volumes, 
+			   const std::vector<double>& sell_volumes,
+		           FixedVector<double, 20>& bid_prices, 
+			   FixedVector<double, 20>& ask_prices);
 
 		Position& getPosition() { return position; }
 
@@ -26,7 +30,5 @@ namespace RLTrader {
 		Position position;
 		int order_id;
 		int max_ticks;
-		void sendGrid(int levels, int start_level,
-			      const double& amount, OrderSide side, FixedVector<double, 20>& refPrices);
 	};
 }

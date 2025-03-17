@@ -27,42 +27,44 @@ void Strategy::reset() {
 	this->order_id = 0;
 }
 
-void Strategy::quote(int buy_spread, int sell_spread, const double& buy_percent, const double& sell_percent,
-                     FixedVector<double, 20>& bid_prices, FixedVector<double, 20>& ask_prices) {
+void Strategy::quote(const std::vector<double>& buy_spreads,
+                     const std::vector<double>& sell_spreads,
+                     const std::vector<double>& buy_volumes,
+                     const std::vector<double>& sell_volumes,
+                     FixedVector<double, 20>& bid_prices,
+                     FixedVector<double, 20>& ask_prices) {
+	auto tick_size = instrument.getTickSize();
 	auto posInfo = position.getPositionInfo(bid_prices[0], ask_prices[0]);
 	auto leverage = posInfo.leverage;
         auto initBalance = position.getInitialBalance();
-        double buy_denom = 500;
-        double sell_denom = 500;
+        auto skew = static_cast<int>(2 * leverage) * tick_size;
+        
+       	auto base_bid_price = bid_prices[0];
+	auto base_ask_price = ask_prices[0];
 
-	double buy_volume = initBalance * buy_percent / buy_denom;
-	double sell_volume = initBalance * sell_percent / sell_denom;
-        int skew = static_cast<int>(5 * leverage);
-        buy_spread = std::max(0, buy_spread + skew);
-        sell_spread = std::max(0, sell_spread - skew);
-       
-        if (this->exchange.isDummy())	
+	auto bid_width = 0.05 * base_bid_price;
+        auto ask_width = 0.05 * base_ask_price;
+        
+	if (this->exchange.isDummy())	
             this->exchange.cancelOrders();
 
-        if (buy_volume > 0 && buy_spread >= 0 && buy_spread < 20)
-        	this->sendGrid(1, buy_spread, buy_volume, OrderSide::BUY, bid_prices);
-        if (sell_volume > 0 && sell_spread >= 0 && sell_spread < 20)
-        	this->sendGrid(1, sell_spread, sell_volume, OrderSide::SELL, ask_prices);
-}
+        for (auto ii = 0; ii < buy_spreads.size(); ++ii) {
+             auto bid_spread = std::ceil(buy_spreads[ii] * bid_width / tick_size) * tick_size;
+	     auto ask_spread = std::ceil(sell_spreads[ii] * ask_width / tick_size) * tick_size;
+	     auto bid_quote = base_bid_price - bid_spread;
+	     auto ask_quote = base_ask_price + ask_spread;
+	     base_bid_price = std::min(base_bid_price, bid_quote + skew);
+	     base_ask_price = std::max(base_ask_price, ask_quote - skew);
+	     auto bid_size = buy_volumes[ii] * initBalance * 0.1;
+	     auto ask_size = sell_volumes[ii] * initBalance * 0.1;
+	     bid_size = instrument.getTradeAmount(bid_size, base_bid_price);
+	     ask_size = instrument.getTradeAmount(ask_size, base_bid_price);
+	     if (bid_size > 0 && base_bid_price <= bid_prices[0] + 1e-10)
+             	this->exchange.quote(std::to_string(++order_id), OrderSide::BUY, base_bid_price, bid_size);
+	     if (ask_size > 0 && base_ask_price >= ask_prices[0] - 1e-10)
+             	this->exchange.quote(std::to_string(++order_id), OrderSide::SELL, base_ask_price, ask_size);
+	}
 
-void Strategy::sendGrid(int levels, int start_level, const double& amount,
-	                    OrderSide side, FixedVector<double, 20>& refPrices) {
-        for (int ii = 0; ii < levels; ++ii) {
-	     auto idx = ii + start_level;
-             if (idx + 1 < 20) {
-                 double spread = std::abs(refPrices[idx] - refPrices[idx + 1]);
-		 if (spread * 0.95 > instrument.getTickSize()) ++idx;
-	     }
-	     auto trade_amount = instrument.getTradeAmount(amount, refPrices[idx]);
-             if (trade_amount >= instrument.getMinAmount()) {
-             	this->exchange.quote(std::to_string(++order_id), side, refPrices[idx], trade_amount);
-             }
-        }
 }
 
 void Strategy::next() {

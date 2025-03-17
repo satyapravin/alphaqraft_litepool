@@ -39,8 +39,9 @@ device = torch.device("cuda")
 class RecurrentActor(nn.Module):
     def __init__(self, state_dim=1210, action_dim=3, hidden_dim=256, gru_hidden_dim=128, num_layers=2):
         super(RecurrentActor, self).__init__()
-self.gru_hidden_dim = gru_hidden_dim
+        self.gru_hidden_dim = gru_hidden_dim
         self.num_layers = num_layers
+        self.feature_dim = 242
         self.time_steps = 5  
 
         self.position_dim = 18
@@ -84,15 +85,15 @@ self.gru_hidden_dim = gru_hidden_dim
             state = torch.tensor(state, dtype=torch.float32, device=next(self.parameters()).device)
 
         batch_size = state.shape[0]
-        state = state.view(batch_size, self.time_steps, -1) 
+        state = state.view(batch_size, self.time_steps, self.feature_dim)  # Reshape to (batch, time_steps, 242)
 
-        position_state = state[:, -1, :self.position_dim] 
-        trade_state = state[:, :, self.position_dim:self.position_dim + self.trade_dim] 
-        market_state = state[:, :, self.position_dim + self.trade_dim:] 
+        market_state = state[:, :, :self.market_dim]  # First 218 values → Market signals
+        position_state = state[:, -1, self.market_dim:self.market_dim + self.position_dim]  # Next 18 values → Position signals
+        trade_state = state[:, :, self.market_dim + self.position_dim:]  # Last 6 values → Trade signals
 
         position_out = self.position_fc(position_state) 
-        trade_out = self.trade_fc(trade_state) 
-        market_out = self.market_fc(market_state)
+        trade_out = self.trade_fc(trade_state)  
+        market_out = self.market_fc(market_state)  
 
         x = torch.cat([trade_out, market_out], dim=-1) 
 
@@ -100,14 +101,15 @@ self.gru_hidden_dim = gru_hidden_dim
             hidden = self.init_hidden(batch_size, state.device)
 
         x, hidden = self.gru(x, hidden)  
-        x = x[:, -1, :] 
+        x = x[:, -1, :]  
         x = torch.cat([x, position_out], dim=-1) 
-        x = F.relu(self.fusion_fc(x))  
+
+        x = F.relu(self.fusion_fc(x))
+
         mean = self.mean(x)
         log_std = self.log_std(x).clamp(-20, 2)
         std = log_std.exp()
         return mean, std, hidden
-
 
     def set_training_mode(self, mode: bool):
         self.train(mode)
@@ -139,33 +141,75 @@ class TransformerCritic(nn.Module):
     def __init__(self, state_dim=1210, action_dim=3, transformer_dim=128, num_heads=4):
         super(TransformerCritic, self).__init__()
         self.time_steps = 5
-        self.feature_dim = 242
+        self.feature_dim = 242  # 242 per timestep
 
-        self.fc1 = nn.Linear(self.feature_dim + action_dim, transformer_dim)
+        self.position_dim = 18
+        self.trade_dim = 6
+        self.market_dim = 242 - (18 + 6)  # 218 market features
 
+        # Process position features separately
+        self.position_fc = nn.Sequential(
+            nn.Linear(self.position_dim, 64),
+            nn.ReLU(),
+            nn.LayerNorm(64),
+            nn.Linear(64, 32),
+            nn.ReLU()
+        )
+
+        # Trade and market features go through Transformer
+        self.trade_fc = nn.Sequential(
+            nn.Linear(self.trade_dim, 64),
+            nn.ReLU(),
+            nn.LayerNorm(64),
+            nn.Linear(64, 32),
+            nn.ReLU()
+        )
+
+        self.market_fc = nn.Sequential(
+            nn.Linear(self.market_dim, 128),
+            nn.ReLU(),
+            nn.LayerNorm(128),
+            nn.Linear(128, 32),
+            nn.ReLU()
+        )
+
+        # Transformer processes time-dependent trade & market signals
+        self.fc1 = nn.Linear(64 + action_dim, transformer_dim)  # 64 = trade (32) + market (32)
         self.transformer_layer = nn.TransformerEncoderLayer(d_model=transformer_dim, nhead=num_heads, batch_first=True)
         self.transformer = nn.TransformerEncoder(self.transformer_layer, num_layers=2)
 
-        self.fc2 = nn.Linear(transformer_dim, 256)
+        # Fix: Adjust `self.fc2` input size to match concatenated features
+        self.fc2 = nn.Linear(transformer_dim + 32, 256)  # Transformer output (128) + Position features (32)
+        
         self.q_1_out = nn.Linear(256, 1)
         self.q_2_out = nn.Linear(256, 1)
 
     def forward(self, state, action):
         batch_size = state.shape[0]
-
         state = state.view(batch_size, self.time_steps, self.feature_dim)  
-        action = action.unsqueeze(1).expand(-1, self.time_steps, -1)  # Expand action to match sequence length
 
-        x = torch.cat([state, action], dim=-1)  
+        # Correct feature extraction
+        market_state = state[:, :, :self.market_dim]  # First 218 values → Market signals
+        position_state = state[:, -1, self.market_dim:self.market_dim + self.position_dim]  # Last timestep position
+        trade_state = state[:, :, self.market_dim + self.position_dim:]  # Last 6 values → Trade signals
+
+        position_out = self.position_fc(position_state)  
+        trade_out = self.trade_fc(trade_state) 
+        market_out = self.market_fc(market_state) 
+
+        x = torch.cat([trade_out, market_out], dim=-1)  
+        action = action.unsqueeze(1).expand(-1, self.time_steps, -1)
+        x = torch.cat([x, action], dim=-1)  
+
         x = F.relu(self.fc1(x))
+        x = self.transformer(x)
 
-        x = self.transformer(x) 
-        x = F.relu(self.fc2(x[:, -1, :]))  
+        x = torch.cat([x[:, -1, :], position_out], dim=-1) 
+        x = F.relu(self.fc2(x))  
         return self.q_1_out(x), self.q_2_out(x)
-
+    
     def set_training_mode(self, mode: bool):
         self.train(mode)
-
 
 # ---------------------------
 # 3. Custom FQF-DSAC Policy with Proper Initialization
@@ -329,7 +373,7 @@ env = litepool.make("RlTrader-v0", env_type="gymnasium",
                           foldername="./train_files/", 
                           balance=1.0,
                           start=720000,
-                          max=3601*5)
+                          max=3601*50)
 
 env.spec.id = 'RlTrader-v0'
 
@@ -366,6 +410,6 @@ if os.path.exists("sac_fqf_rltrader.zip"):
     print("saved fqf model loaded")
 
 for i in range(0, 50):
-    model.learn(3605*32)
+    model.learn(3605*320)
     model.save("sac_fqf_rltrader")
     model.save_replay_buffer("replay_fqf_buffer.pkl")
