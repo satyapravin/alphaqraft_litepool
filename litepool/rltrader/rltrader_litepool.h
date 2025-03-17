@@ -79,8 +79,8 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) ActionSpec(const Config& conf) {
-    return MakeDict("action"_.Bind(Spec<float>({8}, {{-1., -1., -1., -1., -1., -1., -1., -1.},
-				                     { 1.,  1.,  1.,  1.,  1.,  1.,  1.,  1.}})));
+    return MakeDict("action"_.Bind(Spec<float>({12}, {{-1., -1., -1., -1., -1., -1., -1., -1., -1., -1., -1, -1.},
+				                      { 1.,  1.,  1.,  1.,  1.,  1.,  1.,  1.,  1.,  1.,  1., 1.}})));
   }
 };
 
@@ -89,7 +89,6 @@ using RlTraderEnvSpec = EnvSpec<RlTraderEnvFns>;
 
 class RlTraderEnv : public Env<RlTraderEnvSpec> {
  protected:
-  int spreads[4] = {0, 2, 4, 10};
   int state_{0};
   bool isDone = true;
   bool is_prod = false;
@@ -165,31 +164,40 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     WriteState();
   }
 
-  static u_int select_action(const std::vector<double>& logits) {
-      auto maxLogitIt = std::max_element(logits.begin(), logits.end());
-      return std::distance(logits.begin(), maxLogitIt);
-  }
-
   void Step(const Action& action_dict) override { 
-      std::vector<double> buyActionLogits { static_cast<double>(action_dict["action"_][0]), 
-	                                    static_cast<double>(action_dict["action"_][1]),
-	                                    static_cast<double>(action_dict["action"_][2]),
-	                                    static_cast<double>(action_dict["action"_][3])
-				          };
+      double buy_spread_1 = static_cast<double>(action_dict["action"_][0]);
+      double buy_spread_2 = static_cast<double>(action_dict["action"_][1]);
+      double buy_spread_3 = static_cast<double>(action_dict["action"_][2]);
 
+      double sell_spread_1 = static_cast<double>(action_dict["action"_][3]);
+      double sell_spread_2 = static_cast<double>(action_dict["action"_][4]);
+      double sell_spread_3 = static_cast<double>(action_dict["action"_][5]);
 
-      std::vector<double> sellActionLogits { static_cast<double>(action_dict["action"_][4]), 
-	                                     static_cast<double>(action_dict["action"_][5]),
-	                                     static_cast<double>(action_dict["action"_][6]),
-	                                     static_cast<double>(action_dict["action"_][7])
-				           };
+      double buy_volume_1 = static_cast<double>(action_dict["action"_][6]);
+      double buy_volume_2 = static_cast<double>(action_dict["action"_][7]);
+      double buy_volume_3 = static_cast<double>(action_dict["action"_][8]);
 
-      auto buy_action = select_action(buyActionLogits);
-      auto sell_action = select_action(sellActionLogits);
-      auto buy_spread = spreads[buy_action];
-      auto sell_spread = spreads[sell_action];
+      double sell_volume_1 = static_cast<double>(action_dict["action"_][9]);
+      double sell_volume_2 = static_cast<double>(action_dict["action"_][10]);
+      double sell_volume_3 = static_cast<double>(action_dict["action"_][11]);
 
-      adaptor_ptr->quote(buy_spread, sell_spread, 5, 5);
+      std::vector<double> buy_spreads = {buy_spread_1, buy_spread_2, buy_spread_3};
+      std::vector<double> sell_spreads = {sell_spread_1, sell_spread_2, sell_spread_3};
+      std::vector<double> buy_volumes = {buy_volume_1, buy_volume_2, buy_volume_3};
+      std::vector<double> sell_volumes = {sell_volume_1, sell_volume_2, sell_volume_3};
+
+      for (auto ii = 0; ii < buy_spreads.size(); ++ii) {
+          buy_spreads[ii] += 1.0;
+	  buy_spreads[ii] /= 2.0;
+	  sell_spreads[ii] += 1.0;
+	  sell_spreads[ii] /= 2.0;
+	  buy_volumes[ii] += 1.0;
+	  buy_volumes[ii] /= 2.0;
+	  sell_volumes[ii] += 1.0;
+	  sell_volumes[ii] /= 2.0;
+      }
+
+      adaptor_ptr->quote(buy_spreads, sell_spreads,  buy_volumes, sell_volumes);
       isDone = !adaptor_ptr->next();
       ++steps;
       WriteState();
@@ -243,7 +251,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
          info_data.pop_front();
     }
 
-    state["reward"_] = reward;
+    state["reward"_] = reward - 0.001 * std::abs(info["leverage"]);
 
     state["obs"_].Assign(data.begin(), data.size());
   }
