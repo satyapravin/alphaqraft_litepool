@@ -39,14 +39,40 @@ device = torch.device("cuda")
 class RecurrentActor(nn.Module):
     def __init__(self, state_dim=1210, action_dim=3, hidden_dim=256, gru_hidden_dim=128, num_layers=2):
         super(RecurrentActor, self).__init__()
-        self.gru_hidden_dim = gru_hidden_dim
+self.gru_hidden_dim = gru_hidden_dim
         self.num_layers = num_layers
-        self.time_steps = 5 
-        self.feature_dim = 242
+        self.time_steps = 5  
 
-        self.fc1 = nn.Linear(self.feature_dim, hidden_dim) 
-        self.gru = nn.GRU(hidden_dim, gru_hidden_dim, num_layers=num_layers, batch_first=True, dropout=0.2)
-        self.fc2 = nn.Linear(gru_hidden_dim, hidden_dim)
+        self.position_dim = 18
+        self.trade_dim = 6
+        self.market_dim = 242 - (18 + 6) 
+
+        self.position_fc = nn.Sequential(
+            nn.Linear(self.position_dim, 64),
+            nn.ReLU(),
+            nn.LayerNorm(64),
+            nn.Linear(64, 32),
+            nn.ReLU()
+        )
+
+        self.trade_fc = nn.Sequential(
+            nn.Linear(self.trade_dim, 64),
+            nn.ReLU(),
+            nn.LayerNorm(64),
+            nn.Linear(64, 32),
+            nn.ReLU()
+        )
+
+        self.market_fc = nn.Sequential(
+            nn.Linear(self.market_dim, 128),
+            nn.ReLU(),
+            nn.LayerNorm(128),
+            nn.Linear(128, 32),
+            nn.ReLU()
+        )
+
+        self.gru = nn.GRU(64, gru_hidden_dim, num_layers=num_layers, batch_first=True, dropout=0.2)
+        self.fusion_fc = nn.Linear(gru_hidden_dim + 32, hidden_dim)
         self.mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Linear(hidden_dim, action_dim)
 
@@ -58,23 +84,34 @@ class RecurrentActor(nn.Module):
             state = torch.tensor(state, dtype=torch.float32, device=next(self.parameters()).device)
 
         batch_size = state.shape[0]
-        state = state.view(batch_size, self.time_steps, self.feature_dim) 
+        state = state.view(batch_size, self.time_steps, -1) 
 
-        x = F.relu(self.fc1(state)) 
+        position_state = state[:, -1, :self.position_dim] 
+        trade_state = state[:, :, self.position_dim:self.position_dim + self.trade_dim] 
+        market_state = state[:, :, self.position_dim + self.trade_dim:] 
+
+        position_out = self.position_fc(position_state) 
+        trade_out = self.trade_fc(trade_state) 
+        market_out = self.market_fc(market_state)
+
+        x = torch.cat([trade_out, market_out], dim=-1) 
 
         if hidden is None or hidden.shape[1] != batch_size:
             hidden = self.init_hidden(batch_size, state.device)
 
         x, hidden = self.gru(x, hidden)  
-        x = F.relu(self.fc2(x[:, -1, :]))
-
+        x = x[:, -1, :] 
+        x = torch.cat([x, position_out], dim=-1) 
+        x = F.relu(self.fusion_fc(x))  
         mean = self.mean(x)
         log_std = self.log_std(x).clamp(-20, 2)
         std = log_std.exp()
         return mean, std, hidden
 
+
     def set_training_mode(self, mode: bool):
         self.train(mode)
+
 
     def sample(self, state, hidden=None, deterministic=False):
         mean, std, hidden = self.forward(state, hidden)
