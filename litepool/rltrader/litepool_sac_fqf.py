@@ -26,12 +26,38 @@ from stable_baselines3.sac.policies import SACPolicy
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.noise import ActionNoise
 
-
 import litepool
 from litepool.python.protocol import LitePool
 
+from stable_baselines3.common.buffers import ReplayBuffer
+from tianshou.data import ReplayBuffer as TianshouReplayBuffer, Batch
 
 device = torch.device("cuda")
+
+
+class RecurrentReplayBuffer(ReplayBuffer):
+    def __init__(self, buffer_size, observation_space, action_space, sequence_length=10, **kwargs):
+        super().__init__(buffer_size, observation_space, action_space, **kwargs)
+        self.sequence_length = sequence_length
+        self.tianshou_buffer = TianshouReplayBuffer(size=self.buffer_size)
+
+    def add(self, obs, next_obs, action, reward, done, infos):
+        batch = Batch(obs=obs, act=action, rew=reward, done=done, obs_next=next_obs)
+        self.tianshou_buffer.add(batch)
+
+    def sample(self, batch_size):
+        indices = np.random.choice(len(self.tianshou_buffer), batch_size)
+        sequences = []
+
+        for idx in indices:
+            start_idx = max(0, idx - self.sequence_length + 1)
+            end_idx = idx + 1
+
+            batch = self.tianshou_buffer[start_idx:end_idx]
+            sequences.append(batch)
+
+        return Batch.cat(sequences)
+
 
 # ------------------
 # 1. Recurrent Actor 
@@ -396,6 +422,8 @@ model = CustomFQFDSAC(
     gradient_steps=64,    
     ent_coef='auto',                
     verbose=1,
+    replay_buffer_class=RecurrentReplayBuffer,  
+    replay_buffer_kwargs={"sequence_length": 90},  
     action_noise=action_noise,
     device=device)
 
