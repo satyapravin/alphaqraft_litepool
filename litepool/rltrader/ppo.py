@@ -144,7 +144,7 @@ class CustomRecurrentPPOPolicy(ActorCriticPolicy):
         super(CustomRecurrentPPOPolicy, self).__init__(observation_space, action_space, lr_schedule, **kwargs)
 
         self.features_extractor = GRUFeatureExtractor(observation_space)
-        self.actor = RecurrentActor()
+        self.actor = RecurrentActor(action_dim=action_space.shape[0])
         self.critic = TransformerValueCritic()
         self.hidden_states = None
 
@@ -207,7 +207,7 @@ class VecAdaptor(VecEnvWrapper):
           })
 
 
-          if self.steps % 50  == 0 or dones[i]:
+          if self.steps % 1000  == 0 or dones[i]:
               print("id:{0}, steps:{1}, fees:{2:.8f}, balance:{3:.6f}, unreal:{4:.8f}, real:{5:.8f}, drawdown:{6:.8f}, leverage:{7:.4f}, count:{8}".format(
                     infos[i]["env_id"],  self.steps, infos[i]['fees'], infos[i]['balance'] - infos[i]['fees'] + infos[i]['unrealized_pnl'],
                     infos[i]['unrealized_pnl'], infos[i]['realized_pnl'], infos[i]['drawdown'], infos[i]['leverage'], infos[i]['trade_count']))
