@@ -22,12 +22,8 @@ from litepool.python.protocol import LitePool
 
 device = torch.device("cuda")
 
-
-# ------------------
-# 1. Optimized GRU Feature Extractor with Efficient Hidden State Management
-# ------------------
 class GRUFeatureExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space, feature_dim=256, gru_hidden_dim=128, num_layers=1):
+    def __init__(self, observation_space, feature_dim=64, gru_hidden_dim=128, num_layers=2):
         super(GRUFeatureExtractor, self).__init__(observation_space, feature_dim)
 
         self.time_steps = 10  
@@ -64,7 +60,14 @@ class GRUFeatureExtractor(BaseFeaturesExtractor):
         )
 
         self.gru = nn.GRU(64, gru_hidden_dim, num_layers=num_layers, batch_first=True, dropout=0.1)
-        self.fusion_fc = nn.Linear(gru_hidden_dim + 32, feature_dim)
+        
+        self.fusion_fc = nn.Sequential(
+                nn.Linear(gru_hidden_dim + 32, 256),
+                nn.ReLU(),
+                nn.LayerNorm(256),
+                nn.Linear(256, feature_dim),
+                nn.ReLU()
+        )
 
     def forward(self, observations, hidden_states=None):
         batch_size, flat_dim = observations.shape
@@ -92,10 +95,6 @@ class GRUFeatureExtractor(BaseFeaturesExtractor):
 
         return F.relu(self.fusion_fc(x)), new_hidden_states
 
-
-# ------------------
-# 2. Optimized Recurrent Actor
-# ------------------
 class RecurrentActor(nn.Module):
     def __init__(self, feature_dim=256, action_dim=3):
         super(RecurrentActor, self).__init__()
@@ -115,58 +114,69 @@ class RecurrentActor(nn.Module):
         action = mean if deterministic else normal_dist.rsample()
         return torch.tanh(action)
 
+class FQFValueCritic(nn.Module):
+    def __init__(self, feature_dim=64, num_quantiles=32):
+        super(FQFValueCritic, self).__init__()
+        self.num_quantiles = num_quantiles
 
-# ---------------------------
-# 3. Optimized Transformer-Based Value Critic
-# ---------------------------
-class TransformerValueCritic(nn.Module):
-    def __init__(self, feature_dim=256, transformer_dim=128, num_heads=4):
-        super(TransformerValueCritic, self).__init__()
+        self.fc1 = nn.Linear(feature_dim, 128)
+        self.fc2 = nn.Linear(128, 128)
+        self.out_fc = nn.Linear(128, num_quantiles) 
 
-        self.fc1 = nn.Linear(feature_dim, transformer_dim)
-        self.transformer_layer = nn.TransformerEncoderLayer(d_model=transformer_dim, nhead=num_heads, batch_first=True)
-        self.transformer = nn.TransformerEncoder(self.transformer_layer, num_layers=2)
-        self.fc2 = nn.Linear(transformer_dim, 256)
-        self.value_out = nn.Linear(256, 1)
+        self.quantile_fractions = nn.Parameter(torch.rand(num_quantiles))
 
     def forward(self, extracted_features):
         x = F.relu(self.fc1(extracted_features))
-        x = self.transformer(x.unsqueeze(1))  
-        x = F.relu(self.fc2(x[:, -1, :]))
-        return self.value_out(x)
+        x = F.relu(self.fc2(x))
+        quantile_values = self.out_fc(x) 
 
+        sorted_fractions = torch.sort(torch.sigmoid(self.quantile_fractions))[0]
+        return quantile_values, sorted_fractions
 
-# ---------------------------
-# 4. Optimized Custom Recurrent PPO Policy
-# ---------------------------
-class CustomRecurrentPPOPolicy(ActorCriticPolicy):
+from stable_baselines3.ppo.policies import ActorCriticPolicy
+
+class FQFPPOPolicy(ActorCriticPolicy):
     def __init__(self, observation_space, action_space, lr_schedule, **kwargs):
-        super(CustomRecurrentPPOPolicy, self).__init__(observation_space, action_space, lr_schedule, **kwargs)
+        super(FQFPPOPolicy, self).__init__(observation_space, action_space, lr_schedule, **kwargs)
 
         self.features_extractor = GRUFeatureExtractor(observation_space)
         self.actor = RecurrentActor(action_dim=action_space.shape[0])
-        self.critic = TransformerValueCritic()
-        self.hidden_states = None
+        self.critic = FQFValueCritic()
 
     def forward(self, obs, deterministic=False):
-        if self.hidden_states is None:
-            batch_size = obs.shape[0]
-            self.hidden_states = torch.zeros(self.features_extractor.num_layers, batch_size, self.features_extractor.gru_hidden_dim, device=obs.device)
-
-        extracted_features, self.hidden_states = self.features_extractor(obs, self.hidden_states)
+        extracted_features, _ = self.features_extractor(obs)
         actions = self.actor.sample(extracted_features, deterministic)
-        values = self.critic(extracted_features)
+        quantile_values, quantile_fractions = self.critic(extracted_features)
+        values = quantile_values.mean(dim=1)
         mean, std = self.actor.forward(extracted_features)
         log_probs = torch.distributions.Normal(mean, std).log_prob(actions).sum(-1)
-        return actions, values, log_probs
+        return actions, values, log_probs, quantile_values, quantile_fractions
 
-    def evaluate_actions(self, obs, actions):
-        extracted_features, _ = self.features_extractor(obs, self.hidden_states)
-        mean, std = self.actor.forward(extracted_features)
-        log_probs = torch.distributions.Normal(mean, std).log_prob(actions).sum(-1)
-        entropy = torch.distributions.Normal(mean, std).entropy().sum(-1)
-        values = self.critic(extracted_features)
-        return values, log_probs, entropy
+    def quantile_huber_loss(quantile_values, target_values, quantile_fractions):
+        td_error = target_values.unsqueeze(1) - quantile_values 
+        huber_loss = F.smooth_l1_loss(td_error, torch.zeros_like(td_error), reduction='none')
+
+        quantile_weights = torch.abs(quantile_fractions - (td_error.detach() < 0).float())
+        loss = (quantile_weights * huber_loss).mean()
+        return loss
+
+from stable_baselines3 import PPO
+
+class FQFPPO(PPO):
+    def train(self):
+        for rollout_data in self.rollout_buffer.get(batch_size=self.batch_size):
+            obs, actions, rewards, next_obs, dones = rollout_data.observations, rollout_data.actions, rollout_data.rewards, rollout_data.next_observations, rollout_data.dones
+            _, values, log_probs, quantile_values, quantile_fractions = self.policy(obs)
+            _, next_values, _, next_quantile_values, _ = self.policy(next_obs)
+
+            target_values = rewards + self.gamma * (1 - dones) * next_quantile_values.mean(dim=1)
+            critic_loss = quantile_huber_loss(quantile_values, target_values, quantile_fractions)
+
+            self.critic.optimizer.zero_grad()
+            critic_loss.backward()
+            self.critic.optimizer.step()
+            super().train()
+
 
 class VecAdaptor(VecEnvWrapper):
   def __init__(self, venv: LitePool):
@@ -225,25 +235,21 @@ class VecAdaptor(VecEnvWrapper):
 env = litepool.make("RlTrader-v0", env_type="gymnasium", num_envs=64, batch_size=64, num_threads=64,
                     is_prod=False, is_inverse_instr=True, api_key="", api_secret="",
                     symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10, maker_fee=-0.0001,
-                    taker_fee=0.0005, foldername="./train_files/", balance=1.0, start=360000, max=7201*10)
+                    taker_fee=0.0005, foldername="./train_files/", balance=1.0, start=1, max=72001*10)
 
 env.spec.id = 'RlTrader-v0'
 env = VecNormalize(VecMonitor(VecAdaptor(env)), norm_obs=True, norm_reward=True)
 
-# Adaptive Learning Rate
-def adaptive_lr_schedule(progress):
-    return 3e-4 * (1 - progress)
-
 model = PPO(
-    CustomRecurrentPPOPolicy,
+    FQFPPOPolicy,
     env,
-    batch_size=128,  # Reduce batch size for better GRU training
-    learning_rate=adaptive_lr_schedule,
+    batch_size=64,  # Reduce batch size for better GRU training
+    learning_rate=0.0003,
     gamma=0.995,  # More discounting for better long-term decisions
     gae_lambda=0.97,
-    clip_range=0.15,  # Slightly lower clip for stable updates
+    clip_range=0.3,  # Slightly lower clip for stable updates
     ent_coef=0.005,  # Reduce entropy coefficient slightly
-    vf_coef=0.7,  # Increase value loss importance
+    vf_coef=2.0,  # Increase value loss importance
     n_epochs=1,   # More epochs per update
     n_steps=4096,  # Larger rollout buffer
     verbose=1,
@@ -254,7 +260,7 @@ if os.path.exists("ppo_rltrader.zip"):
     model = PPO.load("ppo_rltrader.zip", env=env, device=device)
     print("saved ppo model loaded")
 
-for i in range(0, 500):
-    model.learn(7205*64)
+for i in range(0, 50):
+    model.learn(72005*64)
     model.save("ppo_rltrader")
 
