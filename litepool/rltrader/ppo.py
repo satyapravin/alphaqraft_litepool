@@ -152,13 +152,13 @@ class FQFPPOPolicy(ActorCriticPolicy):
         log_probs = torch.distributions.Normal(mean, std).log_prob(actions).sum(-1)
         return actions, values, log_probs, quantile_values, quantile_fractions
 
-    def quantile_huber_loss(quantile_values, target_values, quantile_fractions):
-        td_error = target_values.unsqueeze(1) - quantile_values 
-        huber_loss = F.smooth_l1_loss(td_error, torch.zeros_like(td_error), reduction='none')
+def quantile_huber_loss(quantile_values, target_values, quantile_fractions):
+    td_error = target_values.unsqueeze(1) - quantile_values 
+    huber_loss = F.smooth_l1_loss(td_error, torch.zeros_like(td_error), reduction='none')
 
-        quantile_weights = torch.abs(quantile_fractions - (td_error.detach() < 0).float())
-        loss = (quantile_weights * huber_loss).mean()
-        return loss
+    quantile_weights = torch.abs(quantile_fractions - (td_error.detach() < 0).float())
+    loss = (quantile_weights * huber_loss).mean()
+    return loss
 
 from stable_baselines3 import PPO
 
@@ -166,17 +166,18 @@ class FQFPPO(PPO):
     def train(self):
         for rollout_data in self.rollout_buffer.get(batch_size=self.batch_size):
             obs, actions, rewards, next_obs, dones = rollout_data.observations, rollout_data.actions, rollout_data.rewards, rollout_data.next_observations, rollout_data.dones
+
             _, values, log_probs, quantile_values, quantile_fractions = self.policy(obs)
             _, next_values, _, next_quantile_values, _ = self.policy(next_obs)
 
             target_values = rewards + self.gamma * (1 - dones) * next_quantile_values.mean(dim=1)
             critic_loss = quantile_huber_loss(quantile_values, target_values, quantile_fractions)
 
-            self.critic.optimizer.zero_grad()
+            self.policy.critic.optimizer.zero_grad()
             critic_loss.backward()
-            self.critic.optimizer.step()
-            super().train()
+            self.policy.critic.optimizer.step()
 
+        super().train()
 
 class VecAdaptor(VecEnvWrapper):
   def __init__(self, venv: LitePool):
