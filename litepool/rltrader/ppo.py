@@ -22,6 +22,9 @@ from litepool.python.protocol import LitePool
 
 device = torch.device("cuda")
 
+# ------------------
+# 1. GRU Feature Extractor
+# ------------------
 class GRUFeatureExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space, feature_dim=64, gru_hidden_dim=128, num_layers=2):
         super(GRUFeatureExtractor, self).__init__(observation_space, feature_dim)
@@ -35,43 +38,15 @@ class GRUFeatureExtractor(BaseFeaturesExtractor):
         self.trade_dim = 6
         self.market_dim = self.state_dim - (self.position_dim + self.trade_dim)
 
-        self.position_fc = nn.Sequential(
-            nn.Linear(self.position_dim, 64),
-            nn.ReLU(),
-            nn.LayerNorm(64),
-            nn.Linear(64, 32),
-            nn.ReLU()
-        )
-
-        self.trade_fc = nn.Sequential(
-            nn.Linear(self.trade_dim, 64),
-            nn.ReLU(),
-            nn.LayerNorm(64),
-            nn.Linear(64, 32),
-            nn.ReLU()
-        )
-
-        self.market_fc = nn.Sequential(
-            nn.Linear(self.market_dim, 128),
-            nn.ReLU(),
-            nn.LayerNorm(128),
-            nn.Linear(128, 32),
-            nn.ReLU()
-        )
+        self.position_fc = nn.Sequential(nn.Linear(self.position_dim, 64), nn.ReLU(), nn.LayerNorm(64), nn.Linear(64, 32), nn.ReLU())
+        self.trade_fc = nn.Sequential(nn.Linear(self.trade_dim, 64), nn.ReLU(), nn.LayerNorm(64), nn.Linear(64, 32), nn.ReLU())
+        self.market_fc = nn.Sequential(nn.Linear(self.market_dim, 128), nn.ReLU(), nn.LayerNorm(128), nn.Linear(128, 32), nn.ReLU())
 
         self.gru = nn.GRU(64, gru_hidden_dim, num_layers=num_layers, batch_first=True, dropout=0.1)
-        
-        self.fusion_fc = nn.Sequential(
-                nn.Linear(gru_hidden_dim + 32, 256),
-                nn.ReLU(),
-                nn.LayerNorm(256),
-                nn.Linear(256, feature_dim),
-                nn.ReLU()
-        )
+        self.fusion_fc = nn.Sequential(nn.Linear(gru_hidden_dim + 32, 256), nn.ReLU(), nn.LayerNorm(256), nn.Linear(256, feature_dim), nn.ReLU())
 
     def forward(self, observations, hidden_states=None):
         batch_size, flat_dim = observations.shape
-
         assert flat_dim == self.time_steps * self.state_dim, "Incorrect observation shape!"
         observations = observations.view(batch_size, self.time_steps, self.state_dim)
 
@@ -89,14 +64,16 @@ class GRUFeatureExtractor(BaseFeaturesExtractor):
             hidden_states = torch.zeros(self.num_layers, batch_size, self.gru_hidden_dim, device=observations.device)
 
         x, new_hidden_states = self.gru(x, hidden_states)
-
         x = x[:, -1, :]  
         x = torch.cat([x, position_out], dim=-1)
 
         return F.relu(self.fusion_fc(x)), new_hidden_states
 
+# ------------------
+# 2. Recurrent Actor
+# ------------------
 class RecurrentActor(nn.Module):
-    def __init__(self, feature_dim=256, action_dim=3):
+    def __init__(self, feature_dim=64, action_dim=3):
         super(RecurrentActor, self).__init__()
 
         self.mean = nn.Linear(feature_dim, action_dim)
@@ -114,6 +91,9 @@ class RecurrentActor(nn.Module):
         action = mean if deterministic else normal_dist.rsample()
         return torch.tanh(action)
 
+# ------------------
+# 3. FQF Value Critic
+# ------------------
 class FQFValueCritic(nn.Module):
     def __init__(self, feature_dim=64, num_quantiles=32):
         super(FQFValueCritic, self).__init__()
@@ -122,46 +102,51 @@ class FQFValueCritic(nn.Module):
         self.fc1 = nn.Linear(feature_dim, 128)
         self.fc2 = nn.Linear(128, 128)
         self.out_fc = nn.Linear(128, num_quantiles) 
-
         self.quantile_fractions = nn.Parameter(torch.rand(num_quantiles))
 
     def forward(self, extracted_features):
         x = F.relu(self.fc1(extracted_features))
         x = F.relu(self.fc2(x))
         quantile_values = self.out_fc(x) 
-
         sorted_fractions = torch.sort(torch.sigmoid(self.quantile_fractions))[0]
         return quantile_values, sorted_fractions
 
-from stable_baselines3.ppo.policies import ActorCriticPolicy
-
+# ------------------
+# 4. FQF PPO Policy
+# ------------------
 class FQFPPOPolicy(ActorCriticPolicy):
     def __init__(self, observation_space, action_space, lr_schedule, **kwargs):
         super(FQFPPOPolicy, self).__init__(observation_space, action_space, lr_schedule, **kwargs)
-
         self.features_extractor = GRUFeatureExtractor(observation_space)
         self.actor = RecurrentActor(action_dim=action_space.shape[0])
         self.critic = FQFValueCritic()
 
     def forward(self, obs, deterministic=False):
-        extracted_features, _ = self.features_extractor(obs)
+        extracted_features = self.features_extractor(obs)[0]
         actions = self.actor.sample(extracted_features, deterministic)
         quantile_values, quantile_fractions = self.critic(extracted_features)
-        values = quantile_values.mean(dim=1)
+
+        tau = 0.7  # Adjust for risk aversion (0.5 = mean, >0.5 = risk-seeking, <0.5 = risk-averse)
+        weights = torch.where(quantile_values > quantile_values.mean(dim=1, keepdim=True), tau, 1 - tau)
+        values = (weights * quantile_values).sum(dim=1) 
+
         mean, std = self.actor.forward(extracted_features)
         log_probs = torch.distributions.Normal(mean, std).log_prob(actions).sum(-1)
-        return actions, values, log_probs, quantile_values, quantile_fractions
+        return actions, values, log_probs
 
+# ------------------
+# 5. Quantile Huber Loss
+# ------------------
 def quantile_huber_loss(quantile_values, target_values, quantile_fractions):
     td_error = target_values.unsqueeze(1) - quantile_values 
     huber_loss = F.smooth_l1_loss(td_error, torch.zeros_like(td_error), reduction='none')
-
     quantile_weights = torch.abs(quantile_fractions - (td_error.detach() < 0).float())
     loss = (quantile_weights * huber_loss).mean()
     return loss
 
-from stable_baselines3 import PPO
-
+# ------------------
+# 6. FQFPPO Algorithm
+# ------------------
 class FQFPPO(PPO):
     def train(self):
         for rollout_data in self.rollout_buffer.get(batch_size=self.batch_size):
@@ -173,9 +158,9 @@ class FQFPPO(PPO):
             target_values = rewards + self.gamma * (1 - dones) * next_quantile_values.mean(dim=1)
             critic_loss = quantile_huber_loss(quantile_values, target_values, quantile_fractions)
 
-            self.policy.critic.optimizer.zero_grad()
+            self.policy.optimizer.zero_grad()
             critic_loss.backward()
-            self.policy.critic.optimizer.step()
+            self.policy.optimizer.step()
 
         super().train()
 
