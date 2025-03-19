@@ -84,6 +84,9 @@ class RecurrentReplayBuffer(ReplayBuffer):
         sampled_batch.actions = torch.tensor(sampled_batch.act, dtype=torch.float32, device=device)
         return sampled_batch
 
+    def __len__(self):
+        return len(self.tianshou_buffer)
+
 # ------------------
 # 1. Recurrent Actor 
 # ------------------
@@ -169,9 +172,11 @@ class RecurrentActor(nn.Module):
     def sample(self, state, hidden=None, deterministic=False):
         mean, std, hidden = self.forward(state, hidden)
         normal_dist = torch.distributions.Normal(mean, std)
-        action = mean if deterministic else normal_dist.rsample()
-        action = torch.tanh(action)
-        return action, hidden
+        raw_action = mean if deterministic else normal_dist.rsample()
+        action = torch.tanh(raw_action)
+        log_prob = normal_dist.log_prob(raw_action) - torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(dim=-1, keepdim=True) 
+        return action, log_prob, hidden
 
     def action_log_prob(self, state, hidden=None):
         mean, std, hidden = self.forward(state, hidden)
@@ -297,7 +302,7 @@ class CustomFQFDSACPolicy(SACPolicy):
         if isinstance(observation, np.ndarray):
             observation = torch.tensor(observation, dtype=torch.float32, device=next(self.actor.parameters()).device)
 
-        action, new_state = self.actor.sample(observation, state, deterministic=deterministic)
+        action, log_prob, new_state = self.actor.sample(observation, state, deterministic=deterministic)
         return action.detach().cpu().numpy(), new_state
 
 
@@ -305,6 +310,28 @@ class CustomFQFDSACPolicy(SACPolicy):
 # 4. Improved Training Step with Persistent Hidden States
 # ---------------------------
 class CustomFQFDSAC(SAC):
+    def __init__(self, policy, env, learning_rate=3e-4, alpha=0.2, **kwargs):
+        super().__init__(policy, env, learning_rate=learning_rate, **kwargs)
+        self.alpha = alpha
+        self.log_alpha = torch.tensor(np.log(alpha), requires_grad=True, device=self.device)
+        self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=learning_rate)
+
+
+    def train(self, gradient_steps: int, batch_size: int = 64) -> None:
+        print("DEBUG: Custom train() is running!")  # Ensure this prints
+
+        for _ in range(gradient_steps):
+            # Sample batch from replay buffer
+            replay_buffer = self.replay_buffer
+            if replay_buffer is None or len(replay_buffer) < batch_size:
+                print("DEBUG: Not enough samples in replay buffer, skipping training step.")
+                return
+
+            # Manually call our custom train_step()
+            losses = self.train_step(replay_buffer, batch_size)
+
+            print(f"DEBUG: Training step completed. Losses: {losses}")
+
     def train_step(self, replay_buffer, batch_size=256):
         replay_data = replay_buffer.sample(batch_size, env=self._vec_normalize_env)
         states = replay_data.observations
@@ -318,19 +345,51 @@ class CustomFQFDSAC(SAC):
 
         with torch.no_grad():
             next_actions, next_log_probs, hidden_actor = self.actor.sample(next_states, hidden_actor)
-            next_q_values = self.critic_target(next_states, next_actions)  # Shape: [batch_size, num_quantiles]
-            target_quantiles = rewards.unsqueeze(-1) + (1 - dones.unsqueeze(-1)) * self.gamma * next_q_values
+            next_q1_values, next_q2_values = self.critic_target(next_states, next_actions)
+            # Take the minimum Q-value to reduce overestimation bias
+            next_q_values = torch.min(next_q1_values, next_q2_values)
 
-        current_q_values = self.critic(states, actions)  # Shape: [batch_size, num_quantiles]
-        critic_loss = F.smooth_l1_loss(current_q_values, target_quantiles.view_as(current_q_values))
+            # Debugging: Print shapes before modifying
+            print(f"next_q_values shape: {next_q_values.shape}")  # Should be [batch_size, num_quantiles]
+            print(f"rewards shape before view: {rewards.shape}")  # Should be [batch_size]
+            print(f"dones shape before view: {dones.shape}")  # Should be [batch_size]
+
+            # Fix: Ensure rewards and dones have correct shape
+            rewards = rewards.view(-1, 1)  # Ensures [batch_size, 1]
+            dones = dones.view(-1, 1)  # Ensures [batch_size, 1]
+
+            print(f"rewards shape after view: {rewards.shape}")  # Should be [batch_size, 1]
+            print(f"dones shape after view: {dones.shape}")  # Should be [batch_size, 1]
+
+            # Compute target Q-values
+            target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
+
+            print(f"target_q_values shape: {target_q_values.shape}")  # Should be [batch_size, num_quantiles]
+
+        # Get current Q-values
+        current_q1_values, current_q2_values = self.critic(states, actions)
+
+        # Take the minimum Q-value to prevent overestimation
+        current_q_values = torch.min(current_q1_values, current_q2_values)
+        print(f"current_q_values shape: {current_q_values.shape}")  # Should be [batch_size, num_quantiles]
+
+        # Fix: Ensure target_q_values and current_q_values have the same shape
+        target_q_values = target_q_values.view_as(current_q_values)
+
+        print(f"Final target_q_values shape: {target_q_values.shape}")  # Should match current_q_values
+
+        # Compute critic loss
+        critic_loss = F.mse_loss(current_q_values, target_q_values)
 
         self.policy.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.policy.critic_optimizer.step()
 
+        # Actor update
         new_actions, log_probs, hidden_actor = self.actor.sample(states, hidden_actor)
         q_values_new = self.critic(states, new_actions)
-        actor_loss = (self.alpha * log_probs - q_values_new.mean()).mean()
+        alpha = self.alpha if isinstance(self.alpha, float) else self.log_alpha.exp()
+        actor_loss = (alpha * log_probs - q_values_new.mean()).mean()
 
         self.policy.optimizer.zero_grad()
         actor_loss.backward()
@@ -341,7 +400,6 @@ class CustomFQFDSAC(SAC):
             "actor_loss": actor_loss.item(),
             "entropy_loss": log_probs.mean().item(),
         }
-
 # ---------------------------
 # 5. Ornstein-Uhlenbeck Noise for Continuous Exploration
 # ---------------------------
