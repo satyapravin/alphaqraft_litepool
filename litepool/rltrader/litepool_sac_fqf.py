@@ -322,17 +322,23 @@ class CustomFQFDSAC(SAC):
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
         self.policy.actor.train()
         self.policy.critic.train()
+
         for _ in range(gradient_steps):
-            # Sample batch from replay buffer
             replay_buffer = self.replay_buffer
             if replay_buffer is None or len(replay_buffer) < batch_size:
                 print("DEBUG: Not enough samples in replay buffer, skipping training step.")
                 return
 
-            # Manually call our custom train_step()
             losses = self.train_step(replay_buffer, batch_size)
 
-            print(f"DEBUG: Training step completed. Losses: {losses}")
+            # Log losses
+            for key, value in losses.items():
+                self.logger.record(f"train/{key}", value)
+
+            # Increment gradient step counter
+            self._n_updates += 1
+            self.logger.record("train/n_updates", self._n_updates)
+
 
     def train_step(self, replay_buffer, batch_size=256):
         replay_data = replay_buffer.sample(batch_size, env=self._vec_normalize_env)
@@ -345,19 +351,18 @@ class CustomFQFDSAC(SAC):
         hidden_actor = None
         hidden_critic = None
 
+        # Target Q-value computation
         with torch.no_grad():
+            rewards = rewards.view(-1, 1)  # Shape: [22723, 1]
+            dones = dones.view(-1, 1)      # Shape: [22723, 1]
             next_actions, next_log_probs, hidden_actor = self.actor.sample(next_states, hidden_actor)
             next_q1_values, next_q2_values = self.critic_target(next_states, next_actions)
             next_q_values = torch.min(next_q1_values, next_q2_values)
-
-            rewards = rewards.view(-1, 1)  # Ensures [batch_size, 1]
-            dones = dones.view(-1, 1)  # Ensures [batch_size, 1]
             target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
 
+        # Critic update
         current_q1_values, current_q2_values = self.critic(states, actions)
-        current_q_values = torch.min(current_q1_values, current_q2_values)
-        target_q_values = target_q_values.view_as(current_q_values)
-        critic_loss = F.mse_loss(current_q_values, target_q_values)
+        critic_loss = F.mse_loss(current_q1_values, target_q_values) + F.mse_loss(current_q2_values, target_q_values)
         self.policy.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.policy.critic_optimizer.step()
@@ -367,17 +372,32 @@ class CustomFQFDSAC(SAC):
         q1_values_new, q2_values_new = self.critic(states, new_actions)
         q_values_new = torch.min(q1_values_new, q2_values_new)
         alpha = self.alpha if isinstance(self.alpha, float) else self.log_alpha.exp()
-        actor_loss = (alpha * log_probs - q_values_new.mean()).mean()
+        actor_loss = (alpha * log_probs - q_values_new).mean()
 
         self.policy.optimizer.zero_grad()
         actor_loss.backward()
         self.policy.optimizer.step()
 
+        # Entropy coefficient update
+        entropy_loss = 0
+        if self.ent_coef == "auto":
+            entropy_loss = -(self.log_alpha * (log_probs + self.target_entropy).detach()).mean()
+            self.alpha_optimizer.zero_grad()
+            entropy_loss.backward()
+            self.alpha_optimizer.step()
+            alpha = self.log_alpha.exp().item()
+
+        log_alpha = self.log_alpha.exp().item() 
+        action_mean, action_log_std, _ = self.actor(states)
+        action_std = action_log_std.exp().mean().item()  
+        print(f"entropy_coef: {log_alpha}, action_std: {action_std}")
+
         return {
             "critic_loss": critic_loss.item(),
             "actor_loss": actor_loss.item(),
-            "entropy_loss": log_probs.mean().item(),
+            "entropy_loss": entropy_loss.item(),
         }
+
 # ---------------------------
 # 5. Ornstein-Uhlenbeck Noise for Continuous Exploration
 # ---------------------------
@@ -499,10 +519,6 @@ model = CustomFQFDSAC(
 
 if os.path.exists("sac_fqf_rltrader.zip"):
     model = CustomFQFDSAC.load("sac_fqf_rltrader.zip", prioritized_replay=True, env=env, device=device)
-    model.ent_coef = "auto"
-    model.log_ent_coef = torch.tensor(0.0, requires_grad=True, device=model.device)
-    model.ent_coef_optimizer = torch.optim.Adam([model.log_ent_coef], lr=1e-4)
-
     if os.path.exists("replay_fqf_buffer.pkl"):
         model.load_replay_buffer("replay_fqf_buffer.pkl")
     print("saved fqf model loaded")
