@@ -37,12 +37,12 @@ device = torch.device("cuda")
 # 1. Recurrent Actor 
 # ------------------
 class RecurrentActor(nn.Module):
-    def __init__(self, state_dim=1210, action_dim=3, hidden_dim=256, gru_hidden_dim=128, num_layers=2):
+    def __init__(self, state_dim=2420, action_dim=3, hidden_dim=256, gru_hidden_dim=128, num_layers=2):
         super(RecurrentActor, self).__init__()
         self.gru_hidden_dim = gru_hidden_dim
         self.num_layers = num_layers
         self.feature_dim = 242
-        self.time_steps = 5  
+        self.time_steps = 10  
 
         self.position_dim = 18
         self.trade_dim = 6
@@ -138,9 +138,9 @@ class RecurrentActor(nn.Module):
 # 2. Transformer-Based Twin Critic
 # ---------------------------
 class TransformerCritic(nn.Module):
-    def __init__(self, state_dim=1210, action_dim=3, transformer_dim=128, num_heads=4):
+    def __init__(self, state_dim=2420, action_dim=3, transformer_dim=128, num_heads=4):
         super(TransformerCritic, self).__init__()
-        self.time_steps = 5
+        self.time_steps = 10 
         self.feature_dim = 242  # 242 per timestep
 
         self.position_dim = 18
@@ -218,7 +218,7 @@ class CustomFQFDSACPolicy(SACPolicy):
     def __init__(self, observation_space, action_space, lr_schedule, **kwargs):
         super(CustomFQFDSACPolicy, self).__init__(observation_space, action_space, lr_schedule, **kwargs)
 
-        state_dim = observation_space.shape[0]  # Expecting 1210 (5 * 242)
+        state_dim = observation_space.shape[0]  # Expecting 2420 (10 * 242)
         action_dim = action_space.shape[0]
 
         self.actor = RecurrentActor(state_dim, action_dim)
@@ -343,10 +343,10 @@ class VecAdapter(VecEnvWrapper):
           })
 
 
-          if self.steps % 500  == 0 or dones[i]:
+          if self.steps % 50  == 0 or dones[i]:
               print("id:{0}, steps:{1}, fees:{2:.8f}, balance:{3:.6f}, unreal:{4:.8f}, real:{5:.8f}, drawdown:{6:.8f}, leverage:{7:.4f}, count:{8}".format(
-                    infos[i]["env_id"],  self.steps, infos[i]['fees'], infos[i]['balance'] - infos[i]['fees'], infos[i]['unrealized_pnl'], 
-                    infos[i]['realized_pnl'], infos[i]['drawdown'], infos[i]['leverage'], infos[i]['trade_count']))
+                    infos[i]["env_id"],  self.steps, infos[i]['fees'], infos[i]['balance'] - infos[i]['fees'] + infos[i]['unrealized_pnl'], 
+                    infos[i]['unrealized_pnl'], infos[i]['realized_pnl'], infos[i]['drawdown'], infos[i]['leverage'], infos[i]['trade_count']))
           
           if dones[i]:
               infos[i]["terminal_observation"] = obs[i]
@@ -359,8 +359,8 @@ import os
 if os.path.exists('temp.csv'):
     os.remove('temp.csv')
 env = litepool.make("RlTrader-v0", env_type="gymnasium", 
-                          num_envs=32, batch_size=32,
-                          num_threads=32,
+                          num_envs=64, batch_size=64,
+                          num_threads=64,
                           is_prod=False,
                           is_inverse_instr=True,
                           api_key="",
@@ -372,8 +372,8 @@ env = litepool.make("RlTrader-v0", env_type="gymnasium",
                           taker_fee=0.0005,
                           foldername="./train_files/", 
                           balance=1.0,
-                          start=720000,
-                          max=3601*50)
+                          start=360000,
+                          max=7201*10)
 
 env.spec.id = 'RlTrader-v0'
 
@@ -388,7 +388,7 @@ model = CustomFQFDSAC(
     env,
     batch_size=256,
     buffer_size=1000000,                
-    learning_rate=1e-4,
+    learning_rate=5e-4,
     gamma=0.99,
     tau=0.005,
     learning_starts=100,        
@@ -400,16 +400,16 @@ model = CustomFQFDSAC(
     device=device)
 
 if os.path.exists("sac_fqf_rltrader.zip"):
-    model = CustomFQFDSAC.load("sac_fqf_rltrader.zip", env=env, device=device)
-    #model.ent_coef = "auto"
-    #model.log_ent_coef = torch.tensor(0.0, requires_grad=True, device=model.device)
-    #model.ent_coef_optimizer = torch.optim.Adam([model.log_ent_coef], lr=1e-4)
+    model = CustomFQFDSAC.load("sac_fqf_rltrader.zip", prioritized_replay=True, env=env, device=device)
+    model.ent_coef = "auto"
+    model.log_ent_coef = torch.tensor(0.0, requires_grad=True, device=model.device)
+    model.ent_coef_optimizer = torch.optim.Adam([model.log_ent_coef], lr=1e-4)
 
     if os.path.exists("replay_fqf_buffer.pkl"):
         model.load_replay_buffer("replay_fqf_buffer.pkl")
     print("saved fqf model loaded")
 
-for i in range(0, 50):
-    model.learn(3605*320)
+for i in range(0, 500):
+    model.learn(7205*64)
     model.save("sac_fqf_rltrader")
     model.save_replay_buffer("replay_fqf_buffer.pkl")

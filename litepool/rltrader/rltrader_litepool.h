@@ -63,7 +63,7 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) StateSpec(const Config& conf) {
-    return MakeDict("obs"_.Bind(Spec<double>({242*5})),
+    return MakeDict("obs"_.Bind(Spec<double>({242*10})),
                     "info:mid_price"_.Bind(Spec<double>({-1})),
                     "info:balance"_.Bind(Spec<double>({-1})),
                     "info:unrealized_pnl"_.Bind(Spec<double>({-1})),
@@ -204,12 +204,12 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   }
 
   void WriteState() {
-    std::array<double, 242*5> data;
+    std::array<double, 242*10> data;
     adaptor_ptr->getState(data);
     State state = Allocate(1);
 
     if (!isDone) {
-      assert(data.size() == 242*5);
+      assert(data.size() == 242*10);
     }
     
     std::unordered_map<std::string, double> info;
@@ -227,23 +227,29 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     curr_data.rpnl = info["realized_pnl"];
     curr_data.upnl = info["unrealized_pnl"];
     curr_data.fees = info["fees"];
+    auto reward = 0;
 
     if (isDone) {
-        auto reward = curr_data.rpnl + curr_data.upnl - curr_data.fees;
+        reward = curr_data.rpnl + curr_data.upnl - curr_data.fees;
         if (reward > 0) reward /= (0.0001 + std::abs(info["drawdown"]));
     }
     else if (info_data.size() < max_deque_size) {
         reward = curr_data.rpnl + curr_data.upnl; 
     } else {
-        if (steps % 5 == 0) {
-	    auto prev_data = info_data.front();
-            double rpnl = curr_data.rpnl - prev_data.rpnl;
-            double upnl = curr_data.upnl - prev_data.upnl;
-            double fees = curr_data.fees - prev_data.fees;
-            reward = rpnl + upnl - fees;
-	} else {
-            reward = info["leverage"] * (info["mid_price"] - info["average_price"]) / info["balance"];
-        }
+	auto prev_data = info_data.front();
+        double rpnl = curr_data.rpnl - prev_data.rpnl;
+        double upnl = curr_data.upnl - prev_data.upnl;
+        double fees = curr_data.fees - prev_data.fees;
+
+	if (steps % 5 == 0)
+	    reward = upnl;
+	else
+	    reward = rpnl - fees;
+
+        if (steps % 10 == 0) {
+	    auto count = info["trade_count"] / steps * 60;
+            reward +=  std::min(count - 1, 0.0);
+	}  
     }
 
     info_data.push_back(curr_data);
@@ -251,8 +257,8 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
          info_data.pop_front();
     }
 
-    state["reward"_] = reward - 0.001 * std::abs(info["leverage"]);
-
+    state["reward"_] *= 0.8;
+    state["reward"_] += 0.2 * reward; 
     state["obs"_].Assign(data.begin(), data.size());
   }
 

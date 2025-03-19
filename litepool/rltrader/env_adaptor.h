@@ -19,7 +19,7 @@ public:
     void reset() ;
     bool next() ;
     void getInfo(std::unordered_map<std::string, double>& info) ;
-    void getState(std::array<double, 242*5>& state) ;
+    void getState(std::array<double, 242*10>& state) ;
 private:;
     void computeState(OrderBook& book);
     void computeInfo(OrderBook& book);
@@ -32,7 +32,7 @@ private:;
     std::unique_ptr<MarketSignalBuilder> market_builder;
     std::unique_ptr<PositionSignalBuilder> position_builder;
     std::unique_ptr<TradeSignalBuilder> trade_builder;
-    std::array<double, 242*5> state;
+    std::array<double, 242*10> state;
     std::unordered_map<std::string, double> info;
     FixedVector<double, 20> bid_prices;
     FixedVector<double, 20> ask_prices;

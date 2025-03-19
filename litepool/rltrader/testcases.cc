@@ -146,17 +146,17 @@ TEST_CASE("env adaptor test") {
 	adaptor.reset();
 
 	int counter = 0;
-	std::array<double, 242*5> state;
+	std::array<double, 242*10> state;
 	adaptor.getState(state);
-	CHECK(state.size() == 242*5);
+	CHECK(state.size() == 242*10);
 	adaptor.next();
 	adaptor.getState(state);
-	CHECK(state.size() == 242*5);
+	CHECK(state.size() == 242*10);
 	adaptor.getState(state);
-	CHECK(state.size() == 242*5);
+	CHECK(state.size() == 242*10);
 	adaptor.next();
 	adaptor.getState(state);
-	CHECK(state.size() == 242*5);
+	CHECK(state.size() == 242*10);
 	adaptor.quote({0.01}, {0.01}, {0.01}, {0.01});
 
 	for (int ii=0; ii < 500; ++ii) {
@@ -166,7 +166,7 @@ TEST_CASE("env adaptor test") {
 	}
 
 	adaptor.next();
-	std::array<double, 242*5> signals;
+	std::array<double, 242*10> signals;
 	adaptor.getState(signals);
 	CHECK(std::all_of(signals.begin(), signals.end(), [](double val) {return std::isfinite(val);}));
 	CHECK(std::all_of(signals.begin(), signals.end(), [](double val) { return std::abs(val) < 10;}));
