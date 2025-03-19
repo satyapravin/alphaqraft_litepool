@@ -120,6 +120,7 @@ class FQFPPOPolicy(ActorCriticPolicy):
         self.features_extractor = GRUFeatureExtractor(observation_space)
         self.actor = RecurrentActor(action_dim=action_space.shape[0])
         self.critic = FQFValueCritic()
+        self.mlp_extractor = None
 
     def forward(self, obs, deterministic=False):
         extracted_features = self.features_extractor(obs)[0]
@@ -133,7 +134,22 @@ class FQFPPOPolicy(ActorCriticPolicy):
         mean, std = self.actor.forward(extracted_features)
         log_probs = torch.distributions.Normal(mean, std).log_prob(actions).sum(-1)
         return actions, values, log_probs
+    
+    def evaluate_actions(self, obs, actions):
+        extracted_features = self.features_extractor(obs)[0]  
+        values = self.critic(extracted_features)[0].mean(dim=1) 
+        mean, std = self.actor.forward(extracted_features)
+        log_probs = torch.distributions.Normal(mean, std).log_prob(actions).sum(-1)
+        entropy = torch.distributions.Normal(mean, std).entropy().sum(-1)
+        return values, log_probs, entropy
 
+    def predict_values(self, obs):
+        extracted_features = self.features_extractor(obs)[0]  
+        quantile_values, _ = self.critic(extracted_features) 
+        tau = 0.7  
+        weights = torch.where(quantile_values > quantile_values.mean(dim=1, keepdim=True), tau, 1 - tau)
+        values = (weights * quantile_values).sum(dim=1) 
+        return values 
 # ------------------
 # 5. Quantile Huber Loss
 # ------------------
@@ -221,7 +237,7 @@ class VecAdaptor(VecEnvWrapper):
 env = litepool.make("RlTrader-v0", env_type="gymnasium", num_envs=64, batch_size=64, num_threads=64,
                     is_prod=False, is_inverse_instr=True, api_key="", api_secret="",
                     symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10, maker_fee=-0.0001,
-                    taker_fee=0.0005, foldername="./train_files/", balance=1.0, start=1, max=72001*10)
+                    taker_fee=0.0005, foldername="./train_files/", balance=1.0, start=360000, max=901*10)
 
 env.spec.id = 'RlTrader-v0'
 env = VecNormalize(VecMonitor(VecAdaptor(env)), norm_obs=True, norm_reward=True)
@@ -233,11 +249,11 @@ model = PPO(
     learning_rate=0.0003,
     gamma=0.995,  # More discounting for better long-term decisions
     gae_lambda=0.97,
-    clip_range=0.3,  # Slightly lower clip for stable updates
-    ent_coef=0.005,  # Reduce entropy coefficient slightly
-    vf_coef=2.0,  # Increase value loss importance
+    clip_range=0.4,  # Slightly lower clip for stable updates
+    ent_coef=0.05,  # Reduce entropy coefficient slightly
+    vf_coef=3.0,  # Increase value loss importance
     n_epochs=1,   # More epochs per update
-    n_steps=4096,  # Larger rollout buffer
+    n_steps=900,  # Larger rollout buffer
     verbose=1,
     device=device
 )
@@ -247,6 +263,6 @@ if os.path.exists("ppo_rltrader.zip"):
     print("saved ppo model loaded")
 
 for i in range(0, 50):
-    model.learn(72005*64)
+    model.learn(27005*64)
     model.save("ppo_rltrader")
 
