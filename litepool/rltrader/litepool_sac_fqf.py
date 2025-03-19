@@ -130,9 +130,12 @@ class RecurrentActor(nn.Module):
         self.fusion_fc = nn.Linear(gru_hidden_dim + 32, hidden_dim)
         self.mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Linear(hidden_dim, action_dim)
+        self.log_std.weight.data.fill_(-0.5)
+
 
     def init_hidden(self, batch_size, device):
         return torch.zeros(self.num_layers, batch_size, self.gru_hidden_dim, device=device)
+
 
     def forward(self, state, hidden=None):
         if isinstance(state, np.ndarray):
@@ -161,7 +164,7 @@ class RecurrentActor(nn.Module):
         x = F.relu(self.fusion_fc(x))
 
         mean = self.mean(x)
-        log_std = self.log_std(x).clamp(-20, 2)
+        log_std = self.log_std(x).clamp(-20, 0)
         std = log_std.exp()
         return mean, std, hidden
 
@@ -317,7 +320,7 @@ class CustomFQFDSAC(SAC):
         self.alpha = alpha
         self.log_alpha = torch.tensor(np.log(alpha), requires_grad=True, device=self.device)
         self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=learning_rate)
-
+        self.target_entropy = -env.action_space.shape[0] 
 
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
         self.policy.actor.train()
@@ -388,8 +391,8 @@ class CustomFQFDSAC(SAC):
             alpha = self.log_alpha.exp().item()
 
         log_alpha = self.log_alpha.exp().item() 
-        action_mean, action_log_std, _ = self.actor(states)
-        action_std = action_log_std.exp().mean().item()  
+        action_mean, action_std, _ = self.actor(states)
+        action_std = action_std.mean().item()  
         print(f"entropy_coef: {log_alpha}, action_std: {action_std}")
 
         return {
@@ -475,8 +478,8 @@ import os
 if os.path.exists('temp.csv'):
     os.remove('temp.csv')
 env = litepool.make("RlTrader-v0", env_type="gymnasium", 
-                          num_envs=64, batch_size=64,
-                          num_threads=64,
+                          num_envs=32, batch_size=32,
+                          num_threads=32,
                           is_prod=False,
                           is_inverse_instr=True,
                           api_key="",
@@ -488,8 +491,8 @@ env = litepool.make("RlTrader-v0", env_type="gymnasium",
                           taker_fee=0.0005,
                           foldername="./train_files/", 
                           balance=1.0,
-                          start=360000,
-                          max=7201*10)
+                          start=1,
+                          max=40001*10)
 
 env.spec.id = 'RlTrader-v0'
 
@@ -504,16 +507,16 @@ model = CustomFQFDSAC(
     env,
     batch_size=256,
     buffer_size=1000000,                
-    learning_rate=5e-4,
+    learning_rate=1e-3,
     gamma=0.99,
     tau=0.005,
     learning_starts=100,        
     train_freq=64,           
-    gradient_steps=2,    
+    gradient_steps=1,    
     ent_coef='auto',                
     verbose=1,
     replay_buffer_class=RecurrentReplayBuffer,  
-    replay_buffer_kwargs={"sequence_length": 90},  
+    replay_buffer_kwargs={"sequence_length": 120},  
     action_noise=action_noise,
     device=device)
 
@@ -524,6 +527,6 @@ if os.path.exists("sac_fqf_rltrader.zip"):
     print("saved fqf model loaded")
 
 for i in range(0, 500):
-    model.learn(7205*64)
+    model.learn(40005*64)
     model.save("sac_fqf_rltrader")
     model.save_replay_buffer("replay_fqf_buffer.pkl")
