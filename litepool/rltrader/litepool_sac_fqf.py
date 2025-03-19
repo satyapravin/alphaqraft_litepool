@@ -290,6 +290,8 @@ class CustomFQFDSACPolicy(SACPolicy):
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=3e-4)
         self.critic.optimizer = self.critic_optimizer
         self.critic_target.load_state_dict(self.critic.state_dict())
+        self.optimizer = self.actor.optimizer
+
 
     def forward(self, obs, hidden, deterministic=False):
         return self.actor.sample(obs, hidden, deterministic)
@@ -318,8 +320,8 @@ class CustomFQFDSAC(SAC):
 
 
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
-        print("DEBUG: Custom train() is running!")  # Ensure this prints
-
+        self.policy.actor.train()
+        self.policy.critic.train()
         for _ in range(gradient_steps):
             # Sample batch from replay buffer
             replay_buffer = self.replay_buffer
@@ -346,48 +348,24 @@ class CustomFQFDSAC(SAC):
         with torch.no_grad():
             next_actions, next_log_probs, hidden_actor = self.actor.sample(next_states, hidden_actor)
             next_q1_values, next_q2_values = self.critic_target(next_states, next_actions)
-            # Take the minimum Q-value to reduce overestimation bias
             next_q_values = torch.min(next_q1_values, next_q2_values)
 
-            # Debugging: Print shapes before modifying
-            print(f"next_q_values shape: {next_q_values.shape}")  # Should be [batch_size, num_quantiles]
-            print(f"rewards shape before view: {rewards.shape}")  # Should be [batch_size]
-            print(f"dones shape before view: {dones.shape}")  # Should be [batch_size]
-
-            # Fix: Ensure rewards and dones have correct shape
             rewards = rewards.view(-1, 1)  # Ensures [batch_size, 1]
             dones = dones.view(-1, 1)  # Ensures [batch_size, 1]
-
-            print(f"rewards shape after view: {rewards.shape}")  # Should be [batch_size, 1]
-            print(f"dones shape after view: {dones.shape}")  # Should be [batch_size, 1]
-
-            # Compute target Q-values
             target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
 
-            print(f"target_q_values shape: {target_q_values.shape}")  # Should be [batch_size, num_quantiles]
-
-        # Get current Q-values
         current_q1_values, current_q2_values = self.critic(states, actions)
-
-        # Take the minimum Q-value to prevent overestimation
         current_q_values = torch.min(current_q1_values, current_q2_values)
-        print(f"current_q_values shape: {current_q_values.shape}")  # Should be [batch_size, num_quantiles]
-
-        # Fix: Ensure target_q_values and current_q_values have the same shape
         target_q_values = target_q_values.view_as(current_q_values)
-
-        print(f"Final target_q_values shape: {target_q_values.shape}")  # Should match current_q_values
-
-        # Compute critic loss
         critic_loss = F.mse_loss(current_q_values, target_q_values)
-
         self.policy.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.policy.critic_optimizer.step()
 
         # Actor update
         new_actions, log_probs, hidden_actor = self.actor.sample(states, hidden_actor)
-        q_values_new = self.critic(states, new_actions)
+        q1_values_new, q2_values_new = self.critic(states, new_actions)
+        q_values_new = torch.min(q1_values_new, q2_values_new)
         alpha = self.alpha if isinstance(self.alpha, float) else self.log_alpha.exp()
         actor_loss = (alpha * log_probs - q_values_new.mean()).mean()
 
@@ -511,7 +489,7 @@ model = CustomFQFDSAC(
     tau=0.005,
     learning_starts=100,        
     train_freq=64,           
-    gradient_steps=64,    
+    gradient_steps=2,    
     ent_coef='auto',                
     verbose=1,
     replay_buffer_class=RecurrentReplayBuffer,  
