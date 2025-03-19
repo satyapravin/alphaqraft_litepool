@@ -42,10 +42,30 @@ class RecurrentReplayBuffer(ReplayBuffer):
         self.tianshou_buffer = TianshouReplayBuffer(size=self.buffer_size)
 
     def add(self, obs, next_obs, action, reward, done, infos):
-        batch = Batch(obs=obs, act=action, rew=reward, done=done, obs_next=next_obs)
-        self.tianshou_buffer.add(batch)
+        num_envs = len(done)
+        done = np.asarray(done, dtype=bool)  
+        reward = np.asarray(reward, dtype=np.float32)
+        obs = np.asarray(obs)
+        next_obs = np.asarray(next_obs)
+        action = np.asarray(action)
+        terminated = np.copy(done)
+        truncated = np.array([False for info in infos], dtype=bool)
+       
+        for env_id in range(0, num_envs):
+            batch = Batch(
+                obs=obs[env_id],
+                act=action[env_id],
+                rew=reward[env_id],
+                done=done[env_id],  
+                obs_next=next_obs[env_id],
+                terminated=terminated[env_id],  
+                truncated=truncated[env_id],  
+            )
 
-    def sample(self, batch_size):
+            self.tianshou_buffer.add(batch)
+
+
+    def sample(self, batch_size, env=None):
         indices = np.random.choice(len(self.tianshou_buffer), batch_size)
         sequences = []
 
@@ -56,8 +76,13 @@ class RecurrentReplayBuffer(ReplayBuffer):
             batch = self.tianshou_buffer[start_idx:end_idx]
             sequences.append(batch)
 
-        return Batch.cat(sequences)
-
+        sampled_batch = Batch.cat(sequences)
+        sampled_batch.observations = sampled_batch.obs 
+        sampled_batch.next_observations = sampled_batch.obs_next
+        sampled_batch.rewards = torch.tensor(sampled_batch.rew, dtype=torch.float32, device=device)
+        sampled_batch.dones = torch.tensor(sampled_batch.done, dtype=torch.float32, device=device)
+        sampled_batch.actions = torch.tensor(sampled_batch.act, dtype=torch.float32, device=device)
+        return sampled_batch
 
 # ------------------
 # 1. Recurrent Actor 
@@ -211,6 +236,9 @@ class TransformerCritic(nn.Module):
         self.q_2_out = nn.Linear(256, 1)
 
     def forward(self, state, action):
+        if not isinstance(state, torch.Tensor):
+            state = torch.tensor(state, dtype=torch.float32, device=device)
+
         batch_size = state.shape[0]
         state = state.view(batch_size, self.time_steps, self.feature_dim)  
 
@@ -271,6 +299,8 @@ class CustomFQFDSACPolicy(SACPolicy):
 
         action, new_state = self.actor.sample(observation, state, deterministic=deterministic)
         return action.detach().cpu().numpy(), new_state
+
+
 # ---------------------------
 # 4. Improved Training Step with Persistent Hidden States
 # ---------------------------
@@ -288,11 +318,11 @@ class CustomFQFDSAC(SAC):
 
         with torch.no_grad():
             next_actions, next_log_probs, hidden_actor = self.actor.sample(next_states, hidden_actor)
-            next_q_values = self.critic_target(next_states, next_actions)
-            target_quantiles = rewards + (1 - dones) * self.gamma * next_q_values
+            next_q_values = self.critic_target(next_states, next_actions)  # Shape: [batch_size, num_quantiles]
+            target_quantiles = rewards.unsqueeze(-1) + (1 - dones.unsqueeze(-1)) * self.gamma * next_q_values
 
-        current_q_values = self.critic(states, actions)
-        critic_loss = F.smooth_l1_loss(current_q_values, target_quantiles)
+        current_q_values = self.critic(states, actions)  # Shape: [batch_size, num_quantiles]
+        critic_loss = F.smooth_l1_loss(current_q_values, target_quantiles.view_as(current_q_values))
 
         self.policy.critic_optimizer.zero_grad()
         critic_loss.backward()
@@ -305,8 +335,12 @@ class CustomFQFDSAC(SAC):
         self.policy.optimizer.zero_grad()
         actor_loss.backward()
         self.policy.optimizer.step()
-        return {"critic_loss": critic_loss.item(), "actor_loss": actor_loss.item(), "entropy_loss": log_probs.mean().item()}
 
+        return {
+            "critic_loss": critic_loss.item(),
+            "actor_loss": actor_loss.item(),
+            "entropy_loss": log_probs.mean().item(),
+        }
 
 # ---------------------------
 # 5. Ornstein-Uhlenbeck Noise for Continuous Exploration
