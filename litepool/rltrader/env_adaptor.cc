@@ -23,7 +23,6 @@ bool EnvAdaptor::next() {
             this->strategy.next();
             computeState(book);
 
-           
             std::copy(book.bid_prices.begin(), book.bid_prices.end(), bid_prices.begin());
             std::copy(book.ask_prices.begin(), book.ask_prices.end(), ask_prices.begin());
             std::copy(book.bid_sizes.begin(),  book.bid_sizes.end(),  bid_sizes.begin());
