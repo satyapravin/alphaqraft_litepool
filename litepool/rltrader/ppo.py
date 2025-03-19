@@ -154,14 +154,19 @@ class CustomRecurrentPPOPolicy(ActorCriticPolicy):
             self.hidden_states = torch.zeros(self.features_extractor.num_layers, batch_size, self.features_extractor.gru_hidden_dim, device=obs.device)
 
         extracted_features, self.hidden_states = self.features_extractor(obs, self.hidden_states)
-        return self.actor.sample(extracted_features, deterministic)
+        actions = self.actor.sample(extracted_features, deterministic)
+        values = self.critic(extracted_features)
+        mean, std = self.actor.forward(extracted_features)
+        log_probs = torch.distributions.Normal(mean, std).log_prob(actions).sum(-1)
+        return actions, values, log_probs
 
     def evaluate_actions(self, obs, actions):
         extracted_features, _ = self.features_extractor(obs, self.hidden_states)
-        log_probs, entropy = self.actor.forward(extracted_features)
+        mean, std = self.actor.forward(extracted_features)
+        log_probs = torch.distributions.Normal(mean, std).log_prob(actions).sum(-1)
+        entropy = torch.distributions.Normal(mean, std).entropy().sum(-1)
         values = self.critic(extracted_features)
-        return values, log_probs
-
+        return values, log_probs, entropy
 
 class VecAdaptor(VecEnvWrapper):
   def __init__(self, venv: LitePool):
