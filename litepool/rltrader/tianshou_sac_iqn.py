@@ -8,7 +8,7 @@ import litepool
 from tianshou.env import BaseVectorEnv
 from tianshou.data import Collector, VectorReplayBuffer, Batch
 from tianshou.policy import SACPolicy
-from tianshou.utils import BaseLogger
+from tianshou.trainer import OffpolicyTrainer
 
 device = torch.device("cuda")
 
@@ -124,26 +124,20 @@ class RecurrentActor(nn.Module):
         self.log_std.weight.data.fill_(-0.5)
 
     def forward(self, obs, state=None, info=None):
-        if isinstance(obs, Batch):  # Tianshou passes `Batch` objects
-            obs = obs.obs  # Extract numpy array or tensor
+        if isinstance(obs, Batch):
+            obs = obs.obs  
 
         obs = torch.as_tensor(obs, dtype=torch.float32, device=next(self.parameters()).device)
+        batch_size = obs.shape[0]
 
-        batch_size = obs.shape[0]  # Get batch size dynamically
-
-        expected_flat_dim = self.time_steps * self.feature_dim  # Should be 10 * 242 = 2420
+        expected_flat_dim = self.time_steps * self.feature_dim  
         if obs.dim() == 2 and obs.shape[1] == expected_flat_dim:  
-            obs = obs.view(batch_size, self.time_steps, self.feature_dim)  # Reshape to (batch, 10, 242)
+            obs = obs.view(batch_size, self.time_steps, self.feature_dim)  
 
-        if obs.shape[1] != self.time_steps or obs.shape[2] != self.feature_dim:
-            raise ValueError(f"Unexpected obs shape after processing: {obs.shape}, expected ({batch_size}, {self.time_steps}, {self.feature_dim})")
-
-        # 🔹 Extract different parts of the input
         market_state = obs[:, :, :self.market_dim]
         position_state = obs[:, -1, self.market_dim:self.market_dim + self.position_dim]
         trade_state = obs[:, :, self.market_dim + self.position_dim:]
 
-        # 🔹 Process each part
         position_out = self.position_fc(position_state)
         trade_out = self.trade_fc(trade_state)
         market_out = self.market_fc(market_state)
@@ -152,18 +146,25 @@ class RecurrentActor(nn.Module):
 
         if state is None:
             state = torch.zeros(self.num_layers, batch_size, self.gru_hidden_dim, device=obs.device)
-        elif isinstance(state, list):
-            state = state[0]  # ✅ Extract tensor from list
+        elif isinstance(state, list):  
+            state = state[0]  # ✅ Extract tensor from list if needed
 
-        x, new_state = self.gru(x, state)  # new_state is (num_layers, batch, gru_hidden_dim)
+        # ✅ Fix: Convert `state` back to `[num_layers, batch_size, hidden_dim]` if needed
+        if state.shape == (batch_size, self.num_layers, self.gru_hidden_dim):
+            state = state.transpose(0, 1).contiguous()  # Convert `[batch_size, num_layers, hidden_dim]` → `[num_layers, batch_size, hidden_dim]`
+
+
+        x, new_state = self.gru(x, state)  # ✅ GRU expects `[num_layers, batch_size, hidden_dim]`
 
         x = x[:, -1, :]
         x = torch.cat([x, position_out], dim=-1)
         x = self.fusion_fc(x)
-        mean = self.mean(x)  
-        log_std = self.log_std(x).clamp(-20, 0)
-        return (torch.tanh(mean) * self.max_action, log_std.exp()), new_state.detach()
 
+        mean = self.mean(x)
+        log_std = self.log_std(x).clamp(-20, 0)
+
+        # ✅ Fix: Return `new_state` as `[batch_size, num_layers, hidden_dim]` for Tianshou
+        return (torch.tanh(mean) * self.max_action, log_std.exp()), new_state.detach().transpose(0, 1)  # `[num_layers, batch_size, hidden_dim]` → `[batch_size, num_layers, hidden_dim]`
 
 class IQNCritic(nn.Module):
     """IQN-based Critic with Feature Extraction"""
@@ -241,7 +242,9 @@ class IQNCritic(nn.Module):
         # 🔹 Take last timestep
         x = x[:, -1, :]
 
-        # 🔹 Concatenate with position state and action
+        if isinstance(action, np.ndarray):
+            action = torch.as_tensor(action, dtype=torch.float32, device=state.device)
+
         x = torch.cat([x, position_out, action], dim=-1)
 
         # 🔹 Fusion layer
@@ -265,17 +268,24 @@ policy = SACPolicy(
     action_space=env_action_space
 )
 
+policy = policy.to(device)
 # ---------------------------
 # 5. Training Setup
 # ---------------------------
 buffer = VectorReplayBuffer(total_size=100000, buffer_num=32)
-collector = Collector(policy, env, buffer)
+collector = Collector(policy, env, buffer, exploration_noise=True)
 
-# ---------------------------
-# 6. Training Loop
-# ---------------------------
-for epoch in range(500):
-    result = collector.collect(n_step=36005*64, reset_before_collect=True)
-    print(f"Epoch {epoch}, Reward Mean: {result['rew']:.3f}, Done: {result['done']}")
-    torch.save(policy.state_dict(), "sac_iqn_rltrader.pth")
-    replay_buffer.save_hdf5("replay_iqn_buffer.h5")
+trainer = OffpolicyTrainer(
+    policy=policy,
+    train_collector=collector,  
+    max_epoch=100,
+    step_per_epoch=3605*32,
+    step_per_collect=100*32,  
+    update_per_step=0.1,
+    batch_size=64,
+    episode_per_test=0,
+)
+trainer.run()
+
+torch.save(policy.state_dict(), "sac_iqn_rltrader.pth")
+replay_buffer.save_hdf5("replay_iqn_buffer.h5")
