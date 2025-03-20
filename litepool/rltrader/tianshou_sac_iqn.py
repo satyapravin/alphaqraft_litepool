@@ -12,64 +12,9 @@ from tianshou.trainer import OffpolicyTrainer
 
 device = torch.device("cuda")
 
-# ---------------------------
-# 1. Custom VecAdapter for Tianshou
-# ---------------------------
-import numpy as np
-from tianshou.env import BaseVectorEnv
-
-class VecAdapterTianshou(BaseVectorEnv):
-    """Tianshou-compatible VecEnv for LitePool (similar to EnvPool)."""
-
-    def __init__(self, venv):
-        self.venv = venv
-        self.env_num = venv.spec.config.num_envs  
-        self.is_closed = False  
-        self.is_async = False  
-        self.workers = [self.venv]
-
-    def reset(self, id=None):
-        """Resets the environment."""
-        if id is None:
-            obs, info = self.venv.reset()
-            return obs, info  
-        obs, info = self.venv.reset(id)
-        return obs, info
-
-    def step(self, actions, id=None):
-        """Steps through the environment."""
-        obs, rewards, terms, truncs, info_dict = self.venv.recv()
-        dones = terms + truncs
-        infos = []
-
-        for i in range(len(info_dict["env_id"])):
-            # Convert info_dict to individual dicts per environment
-            info = {key: info_dict[key][i] for key in info_dict.keys() if isinstance(info_dict[key], np.ndarray)}
-
-            if dones[i]:
-                print(
-                    f"[DONE] id:{info['env_id']}, steps:{self.venv.spec.config.num_envs}, "
-                    f"fees:{info['fees']:.8f}, balance:{info['balance'] - info['fees'] + info['unrealized_pnl']:.6f}, "
-                    f"unreal:{info['unrealized_pnl']:.8f}, real:{info['realized_pnl']:.8f}, "
-                    f"drawdown:{info['drawdown']:.8f}, leverage:{info['leverage']:.4f}, count:{info['trade_count']}"
-                )
-
-                # Store terminal observation before resetting
-                info["terminal_observation"] = obs[i]
-                obs[i], _ = self.venv.reset(np.array([i]))
-
-            infos.append(info)
-
-        return obs, rewards, dones, infos
-
-    def close(self):
-        """Closes the environment."""
-        if not self.is_closed:
-            self.venv.close()
-            self.is_closed = True
-# ---------------------------
-# 2. Create LitePool Environment
-# ---------------------------
+#-------------------------------------
+# Make environment
+#------------------------------------
 env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=32, batch_size=32,
     num_threads=32, is_prod=False, is_inverse_instr=True, api_key="",
@@ -79,7 +24,49 @@ env = litepool.make(
 )
 env.spec.id = "RlTrader-v0"
 env_action_space = env.action_space
-#env = VecAdapterTianshou(env)
+
+
+#-----------------------------
+# Custom SAC policy
+#----------------------------
+
+class CustomSACPolicy(SACPolicy):
+    """Custom SAC Policy using Quantile Huber Loss for IQN-based critics."""
+
+    def learn(self, batch: Batch, **kwargs):
+        """Override SAC's critic loss with Quantile Huber Loss."""
+
+        # 🔥 Debugging: Print batch type
+        print(f"Batch.obs type: {type(batch.obs)}")  # Check if it's NumPy or Tensor
+        print(f"Batch.act type: {type(batch.act)}")
+
+        # Convert to PyTorch tensor if necessary
+        batch_obs_tensor = torch.as_tensor(batch.obs, device=device)
+
+        # Compute actor output
+        action, log_prob = self.actor(batch_obs_tensor)
+
+        # Compute critic Q-values
+        current_q1a = self.critic(batch_obs_tensor, batch.act)
+        current_q2a = self.critic(batch_obs_tensor, batch.act)
+
+        print(f"Log_prob shape: {log_prob.flatten().shape}")
+        print(f"Q1a shape: {current_q1a.shape}, Q2a shape: {current_q2a.shape}")
+
+        # 🔹 Ensure batch size matches between actor and critic
+        if current_q1a.shape[0] != batch_obs_tensor.shape[0]:
+            raise ValueError(f"Critic batch size mismatch! Expected: {batch_obs_tensor.shape[0]}, Got: {current_q1a.shape[0]}")
+
+        # Generate quantile fractions (taus) for IQN
+        taus = torch.linspace(0, 1, self.critic.num_quantiles + 1, device=batch_obs_tensor.device)[:-1]  # ✅ Fixed
+
+        # Compute target Q-value using minimum of two critics
+        target_q = torch.min(current_q1a, current_q2a).detach()
+
+        # Compute Quantile Huber Loss
+        critic_loss = quantile_huber_loss(current_q1a, target_q, taus) + quantile_huber_loss(current_q2a, target_q, taus)
+
+        return Batch(critic_loss=critic_loss)  # ✅ Corrected
 
 # ---------------------------
 # 3. Custom Models for SAC + IQN
@@ -259,7 +246,13 @@ class IQNCritic(nn.Module):
 actor = RecurrentActor().to(device)
 critic = IQNCritic().to(device)
 
-policy = SACPolicy(
+def quantile_huber_loss(input, target, taus, kappa=1.0):
+    td_error = target - input  # Temporal difference error
+    huber_loss = F.huber_loss(input, target, delta=kappa, reduction="none") 
+    loss = (taus - (td_error.detach() < 0).float()).abs() * huber_loss
+    return loss.mean()
+
+policy = CustomSACPolicy(
     actor=actor,
     actor_optim=Adam(actor.parameters(), lr=3e-4),
     critic=critic,
