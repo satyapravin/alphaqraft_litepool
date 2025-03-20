@@ -14,9 +14,9 @@ from tianshou.data import Collector, VectorReplayBuffer, Batch
 from tianshou.policy import SACPolicy
 from tianshou.trainer import OffpolicyTrainer
 from tianshou.utils import TensorboardLogger
+from torch.cuda.amp import autocast, GradScaler
 
 device = torch.device("cuda")
-
 
 #-------------------------------------
 # Make environment
@@ -28,9 +28,14 @@ env = litepool.make(
     maker_fee=-0.0001, taker_fee=0.0005, foldername="./train_files/",
     balance=1.0, start=1, max=36001*10
 )
+
+
 env.spec.id = "RlTrader-v0"
 env_action_space = env.action_space
 
+env = gym.wrappers.TransformObservation(
+    env, lambda obs: torch.as_tensor(obs, device=device)
+)
 #-----------------------------
 # Custom SAC policy
 #----------------------------
@@ -83,6 +88,7 @@ class CustomSACPolicy(SACPolicy):
         self.alpha = nn.Parameter(torch.tensor([alpha], device=device))
         self.alpha_optim = torch.optim.Adam([self.alpha], lr=3e-4)
         self.critic_target = copy.deepcopy(critic)
+        self.scaler = GradScaler()
 
     def forward(self, batch: Batch, state=None, **kwargs):
         obs = batch.obs
@@ -96,16 +102,16 @@ class CustomSACPolicy(SACPolicy):
         return Batch(act=act, state=h, dist=dist, log_prob=log_prob)
 
     def learn(self, batch: Batch, **kwargs):
+        batch.to_torch(device=device)
         self.training = True
         start_time = time.time()  # Add this line
 
         # Convert numpy arrays to tensors
-        obs = torch.as_tensor(batch.obs, device=device, dtype=torch.float32)
-        obs_next = torch.as_tensor(batch.obs_next, device=device, dtype=torch.float32)
-        act = torch.as_tensor(batch.act, device=device, dtype=torch.float32)
-        rew = torch.as_tensor(batch.rew, device=device, dtype=torch.float32)
-        done = torch.as_tensor(batch.done, device=device, dtype=torch.float32)
-
+        obs = batch.obs
+        obs_next = batch.obs_next
+        act = batch.act
+        rew = batch.rew
+        done = batch.done
         batch_size = obs.shape[0]
 
         # Update actor
@@ -120,6 +126,7 @@ class CustomSACPolicy(SACPolicy):
         current_q2 = self.critic(obs, act_pred)
         q_min = torch.min(current_q1, current_q2).mean(dim=-1)
 
+        
         actor_loss = (self.alpha * log_prob - q_min).mean()
         self.actor_optim.zero_grad()
         actor_loss.backward()
@@ -376,11 +383,23 @@ buffer = VectorReplayBuffer(
     buffer_num=32
 )
 
-collector = Collector(policy, env, buffer, exploration_noise=True)
+class GPUCollector(Collector):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def collect(self, *args, **kwargs):
+        result = super().collect(*args, **kwargs)
+        # Move batch data to GPU
+        if self.buffer is not None:
+            self.buffer.to_torch(device=device)
+        return result
+
+collector = GPUCollector(policy, env, buffer, exploration_noise=True)
 
 buffer = VectorReplayBuffer(
     total_size=1000000,  # 1M transitions in total
     buffer_num=32,       # Number of environments
+    device=device
 )
 
 
