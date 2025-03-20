@@ -81,22 +81,30 @@ class DictToTensorWrapper(gym.ObservationWrapper):
     def __init__(self, env, device):
         super().__init__(env)
         self.device = device
+        self.time_steps = 10
+        self.feature_dim = 242
         
         # Sample an observation to determine the structure
         sample_obs = env.reset()[0]
-        self.array_shape = sample_obs[0].shape
         
-        # Keep original observation space shape
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=self.array_shape,
+            shape=(self.time_steps * self.feature_dim,),  # Flat shape: 2420
             dtype=np.float32
         )
 
     def observation(self, obs):
-        # Keep only the array part and its original shape
+        # Get the array part and reshape it to match the expected dimensions
         array_part = obs[0]
+        
+        # Ensure the input is the correct shape (batch_size, 2420)
+        if array_part.ndim == 1:
+            array_part = array_part.reshape(1, -1)
+            
+        # Verify the shape matches what we expect
+        assert array_part.shape[1] == self.time_steps * self.feature_dim, \
+            f"Expected {self.time_steps * self.feature_dim} features, got {array_part.shape[1]}"
         
         # Convert to tensor but keep on CPU
         return torch.as_tensor(array_part, device='cpu')
