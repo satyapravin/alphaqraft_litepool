@@ -28,89 +28,7 @@ device = torch.device("cuda")
 #-------------------------------------
 # Make environment
 #------------------------------------
-
-class LitePoolWrapper(gym.Wrapper):
-    def __init__(self, env):
-        super().__init__(env)
-        self.env = env
-        self.action_space = env.action_space
-        self.observation_space = env.observation_space
-
-    def _process_obs(self, obs):
-        if isinstance(obs, dict):
-            # Convert each value in the dictionary to numpy array
-            processed_obs = {}
-            for key, value in obs.items():
-                if isinstance(value, torch.Tensor):
-                    processed_obs[key] = value.cpu().numpy()
-                else:
-                    processed_obs[key] = np.array(value)
-            return processed_obs
-        elif isinstance(obs, torch.Tensor):
-            return obs.cpu().numpy()
-        return obs
-
-    def reset(self, seed=None, options=None):
-        obs = self.env.reset()
-        processed_obs = self._process_obs(obs)
-        return processed_obs, {}
-
-    def step(self, action):
-        if isinstance(action, torch.Tensor):
-            action = action.cpu()
-        
-        result = self.env.step(action)
-        
-        if len(result) == 4:
-            obs, reward, done, info = result
-            truncated = False
-        else:
-            obs, reward, terminated, truncated, info = result
-            done = terminated
-            
-        processed_obs = self._process_obs(obs)
-        
-        if isinstance(reward, torch.Tensor):
-            reward = reward.cpu().numpy()
-        if isinstance(done, torch.Tensor):
-            done = done.cpu().numpy()
-            
-        return processed_obs, reward, done, truncated, info
-
-class DictToTensorWrapper(gym.ObservationWrapper):
-    def __init__(self, env, device):
-        super().__init__(env)
-        self.device = device
-        self.time_steps = 10
-        self.feature_dim = 242
-        
-        # Sample an observation to determine the structure
-        sample_obs = env.reset()[0]
-        
-        self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(self.time_steps * self.feature_dim,),  # Flat shape: 2420
-            dtype=np.float32
-        )
-
-    def observation(self, obs):
-        # Get the array part and reshape it to match the expected dimensions
-        array_part = obs[0]
-        
-        # Ensure the input is the correct shape (batch_size, 2420)
-        if array_part.ndim == 1:
-            array_part = array_part.reshape(1, -1)
-            
-        # Verify the shape matches what we expect
-        assert array_part.shape[1] == self.time_steps * self.feature_dim, \
-            f"Expected {self.time_steps * self.feature_dim} features, got {array_part.shape[1]}"
-        
-        # Convert to tensor but keep on CPU
-        return torch.as_tensor(array_part, device='cpu')
-
-# Update your environment setup:
-raw_env = litepool.make(
+env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=32, batch_size=32,
     num_threads=32, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
@@ -118,15 +36,8 @@ raw_env = litepool.make(
     balance=1.0, start=1, max=36001*10
 )
 
-def make_env():
-    return wrapped_env
-
-
-raw_env.spec.id = 'RlTrader-v0'
-wrapped_env = LitePoolWrapper(raw_env)
-wrapped_env = DictToTensorWrapper(wrapped_env, device)
-env = DummyVectorEnv([make_env])
-env_action_space = raw_env.action_space
+env.spec.id = 'RlTrader-v0'
+env_action_space = env.action_space
 
 #-----------------------------
 # Custom SAC policy
@@ -195,11 +106,21 @@ class CustomSACPolicy(SACPolicy):
 
     def learn(self, batch: Batch, **kwargs):
         batch.to_torch(device=device)
+
+        for key in ['obs', 'act', 'rew', 'done', 'obs_next']:
+            if isinstance(getattr(batch, key), np.ndarray):
+                setattr(batch, key, torch.as_tensor(getattr(batch, key)).to(device))
+
+        obs = batch.obs
+        obs_next = batch.obs_next
+        act = batch.act
+        rew = batch.rew
+        done = batch.done
+
         self.training = True
         start_time = time.time()
 
-        with autocast():
-            # Actor update
+        with autocast(device_type="cuda"):
             loc, scale, _ = self.actor(obs)
             dist = Independent(Normal(loc, scale), 1)
             act_pred = dist.rsample()
@@ -211,6 +132,10 @@ class CustomSACPolicy(SACPolicy):
             current_q2 = self.critic(obs, act_pred)
             q_min = torch.min(current_q1, current_q2).mean(dim=-1)
             actor_loss = (self.alpha * log_prob - q_min).mean()
+            batch.to_torch(device=device)
+            self.training = True
+            start_time = time.time()
+
 
         # Actor optimization with scaler
         self.actor_optim.zero_grad()
@@ -220,7 +145,7 @@ class CustomSACPolicy(SACPolicy):
         self.scaler.step(self.actor_optim)
 
         # Alpha update
-        with autocast():
+        with autocast(device_type="cuda"):
             alpha_loss = -(self.alpha * (log_prob + self.target_entropy).detach()).mean()
 
         self.alpha_optim.zero_grad()
@@ -228,7 +153,7 @@ class CustomSACPolicy(SACPolicy):
         self.scaler.step(self.alpha_optim)
 
         # Critic update
-        with autocast():
+        with autocast(device_type="cuda"):
             with torch.no_grad():
                 next_loc, next_scale, _ = self.actor(obs_next)
                 next_dist = Independent(Normal(next_loc, next_scale), 1)
@@ -279,7 +204,7 @@ class RecurrentActor(nn.Module):
         self.time_steps = 10
         self.max_action = 1
         self.position_dim = 18
-        self.trade_dim = 6
+        self.trade_dim = 6  # Keep original trade_dim
         self.market_dim = 218
         self.action_dim = action_dim
 
@@ -307,7 +232,6 @@ class RecurrentActor(nn.Module):
         self.mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Linear(hidden_dim, action_dim)
 
-        # Initialize log_std to a reasonable value
         self.log_std.weight.data.uniform_(-3, -2)
         self.log_std.bias.data.uniform_(-3, -2)
 
@@ -318,17 +242,17 @@ class RecurrentActor(nn.Module):
         obs = torch.as_tensor(obs, dtype=torch.float32, device=next(self.parameters()).device)
         batch_size = obs.shape[0]
 
-        expected_flat_dim = self.time_steps * self.feature_dim
-        if obs.dim() == 2 and obs.shape[1] == expected_flat_dim:
-            obs = obs.view(batch_size, self.time_steps, self.feature_dim)
+        # Reshape the input to (batch_size, time_steps, feature_dim)
+        obs = obs.view(batch_size, self.time_steps, -1)
 
+        # Split the features
         market_state = obs[:, :, :self.market_dim]
         position_state = obs[:, -1, self.market_dim:self.market_dim + self.position_dim]
-        trade_state = obs[:, :, self.market_dim + self.position_dim:]
+        trade_state = obs[:, -1, self.market_dim + self.position_dim:self.market_dim + self.position_dim + self.trade_dim]
 
         position_out = self.position_fc(position_state)
         trade_out = self.trade_fc(trade_state)
-        market_out = self.market_fc(market_state)
+        market_out = self.market_fc(market_state[:, -1])  # Use only the last timestep
 
         x = torch.cat([trade_out, market_out], dim=-1)
 
@@ -340,6 +264,7 @@ class RecurrentActor(nn.Module):
         if state.shape == (batch_size, self.num_layers, self.gru_hidden_dim):
             state = state.transpose(0, 1).contiguous()
 
+        x = x.unsqueeze(1)  # Add time dimension for GRU
         x, new_state = self.gru(x, state)
         x = x[:, -1, :]
         x = torch.cat([x, position_out], dim=-1)
@@ -349,18 +274,15 @@ class RecurrentActor(nn.Module):
         log_std = self.log_std(x).clamp(-20, 2)
         std = log_std.exp() + 1e-6
 
-        # Return in the format expected by Tianshou's SAC implementation
         loc = mean
         scale = std
 
-        # Ensure proper dimensions
         if loc.dim() == 1:
             loc = loc.unsqueeze(0)
         if scale.dim() == 1:
             scale = scale.unsqueeze(0)
 
         return loc, scale, new_state.detach().transpose(0, 1)
-
 
 
 class IQNCritic(nn.Module):
@@ -468,18 +390,313 @@ buffer = VectorReplayBuffer(
     device=device
 )
 
+from tianshou.data import Collector, Batch
+from collections import namedtuple
+import time
+from dataclasses import dataclass
+
+@dataclass
+class CollectStats:
+    n_ep: int
+    n_st: int
+    rews: np.ndarray
+    lens: np.ndarray
+    rew: float
+    len: float
+    rew_std: float
+    len_std: float
+    n_collected_steps: int
+    n_collected_episodes: int
+    returns_stat: object
+    lens_stat: object
+    rewards_stat: object
+    episodes: int
+    reward_sum: float
+    length_sum: int
+    collect_time: float
+    step_time: float
+    returns: np.ndarray
+    lengths: np.ndarray
+
 class GPUCollector(Collector):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, policy, env, buffer=None, preprocess_fn=None, device='cuda', **kwargs):
+        super().__init__(policy, env, buffer, **kwargs)
+        self.device = device
+        self.preprocess_fn = preprocess_fn
+        self.data = Batch()
+        self.reset_batch_data()
 
-    def collect(self, *args, **kwargs):
-        result = super().collect(*args, **kwargs)
-        # Move batch data to GPU
-        if self.buffer is not None:
-            self.buffer.to_torch(device=device)
-        return result
+    def reset_batch_data(self):
+        """Reset the internal batch data"""
+        self.data.obs_next = None
+        self.data.obs = None
+        self.data.act = None
+        self.data.rew = None
+        self.data.done = None
+        self.data.terminated = None
+        self.data.truncated = None
+        self.data.info = None
+        self.data.policy = Batch()
+        self.data.state = None
 
-collector = GPUCollector(policy, env, buffer, exploration_noise=True)
+    def reset_env(self, gym_reset_kwargs=None):
+        """Reset the environment and return initial observation."""
+        gym_reset_kwargs = gym_reset_kwargs if gym_reset_kwargs else {}
+        obs = self.env.reset(**gym_reset_kwargs)
+        if isinstance(obs, tuple):
+            obs, info = obs
+        else:
+            info = None
+        
+        # Convert observation to tensor on device
+        if isinstance(obs, torch.Tensor):
+            obs = obs.to(self.device)
+        else:
+            obs = torch.as_tensor(obs, device=self.device)
+            
+        self.reset_batch_data()
+        return obs, info
+
+    def _collect(self, n_step=None, n_episode=None, random=False, render=None, gym_reset_kwargs=None):
+        if n_step is not None:
+            assert n_episode is None, "Only one of n_step or n_episode is allowed"
+        assert not self.env.is_async, "Please use AsyncCollector if using async venv."
+        start_time = time.time()
+        step_count = 0
+        episode_count = 0
+        episode_rews = []
+        episode_lens = []
+
+        while True:
+            if self.data.obs is None:
+                obs, info = self.reset_env()
+                self.data.obs = obs
+                self.data.info = info
+
+            # Convert observation to tensor on device and wrap in Batch
+            if isinstance(self.data.obs, torch.Tensor):
+                obs_batch = Batch(obs=self.data.obs.to(self.device))
+            else:
+                obs_batch = Batch(obs=torch.as_tensor(self.data.obs, device=self.device))
+
+            with torch.no_grad():
+                result = self.policy(obs_batch, state=self.data.state)
+
+            self.data.act = result.act
+            self.data.state = result.state if hasattr(result, 'state') else None
+
+            # Convert action to numpy array before stepping
+            if isinstance(self.data.act, torch.Tensor):
+                action = self.data.act.cpu().numpy()
+            else:
+                action = np.array(self.data.act)
+            
+            # Step the environment with numpy action
+            result = self.env.step(action)
+            if len(result) == 5:  # gymnasium style
+                obs_next, rew, terminated, truncated, info = result
+                done = np.logical_or(terminated, truncated)
+            else:  # old gym style
+                obs_next, rew, done, info = result
+                terminated = done
+                truncated = False
+                
+            # Convert new observations and rewards to tensors on device
+            if isinstance(obs_next, torch.Tensor):
+                obs_next = obs_next.to(self.device)
+            else:
+                obs_next = torch.as_tensor(obs_next, device=self.device)
+                
+            if isinstance(rew, torch.Tensor):
+                rew = rew.to(self.device)
+            else:
+                rew = torch.as_tensor(rew, device=self.device)
+
+            self.data.obs_next = obs_next
+            self.data.rew = rew
+            self.data.done = done
+            self.data.terminated = terminated
+            self.data.truncated = truncated
+            self.data.info = info
+
+            if self.preprocess_fn:
+                self.data = self.preprocess_fn(self.data)
+
+            # Convert tensors to numpy for buffer
+            if isinstance(self.data.obs, torch.Tensor):
+                obs = self.data.obs.cpu().numpy()
+            else:
+                obs = self.data.obs
+
+            if isinstance(self.data.act, torch.Tensor):
+                act = self.data.act.cpu().numpy()
+            else:
+                act = self.data.act
+
+            if isinstance(self.data.rew, torch.Tensor):
+                rew = self.data.rew.cpu().numpy()
+            else:
+                rew = self.data.rew
+
+            if isinstance(self.data.obs_next, torch.Tensor):
+                obs_next = self.data.obs_next.cpu().numpy()
+            else:
+                obs_next = self.data.obs_next
+
+            batch = Batch(
+                obs=obs,
+                act=act,
+                rew=rew,
+                done=self.data.done,
+                terminated=self.data.terminated,
+                truncated=self.data.truncated,
+                obs_next=obs_next,
+                info=self.data.info,
+                policy=self.data.policy if hasattr(self.data, 'policy') else None,
+                state=self.data.state if hasattr(self.data, 'state') else None
+            )
+
+            # Save to buffer
+            ptr, ep_rew, ep_len, ep_idx = self.buffer.add(batch)
+
+            step_count += 1
+            # Handle vectorized environment episode completion
+            if isinstance(ep_len, np.ndarray):
+                for idx, (l, r) in enumerate(zip(ep_len, ep_rew)):
+                    if l is not None:  # episode ended
+                        episode_lens.append(l)
+                        episode_rews.append(r)
+                        episode_count += 1
+                        if n_episode and episode_count >= n_episode:
+                            break
+            else:
+                if ep_len is not None:  # single environment episode ended
+                    episode_lens.append(ep_len)
+                    episode_rews.append(ep_rew)
+                    episode_count += 1
+
+            if n_episode and episode_count >= n_episode:
+                break
+
+            if n_step and step_count >= n_step:
+                break
+
+            self.data.obs = self.data.obs_next
+
+        self.reset_batch_data()
+
+        collect_time = time.time() - start_time
+        step_time = collect_time / step_count if step_count else 0
+
+        class StatClass:
+            def __init__(self, mean_val, std_val):
+                self.mean = mean_val
+                self._std = std_val
+            
+            def std(self):
+                return self._std
+
+        if episode_count > 0:
+            rews, lens = list(map(np.array, [episode_rews, episode_lens]))
+            mean_rew = rews.mean()
+            mean_len = lens.mean()
+            std_rew = rews.std()
+            std_len = lens.std()
+            
+            # Basic statistics with mean and std
+            return_stat = StatClass(mean_rew, std_rew)
+            return_stat.n_ep = episode_count
+            return_stat.n_st = step_count
+            return_stat.rews = rews
+            return_stat.lens = lens
+            return_stat.rew = mean_rew
+            return_stat.len = mean_len
+            return_stat.rew_std = std_rew
+            return_stat.len_std = std_len
+            
+            # Length statistics
+            lens_stat = StatClass(mean_len, std_len)
+            lens_stat.n_ep = episode_count
+            lens_stat.n_st = step_count
+            lens_stat.lens = lens
+            lens_stat.len = mean_len
+            lens_stat.len_std = std_len
+            
+            # Reward statistics
+            rewards_stat = StatClass(mean_rew, std_rew)
+            rewards_stat.n_ep = episode_count
+            rewards_stat.n_st = step_count
+            rewards_stat.rews = rews
+            rewards_stat.rew = mean_rew
+            rewards_stat.rew_std = std_rew
+
+            return CollectStats(
+                n_ep=episode_count,
+                n_st=step_count,
+                rews=rews,
+                lens=lens,
+                rew=mean_rew,
+                len=mean_len,
+                rew_std=std_rew,
+                len_std=std_len,
+                n_collected_steps=step_count,
+                n_collected_episodes=episode_count,
+                returns_stat=return_stat,
+                lens_stat=lens_stat,
+                rewards_stat=rewards_stat,
+                episodes=episode_count,
+                reward_sum=float(rews.sum()),
+                length_sum=int(lens.sum()),
+                collect_time=collect_time,
+                step_time=step_time,
+                returns=rews,
+                lengths=lens
+            )
+        else:
+            empty_arr = np.array([])
+            
+            return_stat = StatClass(0.0, 0.0)
+            return_stat.n_ep = episode_count
+            return_stat.n_st = step_count
+            
+            lens_stat = StatClass(0.0, 0.0)
+            lens_stat.n_ep = episode_count
+            lens_stat.n_st = step_count
+            lens_stat.lens = empty_arr
+            lens_stat.len = 0.0
+            lens_stat.len_std = 0.0
+            
+            rewards_stat = StatClass(0.0, 0.0)
+            rewards_stat.n_ep = episode_count
+            rewards_stat.n_st = step_count
+            rewards_stat.rews = empty_arr
+            rewards_stat.rew = 0.0
+            rewards_stat.rew_std = 0.0
+
+            return CollectStats(
+                n_ep=episode_count,
+                n_st=step_count,
+                rews=empty_arr,
+                lens=empty_arr,
+                rew=0.0,
+                len=0.0,
+                rew_std=0.0,
+                len_std=0.0,
+                n_collected_steps=step_count,
+                n_collected_episodes=episode_count,
+                returns_stat=return_stat,
+                lens_stat=lens_stat,
+                rewards_stat=rewards_stat,
+                episodes=episode_count,
+                reward_sum=0.0,
+                length_sum=0,
+                collect_time=collect_time,
+                step_time=step_time,
+                returns=empty_arr,
+                lengths=empty_arr
+            )
+
+collector = GPUCollector(policy, env, buffer, device=device, exploration_noise=True)
 
 
 trainer = OffpolicyTrainer(
