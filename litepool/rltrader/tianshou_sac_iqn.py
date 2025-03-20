@@ -31,27 +31,31 @@ env_action_space = env.action_space
 #----------------------------
 
 class CustomSACPolicy(SACPolicy):
-    """Custom SAC Policy using Quantile Huber Loss for IQN-based critics."""
     def __init__(
         self, 
         actor, 
-        critic1, 
-        critic2, 
+        critic,  # ✅ Use a single critic
         actor_optim, 
-        critic1_optim, 
-        critic2_optim, 
+        critic_optim,  # ✅ Use a single critic optimizer
         action_space=None, 
         tau=0.005, 
         gamma=0.99, 
         alpha=0.2, 
-        target_entropy=None, 
         **kwargs
     ):
         super().__init__(
-            actor, critic1, critic2, actor_optim, critic1_optim, critic2_optim, 
-            action_space=action_space, tau=tau, gamma=gamma, alpha=alpha, 
-            target_entropy=target_entropy, **kwargs
+            actor=actor, 
+            critic=critic,  # ✅ Pass single critic
+            actor_optim=actor_optim, 
+            critic_optim=critic_optim,  # ✅ Pass single critic optimizer
+            action_space=action_space, 
+            tau=tau, 
+            gamma=gamma, 
+            alpha=alpha, 
+            **kwargs
         )
+
+        self.target_entropy = -np.prod(action_space.shape).item() 
 
     def learn(self, batch: Batch, **kwargs):
         """Override SAC's critic loss with Quantile Huber Loss."""
@@ -97,6 +101,7 @@ class CustomSACPolicy(SACPolicy):
 
         # ✅ Return a `Batch` object with all required loss values
         return Batch(critic_loss=critic_loss, actor_loss=actor_loss, alpha_loss=alpha_loss)
+
 # ---------------------------
 # 3. Custom Models for SAC + IQN
 # ---------------------------
@@ -272,25 +277,29 @@ class IQNCritic(nn.Module):
 # ---------------------------
 # 4. Define SAC Policy with IQN
 # ---------------------------
-actor = RecurrentActor().to(device)
-critic = IQNCritic().to(device)
-
-def quantile_huber_loss(input, target, taus, kappa=1.0):
-    td_error = target - input  # Temporal difference error
-    huber_loss = F.huber_loss(input, target, delta=kappa, reduction="none") 
+def quantile_huber_loss(ip, target, taus, kappa=1.0):
+    target = target.unsqueeze(-1).expand_as(ip)  
+    td_error = target - ip  
+    huber_loss = F.huber_loss(ip, target, delta=kappa, reduction="none")
     loss = (taus - (td_error.detach() < 0).float()).abs() * huber_loss
     return loss.mean()
 
+actor = RecurrentActor().to(device)
+
+critic = IQNCritic().to(device)
+critic_optim = Adam(critic.parameters(), lr=3e-4)
+
 policy = CustomSACPolicy(
     actor=actor,
+    critic=critic,  
     actor_optim=Adam(actor.parameters(), lr=3e-4),
-    critic=critic,
-    critic_optim=Adam(critic.parameters(), lr=3e-4),
+    critic_optim=critic_optim,  
     tau=0.005, gamma=0.99, alpha=0.2,
     action_space=env_action_space
 )
 
 policy = policy.to(device)
+
 # ---------------------------
 # 5. Training Setup
 # ---------------------------
