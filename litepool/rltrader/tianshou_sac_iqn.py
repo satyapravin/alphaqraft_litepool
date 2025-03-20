@@ -152,9 +152,8 @@ class RecurrentActor(nn.Module):
 
         if state is None:
             state = torch.zeros(self.num_layers, batch_size, self.gru_hidden_dim, device=obs.device)
-        else:
-            if state.shape[1] != batch_size:
-                state = state[:, :batch_size, :]
+        elif isinstance(state, list):
+            state = state[0]  # ✅ Extract tensor from list
 
         x, new_state = self.gru(x, state)  # new_state is (num_layers, batch, gru_hidden_dim)
 
@@ -163,23 +162,92 @@ class RecurrentActor(nn.Module):
         x = self.fusion_fc(x)
         mean = self.mean(x)  
         log_std = self.log_std(x).clamp(-20, 0)
-        return (torch.tanh(mean) * self.max_action, log_std.exp()), [new_state.detach()]
+        return (torch.tanh(mean) * self.max_action, log_std.exp()), new_state.detach()
 
 
 class IQNCritic(nn.Module):
-    """IQN-based Critic for Distributional RL"""
+    """IQN-based Critic with Feature Extraction"""
 
-    def __init__(self, state_dim=2420, action_dim=12, hidden_dim=128, num_quantiles=32):
+    def __init__(self, state_dim=2420, action_dim=12, hidden_dim=128, num_quantiles=32, gru_hidden_dim=128, num_layers=2):
         super().__init__()
         self.num_quantiles = num_quantiles
-        self.fc1 = nn.Linear(state_dim + action_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.num_layers = num_layers
+        self.gru_hidden_dim = gru_hidden_dim
+        self.feature_dim = 242
+        self.time_steps = 10
+        self.position_dim = 18
+        self.trade_dim = 6
+        self.market_dim = 218  
+
+        # 🔹 Feature extraction layers (same as in Actor)
+        self.position_fc = nn.Sequential(
+            nn.Linear(self.position_dim, 64), nn.ReLU(), nn.LayerNorm(64),
+            nn.Linear(64, 32), nn.ReLU()
+        )
+
+        self.trade_fc = nn.Sequential(
+            nn.Linear(self.trade_dim, 64), nn.ReLU(), nn.LayerNorm(64),
+            nn.Linear(64, 32), nn.ReLU()
+        )
+
+        self.market_fc = nn.Sequential(
+            nn.Linear(self.market_dim, 128), nn.ReLU(), nn.LayerNorm(128),
+            nn.Linear(128, 32), nn.ReLU()
+        )
+
+        # 🔹 GRU for time-series processing
+        self.gru = nn.GRU(64, gru_hidden_dim, num_layers=num_layers, batch_first=True)
+
+        # 🔹 Fusion layer for combining extracted features
+        self.fusion_fc = nn.Sequential(
+            nn.Linear(gru_hidden_dim + 32 + action_dim, hidden_dim * 2), nn.ReLU(),
+            nn.LayerNorm(hidden_dim * 2), nn.Linear(hidden_dim * 2, hidden_dim), nn.ReLU()
+        )
+
+        # 🔹 Q-value output layer
         self.q_values = nn.Linear(hidden_dim, num_quantiles)
 
     def forward(self, state, action):
-        x = torch.cat([state, action], dim=-1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        """Processes the observation and action to compute Q-values."""
+
+        # Ensure state is a tensor
+        state = torch.as_tensor(state, dtype=torch.float32, device=next(self.parameters()).device)
+        batch_size = state.shape[0]
+
+        # 🔹 Ensure state is reshaped correctly
+        expected_flat_dim = self.time_steps * self.feature_dim
+        if state.dim() == 2 and state.shape[1] == expected_flat_dim:
+            state = state.view(batch_size, self.time_steps, self.feature_dim)
+
+        # 🔹 Extract different parts of the input
+        market_state = state[:, :, :self.market_dim]
+        position_state = state[:, -1, self.market_dim:self.market_dim + self.position_dim] 
+        trade_state = state[:, :, self.market_dim + self.position_dim:]
+
+        # 🔹 Process each part using feature extractors
+        position_out = self.position_fc(position_state)
+        trade_out = self.trade_fc(trade_state)
+        market_out = self.market_fc(market_state)
+
+        # 🔹 Combine trade and market features
+        x = torch.cat([trade_out, market_out], dim=-1)
+
+        # 🔹 Initialize GRU hidden state
+        state_h = torch.zeros(self.num_layers, batch_size, self.gru_hidden_dim, device=state.device)
+
+        # 🔹 Process with GRU
+        x, _ = self.gru(x, state_h)  # Output shape: (batch, time_steps, gru_hidden_dim)
+
+        # 🔹 Take last timestep
+        x = x[:, -1, :]
+
+        # 🔹 Concatenate with position state and action
+        x = torch.cat([x, position_out, action], dim=-1)
+
+        # 🔹 Fusion layer
+        x = self.fusion_fc(x)
+
+        # 🔹 Compute Q-values
         return self.q_values(x)
 
 # ---------------------------
