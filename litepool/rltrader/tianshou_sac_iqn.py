@@ -32,42 +32,71 @@ env_action_space = env.action_space
 
 class CustomSACPolicy(SACPolicy):
     """Custom SAC Policy using Quantile Huber Loss for IQN-based critics."""
+    def __init__(
+        self, 
+        actor, 
+        critic1, 
+        critic2, 
+        actor_optim, 
+        critic1_optim, 
+        critic2_optim, 
+        action_space=None, 
+        tau=0.005, 
+        gamma=0.99, 
+        alpha=0.2, 
+        target_entropy=None, 
+        **kwargs
+    ):
+        super().__init__(
+            actor, critic1, critic2, actor_optim, critic1_optim, critic2_optim, 
+            action_space=action_space, tau=tau, gamma=gamma, alpha=alpha, 
+            target_entropy=target_entropy, **kwargs
+        )
 
     def learn(self, batch: Batch, **kwargs):
         """Override SAC's critic loss with Quantile Huber Loss."""
 
-        # 🔥 Debugging: Print batch type
-        print(f"Batch.obs type: {type(batch.obs)}")  # Check if it's NumPy or Tensor
-        print(f"Batch.act type: {type(batch.act)}")
-
-        # Convert to PyTorch tensor if necessary
+        # Convert batch.obs to PyTorch tensor if necessary
         batch_obs_tensor = torch.as_tensor(batch.obs, device=device)
 
         # Compute actor output
         action, log_prob = self.actor(batch_obs_tensor)
 
         # Compute critic Q-values
-        current_q1a = self.critic(batch_obs_tensor, batch.act)
-        current_q2a = self.critic(batch_obs_tensor, batch.act)
+        current_q1a = self.critic(batch_obs_tensor, batch.act)  # Shape: [64, 32]
+        current_q2a = self.critic(batch_obs_tensor, batch.act)  # Shape: [64, 32]
 
-        print(f"Log_prob shape: {log_prob.flatten().shape}")
-        print(f"Q1a shape: {current_q1a.shape}, Q2a shape: {current_q2a.shape}")
+        # 🔥 Debug: Print tensor shapes
+        print(f"log_prob shape: {log_prob.shape}")  # Should be [64, 2, 128]
+        print(f"current_q1a shape: {current_q1a.shape}")  
+        print(f"current_q2a shape: {current_q2a.shape}")  
 
-        # 🔹 Ensure batch size matches between actor and critic
-        if current_q1a.shape[0] != batch_obs_tensor.shape[0]:
-            raise ValueError(f"Critic batch size mismatch! Expected: {batch_obs_tensor.shape[0]}, Got: {current_q1a.shape[0]}")
+        # ✅ Reduce `log_prob` to match batch size
+        log_prob = log_prob.mean(dim=(1, 2))  # ✅ Average over multi-sample stochastic policy
 
-        # Generate quantile fractions (taus) for IQN
-        taus = torch.linspace(0, 1, self.critic.num_quantiles + 1, device=batch_obs_tensor.device)[:-1]  # ✅ Fixed
+        # ✅ Ensure `q_min` has the correct shape
+        q_min = torch.min(current_q1a, current_q2a).mean(dim=-1)  # ✅ Take mean over quantiles
+
+        print(f"Fixed log_prob shape: {log_prob.shape}")  # Should be [64]
+        print(f"Fixed q_min shape: {q_min.shape}")  # Should be [64]
+
+        # Compute actor loss (following SAC)
+        actor_loss = (self.alpha * log_prob - q_min).mean()
+
+        # Compute entropy coefficient loss for SAC
+        alpha_loss = -(self.alpha * (log_prob + self.target_entropy).detach()).mean()
+
+        # Generate quantile fractions for IQN
+        taus = torch.linspace(0, 1, self.critic.num_quantiles + 1, device=batch_obs_tensor.device)[:-1]
 
         # Compute target Q-value using minimum of two critics
-        target_q = torch.min(current_q1a, current_q2a).detach()
+        target_q = q_min.detach()
 
         # Compute Quantile Huber Loss
         critic_loss = quantile_huber_loss(current_q1a, target_q, taus) + quantile_huber_loss(current_q2a, target_q, taus)
 
-        return Batch(critic_loss=critic_loss)  # ✅ Corrected
-
+        # ✅ Return a `Batch` object with all required loss values
+        return Batch(critic_loss=critic_loss, actor_loss=actor_loss, alpha_loss=alpha_loss)
 # ---------------------------
 # 3. Custom Models for SAC + IQN
 # ---------------------------
