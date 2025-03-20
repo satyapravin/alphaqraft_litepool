@@ -1,27 +1,108 @@
 import numpy as np
 import time
 import torch
+
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal, Independent
 from torch.optim import Adam
 import copy
 from pathlib import Path
-
+import gymnasium as gym
+from gymnasium import spaces
 import litepool
 from tianshou.env import BaseVectorEnv
 from tianshou.data import Collector, VectorReplayBuffer, Batch
 from tianshou.policy import SACPolicy
 from tianshou.trainer import OffpolicyTrainer
 from tianshou.utils import TensorboardLogger
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
+from tianshou.env import DummyVectorEnv
 
 device = torch.device("cuda")
 
 #-------------------------------------
 # Make environment
 #------------------------------------
-env = litepool.make(
+
+class LitePoolWrapper(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.env = env
+        self.action_space = env.action_space
+        self.observation_space = env.observation_space
+
+    def _process_obs(self, obs):
+        if isinstance(obs, dict):
+            # Convert each value in the dictionary to numpy array
+            processed_obs = {}
+            for key, value in obs.items():
+                if isinstance(value, torch.Tensor):
+                    processed_obs[key] = value.cpu().numpy()
+                else:
+                    processed_obs[key] = np.array(value)
+            return processed_obs
+        elif isinstance(obs, torch.Tensor):
+            return obs.cpu().numpy()
+        return obs
+
+    def reset(self, seed=None, options=None):
+        obs = self.env.reset()
+        processed_obs = self._process_obs(obs)
+        return processed_obs, {}
+
+    def step(self, action):
+        if isinstance(action, torch.Tensor):
+            action = action.cpu()
+        
+        result = self.env.step(action)
+        
+        if len(result) == 4:
+            obs, reward, done, info = result
+            truncated = False
+        else:
+            obs, reward, terminated, truncated, info = result
+            done = terminated
+            
+        processed_obs = self._process_obs(obs)
+        
+        if isinstance(reward, torch.Tensor):
+            reward = reward.cpu().numpy()
+        if isinstance(done, torch.Tensor):
+            done = done.cpu().numpy()
+            
+        return processed_obs, reward, done, truncated, info
+
+class DictToTensorWrapper(gym.ObservationWrapper):
+    def __init__(self, env, device):
+        super().__init__(env)
+        self.device = device
+        
+        # Sample an observation to determine the structure
+        sample_obs = env.reset()[0]
+        self.array_shape = sample_obs[0].shape
+        
+        # Keep original observation space shape
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=self.array_shape,
+            dtype=np.float32
+        )
+
+    def observation(self, obs):
+        # Keep only the array part and its original shape
+        array_part = obs[0]
+        
+        # Convert to tensor but keep on CPU
+        return torch.as_tensor(array_part, device='cpu')
+
+# Update your environment setup:
+raw_env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=32, batch_size=32,
     num_threads=32, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
@@ -29,13 +110,16 @@ env = litepool.make(
     balance=1.0, start=1, max=36001*10
 )
 
+def make_env():
+    return wrapped_env
 
-env.spec.id = "RlTrader-v0"
-env_action_space = env.action_space
 
-env = gym.wrappers.TransformObservation(
-    env, lambda obs: torch.as_tensor(obs, device=device)
-)
+raw_env.spec.id = 'RlTrader-v0'
+wrapped_env = LitePoolWrapper(raw_env)
+wrapped_env = DictToTensorWrapper(wrapped_env, device)
+env = DummyVectorEnv([make_env])
+env_action_space = raw_env.action_space
+
 #-----------------------------
 # Custom SAC policy
 #----------------------------
@@ -104,75 +188,67 @@ class CustomSACPolicy(SACPolicy):
     def learn(self, batch: Batch, **kwargs):
         batch.to_torch(device=device)
         self.training = True
-        start_time = time.time()  # Add this line
+        start_time = time.time()
 
-        # Convert numpy arrays to tensors
-        obs = batch.obs
-        obs_next = batch.obs_next
-        act = batch.act
-        rew = batch.rew
-        done = batch.done
-        batch_size = obs.shape[0]
+        with autocast():
+            # Actor update
+            loc, scale, _ = self.actor(obs)
+            dist = Independent(Normal(loc, scale), 1)
+            act_pred = dist.rsample()
+            log_prob = dist.log_prob(act_pred)
+            act_pred = torch.tanh(act_pred)
+            log_prob = log_prob - torch.sum(torch.log(1 - act_pred.pow(2) + 1e-6), dim=-1)
 
-        # Update actor
-        loc, scale, _ = self.actor(obs)
-        dist = Independent(Normal(loc, scale), 1)
-        act_pred = dist.rsample()
-        log_prob = dist.log_prob(act_pred)
-        act_pred = torch.tanh(act_pred)
-        log_prob = log_prob - torch.sum(torch.log(1 - act_pred.pow(2) + 1e-6), dim=-1)
+            current_q1 = self.critic(obs, act_pred)
+            current_q2 = self.critic(obs, act_pred)
+            q_min = torch.min(current_q1, current_q2).mean(dim=-1)
+            actor_loss = (self.alpha * log_prob - q_min).mean()
 
-        current_q1 = self.critic(obs, act_pred)
-        current_q2 = self.critic(obs, act_pred)
-        q_min = torch.min(current_q1, current_q2).mean(dim=-1)
-
-        
-        actor_loss = (self.alpha * log_prob - q_min).mean()
+        # Actor optimization with scaler
         self.actor_optim.zero_grad()
-        actor_loss.backward()
+        self.scaler.scale(actor_loss).backward()
+        self.scaler.unscale_(self.actor_optim)
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
-        self.actor_optim.step()
+        self.scaler.step(self.actor_optim)
 
-        # Update alpha
-        alpha_loss = -(self.alpha * (log_prob + self.target_entropy).detach()).mean()
+        # Alpha update
+        with autocast():
+            alpha_loss = -(self.alpha * (log_prob + self.target_entropy).detach()).mean()
+
         self.alpha_optim.zero_grad()
-        alpha_loss.backward()
-        self.alpha_optim.step()
+        self.scaler.scale(alpha_loss).backward()
+        self.scaler.step(self.alpha_optim)
 
-        # Update critic
-        with torch.no_grad():
-            next_loc, next_scale, _ = self.actor(obs_next)
-            next_dist = Independent(Normal(next_loc, next_scale), 1)
-            next_act = next_dist.rsample()
-            next_act = torch.tanh(next_act)
-            next_log_prob = next_dist.log_prob(next_act)
-            next_log_prob = next_log_prob - torch.sum(torch.log(1 - next_act.pow(2) + 1e-6), dim=-1)
+        # Critic update
+        with autocast():
+            with torch.no_grad():
+                next_loc, next_scale, _ = self.actor(obs_next)
+                next_dist = Independent(Normal(next_loc, next_scale), 1)
+                next_act = next_dist.rsample()
+                next_act = torch.tanh(next_act)
+                next_log_prob = next_dist.log_prob(next_act)
+                next_log_prob = next_log_prob - torch.sum(torch.log(1 - next_act.pow(2) + 1e-6), dim=-1)
 
-            target_q = self.critic_target(obs_next, next_act)
-            target_q = target_q - self.alpha.detach() * next_log_prob.unsqueeze(-1)
-            target_q = rew.unsqueeze(-1) + self.gamma * (1 - done.unsqueeze(-1)) * target_q
+                target_q = self.critic_target(obs_next, next_act)
+                target_q = target_q - self.alpha.detach() * next_log_prob.unsqueeze(-1)
+                target_q = rew.unsqueeze(-1) + self.gamma * (1 - done.unsqueeze(-1)) * target_q
 
-        current_q1 = self.critic(obs, act)
-        current_q2 = self.critic(obs, act)
-
-        # Ensure all tensors have matching batch dimensions
-        if current_q1.shape[0] != target_q.shape[0]:
-            target_q = target_q.expand(current_q1.shape[0], -1)
-
-        critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
+            current_q1 = self.critic(obs, act)
+            current_q2 = self.critic(obs, act)
+            critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
 
         self.critic_optim.zero_grad()
-        critic_loss.backward()
+        self.scaler.scale(critic_loss).backward()
+        self.scaler.unscale_(self.critic_optim)
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
-        self.critic_optim.step()
+        self.scaler.step(self.critic_optim)
+        self.scaler.update()
+        
 
-        # Update target networks
         self.soft_update(self.critic_target, self.critic, self.tau)
 
-        # Create loss statistics
         loss = critic_loss.item() + actor_loss.item()
         
-        # Return LogInfo object
         return SACSummary(
             loss=loss,
             loss_actor=actor_loss.item(),
@@ -379,8 +455,9 @@ policy = CustomSACPolicy(
 policy = policy.to(device)
 
 buffer = VectorReplayBuffer(
-    total_size=1000000,
-    buffer_num=32
+    total_size=1000000,  # 1M transitions in total
+    buffer_num=32,       # Number of environments
+    device=device
 )
 
 class GPUCollector(Collector):
@@ -395,12 +472,6 @@ class GPUCollector(Collector):
         return result
 
 collector = GPUCollector(policy, env, buffer, exploration_noise=True)
-
-buffer = VectorReplayBuffer(
-    total_size=1000000,  # 1M transitions in total
-    buffer_num=32,       # Number of environments
-    device=device
-)
 
 
 trainer = OffpolicyTrainer(
