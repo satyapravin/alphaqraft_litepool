@@ -124,9 +124,6 @@ class RecurrentActor(nn.Module):
         self.log_std.weight.data.fill_(-0.5)
 
     def forward(self, obs, state=None, info=None):
-        """Handles both real-time and replay buffer cases correctly, ensuring `state` is properly handled."""
-
-        # ✅ Ensure `obs` is a tensor
         if isinstance(obs, Batch):  # Tianshou passes `Batch` objects
             obs = obs.obs  # Extract numpy array or tensor
 
@@ -134,12 +131,10 @@ class RecurrentActor(nn.Module):
 
         batch_size = obs.shape[0]  # Get batch size dynamically
 
-        # ✅ Ensure obs is reshaped correctly when it comes from the replay buffer
         expected_flat_dim = self.time_steps * self.feature_dim  # Should be 10 * 242 = 2420
         if obs.dim() == 2 and obs.shape[1] == expected_flat_dim:  
             obs = obs.view(batch_size, self.time_steps, self.feature_dim)  # Reshape to (batch, 10, 242)
 
-        # ✅ Ensure obs is now correctly shaped
         if obs.shape[1] != self.time_steps or obs.shape[2] != self.feature_dim:
             raise ValueError(f"Unexpected obs shape after processing: {obs.shape}, expected ({batch_size}, {self.time_steps}, {self.feature_dim})")
 
@@ -155,11 +150,9 @@ class RecurrentActor(nn.Module):
 
         x = torch.cat([trade_out, market_out], dim=-1)
 
-        # ✅ Fix: Ensure `state` is properly initialized
         if state is None:
             state = torch.zeros(self.num_layers, batch_size, self.gru_hidden_dim, device=obs.device)
         else:
-            # ✅ Ensure state has the correct shape [num_layers, batch_size, hidden_dim]
             if state.shape[1] != batch_size:
                 state = state[:, :batch_size, :]
 
@@ -168,12 +161,10 @@ class RecurrentActor(nn.Module):
         x = x[:, -1, :]
         x = torch.cat([x, position_out], dim=-1)
         x = self.fusion_fc(x)
-
-        mean = self.mean(x)
+        mean = self.mean(x)  
         log_std = self.log_std(x).clamp(-20, 0)
+        return (torch.tanh(mean) * self.max_action, log_std.exp()), [new_state.detach()]
 
-        # ✅ Fix: Ensure `new_state` is detached before returning
-        return (torch.tanh(mean) * self.max_action, log_std.exp()), new_state.detach()  # ✅ Return full GRU state
 
 class IQNCritic(nn.Module):
     """IQN-based Critic for Distributional RL"""
