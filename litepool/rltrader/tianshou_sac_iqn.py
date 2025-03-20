@@ -123,31 +123,57 @@ class RecurrentActor(nn.Module):
         self.log_std = nn.Linear(hidden_dim, action_dim)
         self.log_std.weight.data.fill_(-0.5)
 
-    def forward(self, state, hidden=None):
-        batch_size = state.shape[0]
-        state = state.view(batch_size, self.time_steps, self.feature_dim)
+    def forward(self, obs, state=None, info=None):
+        """Handles both real-time and replay buffer cases correctly, ensuring `state` is properly handled."""
 
-        market_state = state[:, :, :self.market_dim]
-        position_state = state[:, -1, self.market_dim:self.market_dim + self.position_dim]
-        trade_state = state[:, :, self.market_dim + self.position_dim:]
+        # ✅ Ensure `obs` is a tensor
+        if isinstance(obs, Batch):  # Tianshou passes `Batch` objects
+            obs = obs.obs  # Extract numpy array or tensor
 
+        obs = torch.as_tensor(obs, dtype=torch.float32, device=next(self.parameters()).device)
+
+        batch_size = obs.shape[0]  # Get batch size dynamically
+
+        # ✅ Ensure obs is reshaped correctly when it comes from the replay buffer
+        expected_flat_dim = self.time_steps * self.feature_dim  # Should be 10 * 242 = 2420
+        if obs.dim() == 2 and obs.shape[1] == expected_flat_dim:  
+            obs = obs.view(batch_size, self.time_steps, self.feature_dim)  # Reshape to (batch, 10, 242)
+
+        # ✅ Ensure obs is now correctly shaped
+        if obs.shape[1] != self.time_steps or obs.shape[2] != self.feature_dim:
+            raise ValueError(f"Unexpected obs shape after processing: {obs.shape}, expected ({batch_size}, {self.time_steps}, {self.feature_dim})")
+
+        # 🔹 Extract different parts of the input
+        market_state = obs[:, :, :self.market_dim]
+        position_state = obs[:, -1, self.market_dim:self.market_dim + self.position_dim]
+        trade_state = obs[:, :, self.market_dim + self.position_dim:]
+
+        # 🔹 Process each part
         position_out = self.position_fc(position_state)
         trade_out = self.trade_fc(trade_state)
         market_out = self.market_fc(market_state)
 
         x = torch.cat([trade_out, market_out], dim=-1)
 
-        if hidden is None:
-            hidden = torch.zeros(self.num_layers, batch_size, self.gru_hidden_dim, device=state.device)
+        # ✅ Fix: Ensure `state` is properly initialized
+        if state is None:
+            state = torch.zeros(self.num_layers, batch_size, self.gru_hidden_dim, device=obs.device)
+        else:
+            # ✅ Ensure state has the correct shape [num_layers, batch_size, hidden_dim]
+            if state.shape[1] != batch_size:
+                state = state[:, :batch_size, :]
 
-        x, hidden = self.gru(x, hidden)
+        x, new_state = self.gru(x, state)  # new_state is (num_layers, batch, gru_hidden_dim)
+
         x = x[:, -1, :]
         x = torch.cat([x, position_out], dim=-1)
-
         x = self.fusion_fc(x)
+
         mean = self.mean(x)
         log_std = self.log_std(x).clamp(-20, 0)
-        return torch.tanh(mean) * self.max_action, log_std.exp()
+
+        # ✅ Fix: Ensure `new_state` is detached before returning
+        return (torch.tanh(mean) * self.max_action, log_std.exp()), new_state.detach()  # ✅ Return full GRU state
 
 class IQNCritic(nn.Module):
     """IQN-based Critic for Distributional RL"""
