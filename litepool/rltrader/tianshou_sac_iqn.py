@@ -33,10 +33,126 @@ env = litepool.make(
     num_threads=32, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
     maker_fee=-0.0001, taker_fee=0.0005, foldername="./train_files/",
-    balance=1.0, start=1, max=36001*10
+    balance=1.0, start=360000, max=3601*10
 )
 
 env.spec.id = 'RlTrader-v0'
+
+class VecNormalize:
+    def __init__(self, env, num_env, norm_obs=True, norm_reward=True, clip_obs=10., clip_reward=10., gamma=0.99, epsilon=1e-8):
+        self.env = env
+        self.norm_obs = norm_obs
+        self.norm_reward = norm_reward
+        self.clip_obs = clip_obs
+        self.clip_reward = clip_reward
+        self.epsilon = epsilon
+        self.gamma = gamma
+        self.num_env = num_env
+        self.obs_rms = RunningMeanStd(shape=self.env.observation_space.shape)
+        self.ret_rms = RunningMeanStd(shape=())
+        self.returns = np.zeros(self.num_env)
+
+    def __len__(self):
+        return self.num_env
+
+    @property
+    def num_envs(self):
+        return self.num_envs
+
+    def close(self):
+        return self.env.close()
+
+    @property
+    def observation_space(self):
+        return self.env.observation_space
+
+    @property
+    def action_space(self):
+        return self.env.action_space
+
+    @property
+    def reward_range(self):
+        return self.env.reward_range
+
+    def seed(self, seed=None):
+        return self.env.seed(seed)
+
+    def normalize_obs(self, obs):
+        if self.norm_obs:
+            obs = np.clip((obs - self.obs_rms.mean) / np.sqrt(self.obs_rms.var + self.epsilon),
+                         -self.clip_obs, self.clip_obs)
+        return obs
+
+    def normalize_reward(self, reward):
+        if self.norm_reward:
+            reward = np.clip(reward / np.sqrt(self.ret_rms.var + self.epsilon),
+                           -self.clip_reward, self.clip_reward)
+        return reward
+
+    def step(self, actions):
+        obs, rews, terminateds, truncateds, infos = self.env.step(actions)
+
+        if self.norm_obs:
+            self.obs_rms.update(obs)
+            obs = self.normalize_obs(obs)
+
+        if self.norm_reward:
+            self.returns = self.returns * self.gamma + rews
+            self.ret_rms.update(self.returns)
+            rews = self.normalize_reward(rews)
+
+        dones = np.logical_or(terminateds, truncateds)
+        self.returns[dones] = 0.0
+
+        return obs, rews, terminateds, truncateds, infos
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+
+        if self.norm_obs:
+            self.obs_rms.update(obs)
+            obs = self.normalize_obs(obs)
+
+        return obs, info
+
+    def __getattr__(self, name):
+        return getattr(self.env, name)
+
+class RunningMeanStd:
+    def __init__(self, shape=(), epsilon=1e-4):
+        self.mean = np.zeros(shape, dtype=np.float64)
+        self.var = np.ones(shape, dtype=np.float64)
+        self.count = epsilon
+
+    def update(self, x):
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.shape[0]
+
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
+        new_var = M2 / tot_count
+
+        self.mean = new_mean
+        self.var = new_var
+        self.count = tot_count
+
+# Wrap environment with VecNormalize
+env = VecNormalize(
+    env,
+    num_env=32,
+    norm_obs=True,
+    norm_reward=True,
+    clip_obs=10.,
+    clip_reward=10.,
+    gamma=0.99
+)
+
 env_action_space = env.action_space
 
 #-----------------------------
@@ -383,6 +499,30 @@ from collections import namedtuple
 import time
 from dataclasses import dataclass
 
+class MetricLogger:
+    def __init__(self, print_interval=1000):
+        self.print_interval = print_interval
+        self.last_print_step = 0
+        self.episode_rewards = []
+        self.episode_lengths = []
+        
+    def log(self, step_count, info, rew, policy):
+        if step_count % self.print_interval == 0:
+            print(f"\nStep: {step_count}")
+            print("Env | Balance | R_PnL | UR_PnL | Fees | Trades | Drawdown | Leverage | Reward")
+            print("-" * 80)
+            
+            # Print one line per environment
+            for ii in info['env_id']:
+                print(f"{ii:3d} | {info['balance'][ii]:7.4f} | {info['realized_pnl'][ii]:6.4f} | "
+                      f"{info['unrealized_pnl'][ii]:6.4f} | {info['fees'][ii]:6.4f} | "
+                      f"{info['trade_count'][ii]} | {info['drawdown'][ii]:8.4f} | "
+                      f"{info['leverage'][ii]:8.4f} | {rew[ii]:8.4f}")
+            
+            if hasattr(policy, 'alpha'):
+                print(f"\nAlpha: {policy.alpha.item():.6f}")
+            print("-" * 80)
+
 @dataclass
 class CollectStats:
     n_ep: int
@@ -488,11 +628,10 @@ class GPUCollector(Collector):
                 obs_next, rew, done, info = result
                 terminated = done
                 truncated = False
-               
-            if step_count  % 1000 == 0:
-                for ii in info['env_id']:
-                    print(f"{step_count}, balance: {info['balance'][ii]:.6f}, realized_pnl: {info['realized_pnl'][ii]:.6f}, unrealized_pnl: {info['unrealized_pnl'][ii]:.6f}, fees: {info['fees'][ii]:.6f}, count: {info['trade_count'][ii]}, drawdown: {info['drawdown'][ii]:.6f}, leverage: {info['leverage'][ii]:.4f}")
-            # Convert new observations and rewards to tensors on device
+            
+            if hasattr(self, 'logger'):
+                self.logger.log(step_count, info, rew, self.policy)
+
             if isinstance(obs_next, torch.Tensor):
                 obs_next = obs_next.to(self.device)
             else:
@@ -687,20 +826,38 @@ class GPUCollector(Collector):
                 lengths=empty_arr
             )
 
+logger = MetricLogger(print_interval=1000)
 collector = GPUCollector(policy, env, buffer, device=device, exploration_noise=True)
+collector.logger = logger
+
+
+results_dir = Path("results")
+results_dir.mkdir(exist_ok=True)
+
+def save_checkpoint_fn(epoch, env_step, gradient_step):
+    torch.save({
+        'policy_state_dict': policy.state_dict(),
+        'actor_optim_state_dict': policy.actor_optim.state_dict(),
+        'critic_optim_state_dict': policy.critic_optim.state_dict(),
+        'alpha_optim_state_dict': policy.alpha_optim.state_dict()
+    }, results_dir / f"checkpoint_epoch_{epoch}_step_{env_step}.pth")
+    
+    if env_step % (3602*32) == 0:  # Save every epoch
+        buffer.save_hdf5(results_dir / f"buffer_epoch_{epoch}_step_{env_step}.h5")
 
 
 trainer = OffpolicyTrainer(
     policy=policy,
     train_collector=collector,
     max_epoch=10,
-    step_per_epoch=36002*32,
-    step_per_collect=36001*32,  # Collect 360 steps per environment
+    step_per_epoch=3602*32,
+    step_per_collect=3601*32,  # Collect 360 steps per environment
     update_per_step=0.1,
     episode_per_test=0,
     batch_size=32,  
     test_in_train=False,
-    verbose=True
+    verbose=True,
+    save_checkpoint_fn=save_checkpoint_fn  # Add checkpoint saving
 )
 
 trainer.run()
