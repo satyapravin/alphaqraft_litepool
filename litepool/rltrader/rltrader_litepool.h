@@ -221,12 +221,13 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
    
     reward = curr_data_rpnl + curr_data_upnl - curr_data_fees;
     if (reward > 0 && isDone) reward /= (0.0001 + std::abs(info["drawdown"]));
+    else reward += info["leverage"] * (info["mid_price"] - info["average_price"]);
 
     if (!isDone) {
-        reward -= prev_reward;
+        reward = prev_reward * 0.95 + reward * 0.05;
 	prev_reward = reward;
     }
-    state["reward"_] = reward * 100;
+    state["reward"_] = reward * 10;
     state["obs"_].Assign(data.begin(), data.size());
   }
 

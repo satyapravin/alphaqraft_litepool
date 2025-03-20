@@ -32,6 +32,8 @@ from litepool.python.protocol import LitePool
 from stable_baselines3.common.buffers import ReplayBuffer
 from tianshou.data import ReplayBuffer as TianshouReplayBuffer, Batch
 
+from torch.amp import autocast, GradScaler
+
 device = torch.device("cuda")
 
 
@@ -91,7 +93,7 @@ class RecurrentReplayBuffer(ReplayBuffer):
 # 1. Recurrent Actor 
 # ------------------
 class RecurrentActor(nn.Module):
-    def __init__(self, state_dim=2420, action_dim=3, hidden_dim=256, gru_hidden_dim=128, num_layers=2):
+    def __init__(self, state_dim=2420, action_dim=12, hidden_dim=64, gru_hidden_dim=128, num_layers=2):
         super(RecurrentActor, self).__init__()
         self.gru_hidden_dim = gru_hidden_dim
         self.num_layers = num_layers
@@ -126,8 +128,16 @@ class RecurrentActor(nn.Module):
             nn.ReLU()
         )
 
-        self.gru = nn.GRU(64, gru_hidden_dim, num_layers=num_layers, batch_first=True, dropout=0.2)
-        self.fusion_fc = nn.Linear(gru_hidden_dim + 32, hidden_dim)
+        self.gru = nn.GRU(64, gru_hidden_dim, num_layers=num_layers, batch_first=True, dropout=0.1)
+
+        self.fusion_fc = nn.Sequential(
+                nn.Linear(gru_hidden_dim + 32, hidden_dim*2),
+                nn.ReLU(),
+                nn.LayerNorm(hidden_dim*2),
+                nn.Linear(hidden_dim*2, hidden_dim),
+                nn.ReLU()
+        )
+
         self.mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Linear(hidden_dim, action_dim)
         self.log_std.weight.data.fill_(-0.5)
@@ -321,6 +331,8 @@ class CustomFQFDSAC(SAC):
         self.log_alpha = torch.tensor(np.log(alpha), requires_grad=True, device=self.device)
         self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=learning_rate)
         self.target_entropy = -env.action_space.shape[0] 
+        self.scaler = GradScaler()
+
 
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
         self.policy.actor.train()
@@ -344,6 +356,7 @@ class CustomFQFDSAC(SAC):
 
 
     def train_step(self, replay_buffer, batch_size=256):
+        # Sample a batch of sequences from the replay buffer
         replay_data = replay_buffer.sample(batch_size, env=self._vec_normalize_env)
         states = replay_data.observations
         actions = replay_data.actions
@@ -354,51 +367,70 @@ class CustomFQFDSAC(SAC):
         hidden_actor = None
         hidden_critic = None
 
+        # --------------------------
         # Target Q-value computation
+        # --------------------------
         with torch.no_grad():
-            rewards = rewards.view(-1, 1)  # Shape: [22723, 1]
-            dones = dones.view(-1, 1)      # Shape: [22723, 1]
+            rewards = rewards.view(-1, 1)  # Shape: [batch_size, 1]
+            dones = dones.view(-1, 1)      # Shape: [batch_size, 1]
             next_actions, next_log_probs, hidden_actor = self.actor.sample(next_states, hidden_actor)
             next_q1_values, next_q2_values = self.critic_target(next_states, next_actions)
             next_q_values = torch.min(next_q1_values, next_q2_values)
             target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
 
-        # Critic update
-        current_q1_values, current_q2_values = self.critic(states, actions)
-        critic_loss = F.mse_loss(current_q1_values, target_q_values) + F.mse_loss(current_q2_values, target_q_values)
+        # --------------------
+        # Critic Update (FP16)
+        # --------------------
+        with autocast(device_type="cuda"):  # Enable mixed precision for forward pass
+            current_q1_values, current_q2_values = self.critic(states, actions)
+            critic_loss = F.mse_loss(current_q1_values, target_q_values) + F.mse_loss(current_q2_values, target_q_values)
+
+        # Backpropagation for critic
         self.policy.critic_optimizer.zero_grad()
-        critic_loss.backward()
-        self.policy.critic_optimizer.step()
+        self.scaler.scale(critic_loss).backward()  # Scale gradients
+        self.scaler.step(self.policy.critic_optimizer)  # Apply optimizer step
+        self.scaler.update()  # Update the GradScaler
 
-        # Actor update
-        new_actions, log_probs, hidden_actor = self.actor.sample(states, hidden_actor)
-        q1_values_new, q2_values_new = self.critic(states, new_actions)
-        q_values_new = torch.min(q1_values_new, q2_values_new)
-        alpha = self.alpha if isinstance(self.alpha, float) else self.log_alpha.exp()
-        actor_loss = (alpha * log_probs - q_values_new).mean()
+        # --------------------
+        # Actor Update (FP16)
+        # --------------------
+        with autocast(device_type="cuda"):  # Enable mixed precision for forward pass
+            new_actions, log_probs, hidden_actor = self.actor.sample(states, hidden_actor)
+            q1_values_new, q2_values_new = self.critic(states, new_actions)
+            q_values_new = torch.min(q1_values_new, q2_values_new)
+            alpha = self.alpha if isinstance(self.alpha, float) else self.log_alpha.exp()
+            actor_loss = (alpha * log_probs - q_values_new).mean()
 
+        # Backpropagation for actor
         self.policy.optimizer.zero_grad()
-        actor_loss.backward()
-        self.policy.optimizer.step()
+        self.scaler.scale(actor_loss).backward()  # Scale gradients
+        self.scaler.step(self.policy.optimizer)  # Apply optimizer step
+        self.scaler.update()  # Update the GradScaler
 
-        # Entropy coefficient update
+        # -------------------------
+        # Entropy Coefficient Update
+        # -------------------------
         entropy_loss = 0
         if self.ent_coef == "auto":
             entropy_loss = -(self.log_alpha * (log_probs + self.target_entropy).detach()).mean()
             self.alpha_optimizer.zero_grad()
-            entropy_loss.backward()
-            self.alpha_optimizer.step()
+            entropy_loss.backward()  
+            self.alpha_optimizer.step()  
+
             alpha = self.log_alpha.exp().item()
 
-        log_alpha = self.log_alpha.exp().item() 
+        # -------------------------
+        # Logging for Debugging
+        # -------------------------
+        log_alpha = self.log_alpha.exp().item()
         action_mean, action_std, _ = self.actor(states)
-        action_std = action_std.mean().item()  
+        action_std = action_std.mean().item()  # Mean action std across batch
         print(f"entropy_coef: {log_alpha}, action_std: {action_std}")
 
         return {
             "critic_loss": critic_loss.item(),
             "actor_loss": actor_loss.item(),
-            "entropy_loss": entropy_loss.item(),
+            "entropy_loss": entropy_loss.item() if self.ent_coef == "auto" else 0,
         }
 
 # ---------------------------
@@ -487,12 +519,12 @@ env = litepool.make("RlTrader-v0", env_type="gymnasium",
                           symbol="BTC-PERPETUAL",
                           tick_size=0.5,
                           min_amount=10,
-                          maker_fee=-0.0001,
+                          maker_fee=-0.00001,
                           taker_fee=0.0005,
                           foldername="./train_files/", 
                           balance=1.0,
                           start=1,
-                          max=40001*10)
+                          max=3601*10)
 
 env.spec.id = 'RlTrader-v0'
 
@@ -511,8 +543,8 @@ model = CustomFQFDSAC(
     gamma=0.99,
     tau=0.005,
     learning_starts=100,        
-    train_freq=64,           
-    gradient_steps=1,    
+    train_freq=1024,           
+    gradient_steps=8,    
     ent_coef='auto',                
     verbose=1,
     replay_buffer_class=RecurrentReplayBuffer,  
@@ -527,6 +559,6 @@ if os.path.exists("sac_fqf_rltrader.zip"):
     print("saved fqf model loaded")
 
 for i in range(0, 500):
-    model.learn(40005*64)
+    model.learn(36005*64)
     model.save("sac_fqf_rltrader")
     model.save_replay_buffer("replay_fqf_buffer.pkl")

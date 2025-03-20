@@ -32,7 +32,10 @@ void PositionSignalBuilder::compute_signals(const PositionInfo& info, const doub
     repo.realized_pnl_drawdown = std::min(repo.realized_pnl - max_trading_pnl, 0.0);
     repo.total_pnl = repo.inventory_pnl + repo.realized_pnl;
     repo.total_drawdown = repo.inventory_pnl_drawdown + repo.realized_pnl_drawdown;
-    repo.relative_price = info.averagePrice / (info.netPosition > 0 ? bid_price : ask_price);
+
+    if (info.netPosition > 0) repo.relative_price = ask_price - info.averagePrice;
+    else if (info.netPosition < 0) repo.relative_price = info.averagePrice - bid_price;
+    else repo.relative_price = 0.0; 
 
     repo.net_position = repo.net_position / info.balance;
     repo.inventory_pnl = repo.inventory_pnl / info.balance;
