@@ -105,92 +105,80 @@ class CustomSACPolicy(SACPolicy):
         return Batch(act=act, state=h, dist=dist, log_prob=log_prob)
 
     def learn(self, batch: Batch, **kwargs):
-        batch.to_torch(device=device)
-
+        # Convert batch data to tensors with correct dtypes
         for key in ['obs', 'act', 'rew', 'done', 'obs_next']:
             if isinstance(getattr(batch, key), np.ndarray):
-                setattr(batch, key, torch.as_tensor(getattr(batch, key)).to(device))
-
-        obs = batch.obs
-        obs_next = batch.obs_next
-        act = batch.act
-        rew = batch.rew
-        done = batch.done
+                setattr(batch, key, torch.as_tensor(getattr(batch, key), dtype=torch.float32).to(device))
 
         self.training = True
         start_time = time.time()
 
         with autocast(device_type="cuda"):
-            loc, scale, _ = self.actor(obs)
+            # Actor forward pass
+            loc, scale, _ = self.actor(batch.obs)
             dist = Independent(Normal(loc, scale), 1)
             act_pred = dist.rsample()
             log_prob = dist.log_prob(act_pred)
             act_pred = torch.tanh(act_pred)
             log_prob = log_prob - torch.sum(torch.log(1 - act_pred.pow(2) + 1e-6), dim=-1)
 
-            current_q1 = self.critic(obs, act_pred)
-            current_q2 = self.critic(obs, act_pred)
+            # Current Q values
+            current_q1 = self.critic(batch.obs, act_pred)
+            current_q2 = self.critic(batch.obs, act_pred)
             q_min = torch.min(current_q1, current_q2).mean(dim=-1)
             actor_loss = (self.alpha * log_prob - q_min).mean()
-            batch.to_torch(device=device)
-            self.training = True
-            start_time = time.time()
 
+            # Actor optimization
+            self.actor_optim.zero_grad()
+            self.scaler.scale(actor_loss).backward()
+            self.scaler.unscale_(self.actor_optim)
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+            self.scaler.step(self.actor_optim)
 
-        # Actor optimization with scaler
-        self.actor_optim.zero_grad()
-        self.scaler.scale(actor_loss).backward()
-        self.scaler.unscale_(self.actor_optim)
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
-        self.scaler.step(self.actor_optim)
-
-        # Alpha update
-        with autocast(device_type="cuda"):
+            # Alpha optimization
             alpha_loss = -(self.alpha * (log_prob + self.target_entropy).detach()).mean()
+            self.alpha_optim.zero_grad()
+            self.scaler.scale(alpha_loss).backward()
+            self.scaler.step(self.alpha_optim)
 
-        self.alpha_optim.zero_grad()
-        self.scaler.scale(alpha_loss).backward()
-        self.scaler.step(self.alpha_optim)
-
-        # Critic update
-        with autocast(device_type="cuda"):
+            # Target Q computation
             with torch.no_grad():
-                next_loc, next_scale, _ = self.actor(obs_next)
+                next_loc, next_scale, _ = self.actor(batch.obs_next)
                 next_dist = Independent(Normal(next_loc, next_scale), 1)
                 next_act = next_dist.rsample()
                 next_act = torch.tanh(next_act)
                 next_log_prob = next_dist.log_prob(next_act)
                 next_log_prob = next_log_prob - torch.sum(torch.log(1 - next_act.pow(2) + 1e-6), dim=-1)
 
-                target_q = self.critic_target(obs_next, next_act)
+                target_q = self.critic_target(batch.obs_next, next_act)
                 target_q = target_q - self.alpha.detach() * next_log_prob.unsqueeze(-1)
-                target_q = rew.unsqueeze(-1) + self.gamma * (1 - done.unsqueeze(-1)) * target_q
+                target_q = batch.rew.unsqueeze(-1) + self.gamma * (1 - batch.done.unsqueeze(-1)) * target_q
 
-            current_q1 = self.critic(obs, act)
-            current_q2 = self.critic(obs, act)
+            # Current Q values and critic loss
+            current_q1 = self.critic(batch.obs, batch.act)
+            current_q2 = self.critic(batch.obs, batch.act)
             critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
 
-        self.critic_optim.zero_grad()
-        self.scaler.scale(critic_loss).backward()
-        self.scaler.unscale_(self.critic_optim)
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
-        self.scaler.step(self.critic_optim)
-        self.scaler.update()
-        
+            # Critic optimization
+            self.critic_optim.zero_grad()
+            self.scaler.scale(critic_loss).backward()
+            self.scaler.unscale_(self.critic_optim)
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+            self.scaler.step(self.critic_optim)
+            self.scaler.update()
 
-        self.soft_update(self.critic_target, self.critic, self.tau)
+            # Update target network
+            self.soft_update(self.critic_target, self.critic, self.tau)
 
-        loss = critic_loss.item() + actor_loss.item()
-        
+        # Return statistics
         return SACSummary(
-            loss=loss,
+            loss=critic_loss.item() + actor_loss.item(),
             loss_actor=actor_loss.item(),
             loss_critic=critic_loss.item(),
             loss_alpha=alpha_loss.item(),
             alpha=self.alpha.item(),
             train_time=time.time() - start_time
         )
-
 # ---------------------------
 # Custom Models for SAC + IQN
 # ---------------------------
@@ -500,7 +488,10 @@ class GPUCollector(Collector):
                 obs_next, rew, done, info = result
                 terminated = done
                 truncated = False
-                
+               
+            if step_count  % 1000 == 0:
+                for ii in info['env_id']:
+                    print(f"{step_count}, balance: {info['balance'][ii]:.6f}, realized_pnl: {info['realized_pnl'][ii]:.6f}, unrealized_pnl: {info['unrealized_pnl'][ii]:.6f}, fees: {info['fees'][ii]:.6f}, count: {info['trade_count'][ii]}, drawdown: {info['drawdown'][ii]:.6f}, leverage: {info['leverage'][ii]:.4f}")
             # Convert new observations and rewards to tensors on device
             if isinstance(obs_next, torch.Tensor):
                 obs_next = obs_next.to(self.device)
@@ -704,7 +695,7 @@ trainer = OffpolicyTrainer(
     train_collector=collector,
     max_epoch=10,
     step_per_epoch=36002*32,
-    step_per_collect=360*32,  # Collect 360 steps per environment
+    step_per_collect=36001*32,  # Collect 360 steps per environment
     update_per_step=0.1,
     episode_per_test=0,
     batch_size=32,  

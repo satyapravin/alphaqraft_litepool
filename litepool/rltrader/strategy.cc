@@ -52,8 +52,8 @@ void Strategy::quote(const std::vector<double>& buy_spreads,
        	auto base_bid_price = bid_prices[0];
 	auto base_ask_price = ask_prices[0];
 
-	auto bid_width = 0.0001 * base_bid_price;
-        auto ask_width = 0.0001 * base_ask_price;
+	auto bid_width = 0.0003 * base_bid_price;
+        auto ask_width = 0.0003 * base_ask_price;
         
 	if (this->exchange.isDummy())	
             this->exchange.cancelOrders();

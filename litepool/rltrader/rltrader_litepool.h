@@ -228,7 +228,6 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
 	prev_reward = reward;
     }
 
-    if (steps % 1000 == 0) std::cout << "  balance : " + std::to_string(info["balance"] + info["realized_pnl"] + info["unrealized_pnl"] - info["fees"]) << std::endl;
     state["reward"_] = reward * 10;
     state["obs"_].Assign(data.begin(), data.size());
   }
