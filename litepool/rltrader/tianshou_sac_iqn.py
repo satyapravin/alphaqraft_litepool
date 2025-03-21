@@ -202,12 +202,28 @@ class CustomSACPolicy(SACPolicy):
             alpha=alpha,
             **kwargs
         )
-        
-        self.target_entropy = -np.prod(action_space.shape).item()
-        self.alpha = nn.Parameter(torch.tensor([alpha], device=device))
-        self.alpha_optim = torch.optim.Adam([self.alpha], lr=3e-4)
+       
+        self.min_alpha = 0.01
+        self.max_alpha = 2.0
+        self.target_entropy = -0.2 * np.prod(action_space.shape).item()
+        self.log_alpha = nn.Parameter(torch.tensor([np.log(alpha)], device=device))  # Optimize log(alpha)
+        self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=3e-4)  # Optimize log(alpha)
+        self.alpha_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.alpha_optim, T_max=1000000, eta_min=1e-5
+        )
         self.critic_target = copy.deepcopy(critic)
         self.scaler = GradScaler()
+
+    @property
+    def alpha(self):
+        # Ensure alpha is always positive by exponentiating log_alpha
+        return self.log_alpha.exp()
+    
+    @alpha.setter
+    def alpha(self, value):
+        # Set alpha by updating log_alpha
+        with torch.no_grad():
+            self.log_alpha.copy_(torch.tensor([np.log(value)], device=device))
 
     def forward(self, batch: Batch, state=None, **kwargs):
         obs = batch.obs
@@ -255,7 +271,10 @@ class CustomSACPolicy(SACPolicy):
             alpha_loss = -(self.alpha * (log_prob + self.target_entropy).detach()).mean()
             self.alpha_optim.zero_grad()
             self.scaler.scale(alpha_loss).backward()
+            self.scaler.unscale_(self.alpha_optim)  # Add this line
+            torch.nn.utils.clip_grad_norm_([self.alpha], 0.5)  # Add this line
             self.scaler.step(self.alpha_optim)
+            self.alpha_scheduler.step()
 
             # Target Q computation
             with torch.no_grad():
@@ -468,31 +487,12 @@ def quantile_huber_loss(ip, target, taus, kappa=1.0):
     td_error = target - ip  
     huber_loss = F.huber_loss(ip, target, delta=kappa, reduction="none")
     loss = (taus - (td_error.detach() < 0).float()).abs() * huber_loss
+    asymmetric_factor = 1.2  
+    loss = torch.where(td_error < 0,
+                      loss * asymmetric_factor,
+                      loss)
     return loss.mean()
 
-# ---------------------------
-# Training Setup
-# ---------------------------
-actor = RecurrentActor().to(device)
-critic = IQNCritic().to(device)
-critic_optim = Adam(critic.parameters(), lr=3e-4)
-
-policy = CustomSACPolicy(
-    actor=actor,
-    critic=critic,
-    actor_optim=Adam(actor.parameters(), lr=3e-4),
-    critic_optim=critic_optim,
-    tau=0.005, gamma=0.99, alpha=0.2,
-    action_space=env_action_space
-)
-
-policy = policy.to(device)
-
-buffer = VectorReplayBuffer(
-    total_size=1000000,  # 1M transitions in total
-    buffer_num=32,       # Number of environments
-    device=device
-)
 
 from tianshou.data import Collector, Batch
 from collections import namedtuple
@@ -826,13 +826,54 @@ class GPUCollector(Collector):
                 lengths=empty_arr
             )
 
+# ---------------------------
+# Training Setup
+# ---------------------------
+actor = RecurrentActor().to(device)
+critic = IQNCritic().to(device)
+critic_optim = Adam(critic.parameters(), lr=3e-4)
+
+policy = CustomSACPolicy(
+    actor=actor,
+    critic=critic,
+    actor_optim=Adam(actor.parameters(), lr=3e-4),
+    critic_optim=critic_optim,
+    tau=0.005, gamma=0.99, alpha=0.2,
+    action_space=env_action_space
+)
+
+policy = policy.to(device)
+
+results_dir = Path("results")
+model_path = results_dir / "sac_iqn_rltrader.pth"
+buffer_path = results_dir / "replay_iqn_buffer.h5"
+
+if model_path.exists():
+    print("Loading existing model...")
+    checkpoint = torch.load(model_path)
+    policy.load_state_dict(checkpoint['policy_state_dict'])
+    policy.actor_optim.load_state_dict(checkpoint['actor_optim_state_dict'])
+    policy.critic_optim.load_state_dict(checkpoint['critic_optim_state_dict'])
+    policy.alpha_optim.load_state_dict(checkpoint['alpha_optim_state_dict'])
+    print("Model loaded successfully")
+
+if buffer_path.exists():
+    print("Loading existing replay buffer...")
+    buffer = VectorReplayBuffer.load_hdf5(buffer_path, device=device)
+    print(f"Buffer loaded successfully with {len(buffer)} transitions")
+else:
+    buffer = VectorReplayBuffer(
+        total_size=1000000,  # 1M transitions in total
+        buffer_num=32,       # Number of environments
+        device=device
+    )
+
+results_dir.mkdir(exist_ok=True)
 logger = MetricLogger(print_interval=1000)
 collector = GPUCollector(policy, env, buffer, device=device, exploration_noise=True)
 collector.logger = logger
 
 
-results_dir = Path("results")
-results_dir.mkdir(exist_ok=True)
 
 def save_checkpoint_fn(epoch, env_step, gradient_step):
     torch.save({
