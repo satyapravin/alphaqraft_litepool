@@ -819,9 +819,59 @@ class GPUCollector(Collector):
                 lengths=empty_arr
             )
 
+def save_checkpoint_fn(epoch, env_step, gradient_step):
+    try:
+        checkpoint_dir = results_dir / "checkpoints"
+        checkpoint_dir.mkdir(exist_ok=True, parents=True)
+
+        # Save model checkpoint
+        checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch}_step_{env_step}.pth"
+        torch.save({
+            'epoch': epoch,
+            'env_step': env_step,
+            'gradient_step': gradient_step,
+            'policy_state_dict': policy.state_dict(),
+            'actor_optim_state_dict': policy.actor_optim.state_dict(),
+            'critic_optim_state_dict': policy.critic_optim.state_dict(),
+            'alpha_optim_state_dict': policy.alpha_optim.state_dict()
+        }, checkpoint_path)
+
+        # Save buffer at epoch intervals
+        if env_step % (36002*32) == 0:  # Save every epoch
+            buffer_path = checkpoint_dir / f"buffer_epoch_{epoch}_step_{env_step}.h5"
+            buffer.save_hdf5(buffer_path)
+
+        print(f"Saved checkpoint at epoch {epoch}, step {env_step}")
+        return True
+
+    except Exception as e:
+        print(f"Error saving checkpoint: {e}")
+        return False
+
+
 # ---------------------------
 # Training Setup
 # ---------------------------
+results_dir = Path("results")
+results_dir.mkdir(exist_ok=True)
+
+checkpoint_dir = results_dir / "checkpoints"
+checkpoint_dir.mkdir(exist_ok=True)
+
+# Find latest checkpoint if exists
+latest_checkpoint = None
+latest_step = -1
+if checkpoint_dir.exists():
+    for checkpoint_file in checkpoint_dir.glob("checkpoint_epoch_*.pth"):
+        try:
+            step = int(checkpoint_file.stem.split("_step_")[1])
+            if step > latest_step:
+                latest_step = step
+                latest_checkpoint = checkpoint_file
+        except:
+            continue
+
+# Initialize models and optimizers
 actor = RecurrentActor().to(device)
 critic = IQNCritic().to(device)
 critic_optim = Adam(critic.parameters(), lr=3e-4)
@@ -837,70 +887,65 @@ policy = CustomSACPolicy(
 
 policy = policy.to(device)
 
-results_dir = Path("results")
-model_path = results_dir / "sac_iqn_rltrader.pth"
-buffer_path = results_dir / "replay_iqn_buffer.h5"
-
-if model_path.exists():
-    print("Loading existing model...")
-    checkpoint = torch.load(model_path)
+# Load checkpoint if exists
+start_epoch = 0
+if latest_checkpoint is not None:
+    print(f"Loading checkpoint from {latest_checkpoint}")
+    checkpoint = torch.load(latest_checkpoint)
     policy.load_state_dict(checkpoint['policy_state_dict'])
     policy.actor_optim.load_state_dict(checkpoint['actor_optim_state_dict'])
     policy.critic_optim.load_state_dict(checkpoint['critic_optim_state_dict'])
     policy.alpha_optim.load_state_dict(checkpoint['alpha_optim_state_dict'])
-    print("Model loaded successfully")
+    start_epoch = checkpoint.get('epoch', 0)
+    print(f"Resumed from epoch {start_epoch}")
 
-if buffer_path.exists():
-    print("Loading existing replay buffer...")
-    buffer = VectorReplayBuffer.load_hdf5(buffer_path, device=device)
-    print(f"Buffer loaded successfully with {len(buffer)} transitions")
+# Load or create buffer
+latest_buffer = None
+if checkpoint_dir.exists():
+    buffer_files = list(checkpoint_dir.glob("buffer_epoch_*.h5"))
+    if buffer_files:
+        latest_buffer = max(buffer_files, key=lambda x: int(x.stem.split("_step_")[1]))
+
+if latest_buffer is not None:
+    print(f"Loading buffer from {latest_buffer}")
+    buffer = VectorReplayBuffer.load_hdf5(latest_buffer, device=device)
+    print(f"Buffer loaded with {len(buffer)} transitions")
 else:
     buffer = VectorReplayBuffer(
-        total_size=1000000,  # 1M transitions in total
-        buffer_num=32,       # Number of environments
+        total_size=1000000,
+        buffer_num=32,
         device=device
     )
 
-results_dir.mkdir(exist_ok=True)
 logger = MetricLogger(print_interval=1000)
 collector = GPUCollector(policy, env, buffer, device=device, exploration_noise=True)
 collector.logger = logger
-
-def save_checkpoint_fn(epoch, env_step, gradient_step):
-    torch.save({
-        'policy_state_dict': policy.state_dict(),
-        'actor_optim_state_dict': policy.actor_optim.state_dict(),
-        'critic_optim_state_dict': policy.critic_optim.state_dict(),
-        'alpha_optim_state_dict': policy.alpha_optim.state_dict()
-    }, results_dir / f"checkpoint_epoch_{epoch}_step_{env_step}.pth")
-    
-    if env_step % (3602*32) == 0:  # Save every epoch
-        buffer.save_hdf5(results_dir / f"buffer_epoch_{epoch}_step_{env_step}.h5")
-
 
 trainer = OffpolicyTrainer(
     policy=policy,
     train_collector=collector,
     max_epoch=10,
     step_per_epoch=36002*32,
-    step_per_collect=36001*32,  # Collect 360 steps per environment
+    step_per_collect=36001*32,
     update_per_step=0.1,
     episode_per_test=0,
-    batch_size=32,  
+    batch_size=32,
     test_in_train=False,
     verbose=True,
-    save_checkpoint_fn=save_checkpoint_fn  # Add checkpoint saving
+    save_checkpoint_fn=save_checkpoint_fn,
+    resume_from_log=True
 )
 
 trainer.run()
 
-# Save results
-
+# Save final results
+final_checkpoint_path = results_dir / "final_model.pth"
 torch.save({
     'policy_state_dict': policy.state_dict(),
     'actor_optim_state_dict': policy.actor_optim.state_dict(),
     'critic_optim_state_dict': policy.critic_optim.state_dict(),
     'alpha_optim_state_dict': policy.alpha_optim.state_dict()
-}, results_dir / "sac_iqn_rltrader.pth")
+}, final_checkpoint_path)
 
-buffer.save_hdf5(results_dir / "replay_iqn_buffer.h5")
+final_buffer_path = results_dir / "final_buffer.h5"
+buffer.save_hdf5(final_buffer_path)
