@@ -565,13 +565,16 @@ class GPUCollector(Collector):
         super().__init__(policy, env, buffer, **kwargs)
         self.device = device
         self.preprocess_fn = preprocess_fn
+        self.env_active = False  # Track if environments are already running
+        self.continuous_step_count = 0
         self.data = Batch()
         self.reset_batch_data()
 
     def reset_batch_data(self):
-        """Reset the internal batch data"""
-        self.data.obs_next = None
-        self.data.obs = None
+        """Reset the internal batch data but maintain environment state"""
+        if not self.env_active:
+            self.data.obs_next = None
+            self.data.obs = None
         self.data.act = None
         self.data.rew = None
         self.data.done = None
@@ -582,29 +585,33 @@ class GPUCollector(Collector):
         self.data.state = None
 
     def reset_env(self, gym_reset_kwargs=None):
-        """Reset the environment and return initial observation."""
-        gym_reset_kwargs = gym_reset_kwargs if gym_reset_kwargs else {}
-        obs = self.env.reset(**gym_reset_kwargs)
-        if isinstance(obs, tuple):
-            obs, info = obs
-        else:
-            info = None
-        
-        # Convert observation to tensor on device
-        if isinstance(obs, torch.Tensor):
-            obs = obs.to(self.device)
-        else:
-            obs = torch.as_tensor(obs, device=self.device)
-            
-        self.reset_batch_data()
-        return obs, info
+        """Reset the environment only if not already active"""
+        if not self.env_active:
+            gym_reset_kwargs = gym_reset_kwargs if gym_reset_kwargs else {}
+            obs = self.env.reset(**gym_reset_kwargs)
+            if isinstance(obs, tuple):
+                obs, info = obs
+            else:
+                info = None
+
+            if isinstance(obs, torch.Tensor):
+                obs = obs.to(self.device)
+            else:
+                obs = torch.as_tensor(obs, device=self.device)
+
+            self.data.obs = obs
+            self.data.info = info
+            self.env_active = True
+
+        return self.data.obs, self.data.info
 
     def _collect(self, n_step=None, n_episode=None, random=False, render=None, gym_reset_kwargs=None):
         if n_step is not None:
             assert n_episode is None, "Only one of n_step or n_episode is allowed"
         assert not self.env.is_async, "Please use AsyncCollector if using async venv."
+        
         start_time = time.time()
-        step_count = 0
+        local_step_count = 0  # Local counter for this collection cycle
         episode_count = 0
         episode_rews = []
         episode_lens = []
@@ -644,7 +651,7 @@ class GPUCollector(Collector):
                 truncated = False
             
             if hasattr(self, 'logger'):
-                self.logger.log(step_count, info, rew, self.policy)
+                self.logger.log(self.continuous_step_count, info, rew, self.policy)
 
             if isinstance(obs_next, torch.Tensor):
                 obs_next = obs_next.to(self.device)
@@ -703,7 +710,9 @@ class GPUCollector(Collector):
             # Save to buffer
             ptr, ep_rew, ep_len, ep_idx = self.buffer.add(batch)
 
-            step_count += 1
+            local_step_count += 1
+            self.continuous_step_count += 1  # Update continuous counter
+
             # Handle vectorized environment episode completion
             if isinstance(ep_len, np.ndarray):
                 for idx, (l, r) in enumerate(zip(ep_len, ep_rew)):
@@ -722,15 +731,10 @@ class GPUCollector(Collector):
             if n_episode and episode_count >= n_episode:
                 break
 
-            if n_step and step_count >= n_step:
+            if n_step and local_step_count >= n_step:
                 break
 
             self.data.obs = self.data.obs_next
-
-        self.reset_batch_data()
-
-        collect_time = time.time() - start_time
-        step_time = collect_time / step_count if step_count else 0
 
         class StatClass:
             def __init__(self, mean_val, std_val):
@@ -750,7 +754,7 @@ class GPUCollector(Collector):
             # Basic statistics with mean and std
             return_stat = StatClass(mean_rew, std_rew)
             return_stat.n_ep = episode_count
-            return_stat.n_st = step_count
+            return_stat.n_st = local_step_count
             return_stat.rews = rews
             return_stat.lens = lens
             return_stat.rew = mean_rew
@@ -761,7 +765,7 @@ class GPUCollector(Collector):
             # Length statistics
             lens_stat = StatClass(mean_len, std_len)
             lens_stat.n_ep = episode_count
-            lens_stat.n_st = step_count
+            lens_stat.n_st = local_step_count
             lens_stat.lens = lens
             lens_stat.len = mean_len
             lens_stat.len_std = std_len
@@ -769,76 +773,56 @@ class GPUCollector(Collector):
             # Reward statistics
             rewards_stat = StatClass(mean_rew, std_rew)
             rewards_stat.n_ep = episode_count
-            rewards_stat.n_st = step_count
+            rewards_stat.n_st = local_step_count
             rewards_stat.rews = rews
             rewards_stat.rew = mean_rew
             rewards_stat.rew_std = std_rew
-
-            return CollectStats(
-                n_ep=episode_count,
-                n_st=step_count,
-                rews=rews,
-                lens=lens,
-                rew=mean_rew,
-                len=mean_len,
-                rew_std=std_rew,
-                len_std=std_len,
-                n_collected_steps=step_count,
-                n_collected_episodes=episode_count,
-                returns_stat=return_stat,
-                lens_stat=lens_stat,
-                rewards_stat=rewards_stat,
-                episodes=episode_count,
-                reward_sum=float(rews.sum()),
-                length_sum=int(lens.sum()),
-                collect_time=collect_time,
-                step_time=step_time,
-                returns=rews,
-                lengths=lens
-            )
         else:
             empty_arr = np.array([])
-            
             return_stat = StatClass(0.0, 0.0)
             return_stat.n_ep = episode_count
-            return_stat.n_st = step_count
+            return_stat.n_st = local_step_count
             
             lens_stat = StatClass(0.0, 0.0)
             lens_stat.n_ep = episode_count
-            lens_stat.n_st = step_count
+            lens_stat.n_st = local_step_count
             lens_stat.lens = empty_arr
             lens_stat.len = 0.0
             lens_stat.len_std = 0.0
             
             rewards_stat = StatClass(0.0, 0.0)
             rewards_stat.n_ep = episode_count
-            rewards_stat.n_st = step_count
+            rewards_stat.n_st = local_step_count
             rewards_stat.rews = empty_arr
             rewards_stat.rew = 0.0
             rewards_stat.rew_std = 0.0
 
-            return CollectStats(
-                n_ep=episode_count,
-                n_st=step_count,
-                rews=empty_arr,
-                lens=empty_arr,
-                rew=0.0,
-                len=0.0,
-                rew_std=0.0,
-                len_std=0.0,
-                n_collected_steps=step_count,
-                n_collected_episodes=episode_count,
-                returns_stat=return_stat,
-                lens_stat=lens_stat,
-                rewards_stat=rewards_stat,
-                episodes=episode_count,
-                reward_sum=0.0,
-                length_sum=0,
-                collect_time=collect_time,
-                step_time=step_time,
-                returns=empty_arr,
-                lengths=empty_arr
-            )
+        collect_time = time.time() - start_time
+        step_time = collect_time / local_step_count if local_step_count else 0
+
+        return CollectStats(
+            n_ep=episode_count,
+            n_st=local_step_count,
+            rews=np.array(episode_rews) if episode_rews else empty_arr,
+            lens=np.array(episode_lens) if episode_lens else empty_arr,
+            rew=mean_rew if episode_count > 0 else 0.0,
+            len=mean_len if episode_count > 0 else 0.0,
+            rew_std=std_rew if episode_count > 0 else 0.0,
+            len_std=std_len if episode_count > 0 else 0.0,
+            n_collected_steps=local_step_count,
+            n_collected_episodes=episode_count,
+            returns_stat=return_stat,
+            lens_stat=lens_stat,
+            rewards_stat=rewards_stat,
+            episodes=episode_count,
+            reward_sum=float(np.sum(episode_rews)) if episode_rews else 0.0,
+            length_sum=int(np.sum(episode_lens)) if episode_lens else 0,
+            collect_time=collect_time,
+            step_time=step_time,
+            returns=np.array(episode_rews) if episode_rews else empty_arr,
+            lengths=np.array(episode_lens) if episode_lens else empty_arr,
+            continuous_step=self.continuous_step_count
+        )
 
 def save_checkpoint_fn(epoch, env_step, gradient_step):
     try:
@@ -945,13 +929,13 @@ collector.logger = logger
 trainer = OffpolicyTrainer(
     policy=policy,
     train_collector=collector,
-    max_epoch=10,
+    max_epoch=100,
     step_per_epoch=7201*32,
-    step_per_collect=360*32,
-    update_per_step=2,
-    episode_per_test=1,
+    step_per_collect=901,
+    update_per_step=0.1,
+    episode_per_test=0,
     batch_size=32,
-    test_in_train=True,
+    test_in_train=False,
     verbose=True,
     save_checkpoint_fn=save_checkpoint_fn,
     resume_from_log=True
