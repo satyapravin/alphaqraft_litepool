@@ -33,7 +33,7 @@ env = litepool.make(
     num_threads=32, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
     maker_fee=-0.0001, taker_fee=0.0005, foldername="./train_files/",
-    balance=1.0, start=360000, max=3601*10
+    balance=1.0, start=360000, max=36001*10
 )
 
 env.spec.id = 'RlTrader-v0'
@@ -191,6 +191,7 @@ class CustomSACPolicy(SACPolicy):
         alpha=0.2, 
         **kwargs
     ):
+        
         super().__init__(
             actor=actor, 
             actor_optim=actor_optim,
@@ -202,11 +203,10 @@ class CustomSACPolicy(SACPolicy):
             alpha=alpha,
             **kwargs
         )
-       
-        self.min_alpha = 0.01
-        self.max_alpha = 2.0
+      
+        self.apha = alpha
+        self.log_alpha = nn.Parameter(torch.tensor([np.log(self.alpha)], device=device))  
         self.target_entropy = -0.2 * np.prod(action_space.shape).item()
-        self.log_alpha = nn.Parameter(torch.tensor([np.log(alpha)], device=device))  # Optimize log(alpha)
         self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=3e-4)  # Optimize log(alpha)
         self.alpha_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.alpha_optim, T_max=1000000, eta_min=1e-5
@@ -215,16 +215,9 @@ class CustomSACPolicy(SACPolicy):
         self.scaler = GradScaler()
 
     @property
-    def alpha(self):
-        # Ensure alpha is always positive by exponentiating log_alpha
+    def get_alpha(self):
         return self.log_alpha.exp()
     
-    @alpha.setter
-    def alpha(self, value):
-        # Set alpha by updating log_alpha
-        with torch.no_grad():
-            self.log_alpha.copy_(torch.tensor([np.log(value)], device=device))
-
     def forward(self, batch: Batch, state=None, **kwargs):
         obs = batch.obs
         loc, scale, h = self.actor(obs, state=state)
@@ -258,7 +251,7 @@ class CustomSACPolicy(SACPolicy):
             current_q1 = self.critic(batch.obs, act_pred)
             current_q2 = self.critic(batch.obs, act_pred)
             q_min = torch.min(current_q1, current_q2).mean(dim=-1)
-            actor_loss = (self.alpha * log_prob - q_min).mean()
+            actor_loss = (self.get_alpha * log_prob - q_min).mean()
 
             # Actor optimization
             self.actor_optim.zero_grad()
@@ -268,11 +261,11 @@ class CustomSACPolicy(SACPolicy):
             self.scaler.step(self.actor_optim)
 
             # Alpha optimization
-            alpha_loss = -(self.alpha * (log_prob + self.target_entropy).detach()).mean()
+            alpha_loss = -(self.get_alpha * (log_prob + self.target_entropy).detach()).mean()
             self.alpha_optim.zero_grad()
             self.scaler.scale(alpha_loss).backward()
             self.scaler.unscale_(self.alpha_optim)  # Add this line
-            torch.nn.utils.clip_grad_norm_([self.alpha], 0.5)  # Add this line
+            torch.nn.utils.clip_grad_norm_([self.get_alpha], 0.5)  # Add this line
             self.scaler.step(self.alpha_optim)
             self.alpha_scheduler.step()
 
@@ -286,7 +279,7 @@ class CustomSACPolicy(SACPolicy):
                 next_log_prob = next_log_prob - torch.sum(torch.log(1 - next_act.pow(2) + 1e-6), dim=-1)
 
                 target_q = self.critic_target(batch.obs_next, next_act)
-                target_q = target_q - self.alpha.detach() * next_log_prob.unsqueeze(-1)
+                target_q = target_q - self.get_alpha.detach() * next_log_prob.unsqueeze(-1)
                 target_q = batch.rew.unsqueeze(-1) + self.gamma * (1 - batch.done.unsqueeze(-1)) * target_q
 
             # Current Q values and critic loss
@@ -311,7 +304,7 @@ class CustomSACPolicy(SACPolicy):
             loss_actor=actor_loss.item(),
             loss_critic=critic_loss.item(),
             loss_alpha=alpha_loss.item(),
-            alpha=self.alpha.item(),
+            alpha=self.get_alpha.item(),
             train_time=time.time() - start_time
         )
 # ---------------------------
@@ -520,7 +513,7 @@ class MetricLogger:
                       f"{info['leverage'][ii]:8.4f} | {rew[ii]:8.4f}")
             
             if hasattr(policy, 'alpha'):
-                print(f"\nAlpha: {policy.alpha.item():.6f}")
+                print(f"\nAlpha: {policy.get_alpha.item():.6f}")
             print("-" * 80)
 
 @dataclass
@@ -873,8 +866,6 @@ logger = MetricLogger(print_interval=1000)
 collector = GPUCollector(policy, env, buffer, device=device, exploration_noise=True)
 collector.logger = logger
 
-
-
 def save_checkpoint_fn(epoch, env_step, gradient_step):
     torch.save({
         'policy_state_dict': policy.state_dict(),
@@ -891,8 +882,8 @@ trainer = OffpolicyTrainer(
     policy=policy,
     train_collector=collector,
     max_epoch=10,
-    step_per_epoch=3602*32,
-    step_per_collect=3601*32,  # Collect 360 steps per environment
+    step_per_epoch=36002*32,
+    step_per_collect=36001*32,  # Collect 360 steps per environment
     update_per_step=0.1,
     episode_per_test=0,
     batch_size=32,  
@@ -904,8 +895,6 @@ trainer = OffpolicyTrainer(
 trainer.run()
 
 # Save results
-results_dir = Path("results")
-results_dir.mkdir(exist_ok=True)
 
 torch.save({
     'policy_state_dict': policy.state_dict(),
