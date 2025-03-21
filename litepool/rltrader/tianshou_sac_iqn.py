@@ -33,7 +33,7 @@ env = litepool.make(
     num_threads=32, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
     maker_fee=-0.0001, taker_fee=0.0005, foldername="./train_files/",
-    balance=1.0, start=360000, max=36001*10
+    balance=1.0, start=360000, max=7201*10
 )
 
 env.spec.id = 'RlTrader-v0'
@@ -178,65 +178,78 @@ class SACSummary:
             "alpha": self.alpha
         }
 
+import copy
+
+
 class CustomSACPolicy(SACPolicy):
     def __init__(
-        self, 
-        actor, 
+        self,
+        actor,
         critic,
-        actor_optim, 
+        actor_optim,
         critic_optim,
-        action_space=None, 
-        tau=0.005, 
-        gamma=0.99, 
-        alpha=0.2, 
+        action_space=None,
+        tau=0.005,
+        gamma=0.99,
+        alpha=0.2,  # Directly using alpha instead of log_alpha
         **kwargs
     ):
-        
         super().__init__(
-            actor=actor, 
+            actor=actor,
             actor_optim=actor_optim,
-            critic=critic, 
+            critic=critic,
             critic_optim=critic_optim,
             action_space=action_space,
             tau=tau,
             gamma=gamma,
-            alpha=alpha,
+            alpha=alpha,  # Directly passing alpha
             **kwargs
         )
-      
-        self.apha = alpha
-        self.log_alpha = nn.Parameter(torch.tensor([np.log(self.alpha)], device=device))  
+
+        # Directly use alpha as a trainable parameter
+        self.alpha = torch.tensor([alpha], dtype=torch.float32, device=device, requires_grad=True)
         self.target_entropy = -0.2 * np.prod(action_space.shape).item()
-        self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=3e-4)  # Optimize log(alpha)
+
+        # Optimizer for alpha (no log transformation)
+        self.alpha_optim = torch.optim.Adam([self.alpha], lr=3e-4)
+
+        # Learning rate scheduler for alpha
         self.alpha_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.alpha_optim, T_max=1000000, eta_min=1e-5
         )
+
         self.critic_target = copy.deepcopy(critic)
         self.scaler = GradScaler()
 
     @property
     def get_alpha(self):
-        return self.log_alpha.exp()
-    
+        """Returns the current entropy coefficient alpha."""
+        return self.alpha.clamp(1e-5, 2.0)  # Clamping alpha to prevent instability
+
     def forward(self, batch: Batch, state=None, **kwargs):
         obs = batch.obs
         loc, scale, h = self.actor(obs, state=state)
         dist = Independent(Normal(loc, scale), 1)
         act = dist.rsample()
         log_prob = dist.log_prob(act)
+
         # Apply tanh squashing
         act = torch.tanh(act)
         log_prob = log_prob - torch.sum(torch.log(1 - act.pow(2) + 1e-6), dim=-1)
+
         return Batch(act=act, state=h, dist=dist, log_prob=log_prob)
 
     def learn(self, batch: Batch, **kwargs):
-        # Convert batch data to tensors with correct dtypes
+        """Performs a learning step using SAC with direct alpha optimization."""
+
+        start_time = time.time()
+
+        # Convert batch data to tensors
         for key in ['obs', 'act', 'rew', 'done', 'obs_next']:
             if isinstance(getattr(batch, key), np.ndarray):
                 setattr(batch, key, torch.as_tensor(getattr(batch, key), dtype=torch.float32).to(device))
 
         self.training = True
-        start_time = time.time()
 
         with autocast(device_type="cuda"):
             # Actor forward pass
@@ -260,13 +273,16 @@ class CustomSACPolicy(SACPolicy):
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
             self.scaler.step(self.actor_optim)
 
-            # Alpha optimization
+            # Alpha optimization (Now optimizing alpha directly)
             alpha_loss = -(self.get_alpha * (log_prob + self.target_entropy).detach()).mean()
             self.alpha_optim.zero_grad()
             self.scaler.scale(alpha_loss).backward()
-            self.scaler.unscale_(self.alpha_optim)  # Add this line
-            torch.nn.utils.clip_grad_norm_([self.get_alpha], 0.5)  # Add this line
+            self.scaler.unscale_(self.alpha_optim)
+            torch.nn.utils.clip_grad_norm_([self.alpha], 0.5)  # Ensure alpha gradients are clipped properly
             self.scaler.step(self.alpha_optim)
+            self.scaler.update()
+
+            # Step alpha learning rate scheduler
             self.alpha_scheduler.step()
 
             # Target Q computation
@@ -298,6 +314,9 @@ class CustomSACPolicy(SACPolicy):
             # Update target network
             self.soft_update(self.critic_target, self.critic, self.tau)
 
+        # Debugging: Print alpha updates
+        print(f"Alpha: {self.get_alpha.item():.6f}, Alpha Loss: {alpha_loss.item():.6f}")
+
         # Return statistics
         return SACSummary(
             loss=critic_loss.item() + actor_loss.item(),
@@ -307,6 +326,7 @@ class CustomSACPolicy(SACPolicy):
             alpha=self.get_alpha.item(),
             train_time=time.time() - start_time
         )
+
 # ---------------------------
 # Custom Models for SAC + IQN
 # ---------------------------
@@ -502,17 +522,18 @@ class MetricLogger:
     def log(self, step_count, info, rew, policy):
         if step_count % self.print_interval == 0:
             print(f"\nStep: {step_count}")
-            print("Env | Balance | R_PnL | UR_PnL | Fees | Trades | Drawdown | Leverage | Reward")
+            print("Env | Net_PnL   | R_PnL     | UR_PnL    | Fees       | Trades   | Drawdown | Leverage | Reward")
             print("-" * 80)
             
             # Print one line per environment
             for ii in info['env_id']:
-                print(f"{ii:3d} | {info['balance'][ii]:7.4f} | {info['realized_pnl'][ii]:6.4f} | "
-                      f"{info['unrealized_pnl'][ii]:6.4f} | {info['fees'][ii]:6.4f} | "
-                      f"{info['trade_count'][ii]} | {info['drawdown'][ii]:8.4f} | "
-                      f"{info['leverage'][ii]:8.4f} | {rew[ii]:8.4f}")
+                net_pnl = info['realized_pnl'][ii] + info['unrealized_pnl'][ii] - info['fees'][ii]
+                print(f"{ii:3d} | {net_pnl:+7.6f} | {info['realized_pnl'][ii]:+6.6f} | "
+                      f"{info['unrealized_pnl'][ii]:+6.6f} | {info['fees'][ii]:+6.6f} | "
+                      f"{info['trade_count'][ii]} | {info['drawdown'][ii]:+8.6f} | "
+                      f"{info['leverage'][ii]:+8.6f} | {rew[ii]:+8.6f}")
             
-            if hasattr(policy, 'alpha'):
+            if hasattr(policy, 'get_alpha'):
                 print(f"\nAlpha: {policy.get_alpha.item():.6f}")
             print("-" * 80)
 
@@ -837,7 +858,7 @@ def save_checkpoint_fn(epoch, env_step, gradient_step):
         }, checkpoint_path)
 
         # Save buffer at epoch intervals
-        if env_step % (36002*32) == 0:  # Save every epoch
+        if env_step % (7201*32) == 0:  # Save every epoch
             buffer_path = checkpoint_dir / f"buffer_epoch_{epoch}_step_{env_step}.h5"
             buffer.save_hdf5(buffer_path)
 
@@ -912,7 +933,7 @@ if latest_buffer is not None:
     print(f"Buffer loaded with {len(buffer)} transitions")
 else:
     buffer = VectorReplayBuffer(
-        total_size=1000000,
+        total_size=100000,
         buffer_num=32,
         device=device
     )
@@ -925,12 +946,12 @@ trainer = OffpolicyTrainer(
     policy=policy,
     train_collector=collector,
     max_epoch=10,
-    step_per_epoch=36002*32,
-    step_per_collect=36001*32,
-    update_per_step=0.1,
-    episode_per_test=0,
+    step_per_epoch=7201*32,
+    step_per_collect=360*32,
+    update_per_step=2,
+    episode_per_test=1,
     batch_size=32,
-    test_in_train=False,
+    test_in_train=True,
     verbose=True,
     save_checkpoint_fn=save_checkpoint_fn,
     resume_from_log=True
