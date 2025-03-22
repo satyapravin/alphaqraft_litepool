@@ -116,6 +116,10 @@ std::string get_bearer_token(const std::string& client_id,
 void DeribitREST::fetch_position(const std::string& symbol, double& amount, double& price) {
     try {
         auto bearer_token = get_bearer_token(api_key, api_secret);
+        if (bearer_token.empty()) {
+            std::cerr << "Failed to obtain bearer token." << std::endl;
+            return;
+        }
 
         std::string query = "/api/v2/private/get_position?instrument_name=" + symbol;
         
