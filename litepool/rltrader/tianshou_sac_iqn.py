@@ -240,8 +240,7 @@ class CustomSACPolicy(SACPolicy):
         return Batch(act=act, state=h, dist=dist, log_prob=log_prob)
 
     def learn(self, batch: Batch, **kwargs):
-        """Performs a learning step using SAC with direct alpha optimization."""
-
+        """Performs a learning step using SAC with IQN."""
         start_time = time.time()
 
         # Convert batch data to tensors
@@ -260,9 +259,14 @@ class CustomSACPolicy(SACPolicy):
             act_pred = torch.tanh(act_pred)
             log_prob = log_prob - torch.sum(torch.log(1 - act_pred.pow(2) + 1e-6), dim=-1)
 
-            # Current Q values
-            current_q1 = self.critic(batch.obs, act_pred)
-            current_q2 = self.critic(batch.obs, act_pred)
+            # Generate taus for current and target Q-values
+            batch_size = batch.obs.shape[0]
+            curr_taus = torch.rand(batch_size, self.critic.num_quantiles, device=device)
+            target_taus = torch.rand(batch_size, self.critic.num_quantiles, device=device)
+
+            # Current Q values with quantiles
+            current_q1, _ = self.critic(batch.obs, act_pred, curr_taus)
+            current_q2, _ = self.critic(batch.obs, act_pred, curr_taus)
             q_min = torch.min(current_q1, current_q2).mean(dim=-1)
             actor_loss = (self.get_alpha * log_prob - q_min).mean()
 
@@ -273,19 +277,18 @@ class CustomSACPolicy(SACPolicy):
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
             self.scaler.step(self.actor_optim)
 
-            # Alpha optimization (Now optimizing alpha directly)
+            # Alpha optimization
             alpha_loss = -(self.get_alpha * (log_prob + self.target_entropy).detach()).mean()
             self.alpha_optim.zero_grad()
             self.scaler.scale(alpha_loss).backward()
             self.scaler.unscale_(self.alpha_optim)
-            torch.nn.utils.clip_grad_norm_([self.alpha], 0.5)  # Ensure alpha gradients are clipped properly
+            torch.nn.utils.clip_grad_norm_([self.alpha], 0.5)
             self.scaler.step(self.alpha_optim)
             self.scaler.update()
 
-            # Step alpha learning rate scheduler
             self.alpha_scheduler.step()
 
-            # Target Q computation
+            # Target Q computation with IQN
             with torch.no_grad():
                 next_loc, next_scale, _ = self.actor(batch.obs_next)
                 next_dist = Independent(Normal(next_loc, next_scale), 1)
@@ -294,17 +297,20 @@ class CustomSACPolicy(SACPolicy):
                 next_log_prob = next_dist.log_prob(next_act)
                 next_log_prob = next_log_prob - torch.sum(torch.log(1 - next_act.pow(2) + 1e-6), dim=-1)
 
-                target_q = self.critic_target(batch.obs_next, next_act)
+                target_q, _ = self.critic_target(batch.obs_next, next_act, target_taus)
                 target_q = target_q - self.get_alpha.detach() * next_log_prob.unsqueeze(-1)
-                reward_scale = 0.1  # Adjust this value
+                reward_scale = 0.1
                 target_q = batch.rew.unsqueeze(-1) * reward_scale + self.gamma * (1 - batch.done.unsqueeze(-1)) * target_q
-                target_q = torch.clamp(target_q, -100, 100)  # Add clipping
+                target_q = torch.clamp(target_q, -100, 100)
 
-            # Current Q values and critic loss
-            current_q1 = self.critic(batch.obs, batch.act)
-            current_q2 = self.critic(batch.obs, batch.act)
-            critic_loss = F.huber_loss(current_q1, target_q, reduction='mean', delta=1.0) + \
-              F.huber_loss(current_q2, target_q, reduction='mean', delta=1.0)
+            # Current Q values for critic loss
+            current_q1, curr_taus1 = self.critic(batch.obs, batch.act, curr_taus)
+            current_q2, curr_taus2 = self.critic(batch.obs, batch.act, curr_taus)
+
+            # Compute quantile Huber loss for both critics
+            critic_loss1 = quantile_huber_loss(current_q1, target_q, curr_taus1, kappa=1.0)
+            critic_loss2 = quantile_huber_loss(current_q2, target_q, curr_taus2, kappa=1.0)
+            critic_loss = critic_loss1 + critic_loss2
 
             # Critic optimization
             self.critic_optim.zero_grad()
@@ -319,10 +325,8 @@ class CustomSACPolicy(SACPolicy):
 
         print(f"Actor Loss: {actor_loss.item():.6f}")
         print(f"Critic Loss: {critic_loss.item():.6f}")
-        # Debugging: Print alpha updates
         print(f"Alpha: {self.get_alpha.item():.6f}, Alpha Loss: {alpha_loss.item():.6f}")
 
-        # Return statistics
         return SACSummary(
             loss=critic_loss.item() + actor_loss.item(),
             loss_actor=actor_loss.item(),
@@ -331,7 +335,6 @@ class CustomSACPolicy(SACPolicy):
             alpha=self.get_alpha.item(),
             train_time=time.time() - start_time
         )
-
 # ---------------------------
 # Custom Models for SAC + IQN
 # ---------------------------
@@ -514,7 +517,9 @@ class IQNCritic(nn.Module):
         x = torch.cat([x, position_out, action], dim=-1)
         x = self.fusion_fc(x)
         q_values = self.q_values(x)
-        return torch.clamp(q_values, -100, 100)
+        if taus is None:
+            taus = torch.rand(batch_size, self.num_quantiles, device=device)
+        return q_values, taus
 
 
 def quantile_huber_loss(ip, target, taus, kappa=1.0):
