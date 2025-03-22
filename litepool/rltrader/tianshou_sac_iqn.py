@@ -33,7 +33,7 @@ env = litepool.make(
     num_threads=32, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
     maker_fee=-0.0001, taker_fee=0.0005, foldername="./train_files/",
-    balance=1.0, start=360000, max=7201*10
+    balance=1.0, start=1, max=72001*10
 )
 
 env.spec.id = 'RlTrader-v0'
@@ -211,7 +211,7 @@ class CustomSACPolicy(SACPolicy):
         self.target_entropy = -0.2 * np.prod(action_space.shape).item()
 
         # Optimizer for alpha (no log transformation)
-        self.alpha_optim = torch.optim.Adam([self.alpha], lr=3e-4)
+        self.alpha_optim = torch.optim.Adam([self.alpha], lr=1e-4)
 
         # Learning rate scheduler for alpha
         self.alpha_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -296,24 +296,29 @@ class CustomSACPolicy(SACPolicy):
 
                 target_q = self.critic_target(batch.obs_next, next_act)
                 target_q = target_q - self.get_alpha.detach() * next_log_prob.unsqueeze(-1)
-                target_q = batch.rew.unsqueeze(-1) + self.gamma * (1 - batch.done.unsqueeze(-1)) * target_q
+                reward_scale = 0.1  # Adjust this value
+                target_q = batch.rew.unsqueeze(-1) * reward_scale + self.gamma * (1 - batch.done.unsqueeze(-1)) * target_q
+                target_q = torch.clamp(target_q, -100, 100)  # Add clipping
 
             # Current Q values and critic loss
             current_q1 = self.critic(batch.obs, batch.act)
             current_q2 = self.critic(batch.obs, batch.act)
-            critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
+            critic_loss = F.huber_loss(current_q1, target_q, reduction='mean', delta=1.0) + \
+              F.huber_loss(current_q2, target_q, reduction='mean', delta=1.0)
 
             # Critic optimization
             self.critic_optim.zero_grad()
             self.scaler.scale(critic_loss).backward()
             self.scaler.unscale_(self.critic_optim)
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
             self.scaler.step(self.critic_optim)
             self.scaler.update()
 
             # Update target network
             self.soft_update(self.critic_target, self.critic, self.tau)
 
+        print(f"Actor Loss: {actor_loss.item():.6f}")
+        print(f"Critic Loss: {critic_loss.item():.6f}")
         # Debugging: Print alpha updates
         print(f"Alpha: {self.get_alpha.item():.6f}, Alpha Loss: {alpha_loss.item():.6f}")
 
@@ -452,11 +457,27 @@ class IQNCritic(nn.Module):
         self.gru = nn.GRU(64, gru_hidden_dim, num_layers=num_layers, batch_first=True)
 
         self.fusion_fc = nn.Sequential(
-            nn.Linear(gru_hidden_dim + 32 + action_dim, hidden_dim * 2), nn.ReLU(),
-            nn.LayerNorm(hidden_dim * 2), nn.Linear(hidden_dim * 2, hidden_dim), nn.ReLU()
+            nn.Linear(gru_hidden_dim + 32 + action_dim, hidden_dim * 2),
+            nn.BatchNorm1d(hidden_dim * 2),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU()
         )
 
-        self.q_values = nn.Linear(hidden_dim, num_quantiles)
+        self.q_values = nn.Sequential(
+            nn.Linear(hidden_dim, num_quantiles),
+            nn.LayerNorm(num_quantiles)
+        )
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+                    
+                    
 
     def forward(self, state, action):
         device = next(self.parameters()).device
@@ -492,7 +513,8 @@ class IQNCritic(nn.Module):
 
         x = torch.cat([x, position_out, action], dim=-1)
         x = self.fusion_fc(x)
-        return self.q_values(x)
+        q_values = self.q_values(x)
+        return torch.clamp(q_values, -100, 100)
 
 
 def quantile_huber_loss(ip, target, taus, kappa=1.0):
@@ -559,6 +581,7 @@ class CollectStats:
     step_time: float
     returns: np.ndarray
     lengths: np.ndarray
+    continuous_step: int
 
 class GPUCollector(Collector):
     def __init__(self, policy, env, buffer=None, preprocess_fn=None, device='cuda', **kwargs):
@@ -879,12 +902,12 @@ if checkpoint_dir.exists():
 # Initialize models and optimizers
 actor = RecurrentActor().to(device)
 critic = IQNCritic().to(device)
-critic_optim = Adam(critic.parameters(), lr=3e-4)
+critic_optim = Adam(critic.parameters(), lr=1e-4)
 
 policy = CustomSACPolicy(
     actor=actor,
     critic=critic,
-    actor_optim=Adam(actor.parameters(), lr=3e-4),
+    actor_optim=Adam(actor.parameters(), lr=1e-4),
     critic_optim=critic_optim,
     tau=0.005, gamma=0.99, alpha=0.2,
     action_space=env_action_space
@@ -929,10 +952,10 @@ collector.logger = logger
 trainer = OffpolicyTrainer(
     policy=policy,
     train_collector=collector,
-    max_epoch=100,
-    step_per_epoch=7201*32,
-    step_per_collect=901,
-    update_per_step=0.1,
+    max_epoch=20,
+    step_per_epoch=72,
+    step_per_collect=32*32,
+    update_per_step=0.01,
     episode_per_test=0,
     batch_size=32,
     test_in_train=False,
