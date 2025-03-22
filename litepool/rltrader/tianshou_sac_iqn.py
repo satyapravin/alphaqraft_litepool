@@ -191,7 +191,7 @@ class CustomSACPolicy(SACPolicy):
         action_space=None,
         tau=0.005,
         gamma=0.99,
-        alpha=0.2,  # Directly using alpha instead of log_alpha
+        alpha=2.0,  # Directly using alpha instead of log_alpha
         **kwargs
     ):
         super().__init__(
@@ -248,6 +248,9 @@ class CustomSACPolicy(SACPolicy):
                 setattr(batch, key, torch.as_tensor(getattr(batch, key), dtype=torch.float32).to(device))
 
         self.training = True
+        
+        # Temperature for Q-value scaling
+        temp = 0.1  
 
         with autocast(device_type="cuda"):
             # Actor forward pass
@@ -258,35 +261,37 @@ class CustomSACPolicy(SACPolicy):
             act_pred = torch.tanh(act_pred)
             log_prob = log_prob - torch.sum(torch.log(1 - act_pred.pow(2) + 1e-6), dim=-1)
 
-            # Generate taus for current and target Q-values
-            batch_size = batch.obs.shape[0]
-            curr_taus = torch.rand(batch_size, self.critic.num_quantiles, device=device)
-
-            # Current Q values with quantiles
-            current_q1, curr_taus = self.critic(batch.obs, act_pred, curr_taus, return_taus=True)
-            current_q2, _ = self.critic(batch.obs, act_pred, curr_taus, return_taus=True)
-            q_min = torch.min(current_q1, current_q2).mean(dim=-1)
+            # Current Q values with temperature scaling
+            current_q1, curr_taus1 = self.critic(batch.obs, act_pred, return_taus=True)
+            current_q2, curr_taus2 = self.critic(batch.obs, act_pred, return_taus=True)
+            
+            if current_q1.dim() == 3:
+                current_q1 = current_q1.squeeze(-1)
+            if current_q2.dim() == 3:
+                current_q2 = current_q2.squeeze(-1)
+                
+            q_min = torch.min(current_q1, current_q2).mean(dim=-1) * temp
             actor_loss = (self.get_alpha * log_prob - q_min).mean()
 
-            # Rest of the actor optimization remains the same
+            # Actor optimization with gradient clipping
             self.actor_optim.zero_grad()
             self.scaler.scale(actor_loss).backward()
             self.scaler.unscale_(self.actor_optim)
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
             self.scaler.step(self.actor_optim)
 
-            # Alpha optimization remains the same
-            alpha_loss = -(self.get_alpha * (log_prob + self.target_entropy).detach()).mean()
+            # Alpha optimization with adjusted target entropy
+            target_entropy = -0.5 * np.prod(self.actor.action_dim)  # Less negative target entropy
+            alpha_loss = -(self.get_alpha * (log_prob.detach() + target_entropy)).mean()
+            
             self.alpha_optim.zero_grad()
             self.scaler.scale(alpha_loss).backward()
             self.scaler.unscale_(self.alpha_optim)
-            torch.nn.utils.clip_grad_norm_([self.alpha], 0.5)
+            torch.nn.utils.clip_grad_norm_([self.alpha], max_norm=0.5)
             self.scaler.step(self.alpha_optim)
             self.scaler.update()
 
-            self.alpha_scheduler.step()
-
-            # Target Q computation with IQN
+            # Target Q computation with temperature scaling
             with torch.no_grad():
                 next_loc, next_scale, _ = self.actor(batch.obs_next)
                 next_dist = Independent(Normal(next_loc, next_scale), 1)
@@ -295,37 +300,62 @@ class CustomSACPolicy(SACPolicy):
                 next_log_prob = next_dist.log_prob(next_act)
                 next_log_prob = next_log_prob - torch.sum(torch.log(1 - next_act.pow(2) + 1e-6), dim=-1)
 
-                target_q, target_taus = self.critic_target(batch.obs_next, next_act, return_taus=True)
-                if target_q.dim() == 3:
-                    target_q = target_q.squeeze(-1)
-                target_q = target_q - self.get_alpha.detach() * next_log_prob.unsqueeze(-1)
+                target_q1, target_taus = self.critic_target(batch.obs_next, next_act, return_taus=True)
+                target_q2, _ = self.critic_target(batch.obs_next, next_act, return_taus=True)
+                
+                if target_q1.dim() == 3:
+                    target_q1 = target_q1.squeeze(-1)
+                if target_q2.dim() == 3:
+                    target_q2 = target_q2.squeeze(-1)
+                    
+                target_q = torch.min(target_q1, target_q2) * temp
+                target_q = target_q - (self.get_alpha.detach() * next_log_prob.unsqueeze(1))
+                
                 reward_scale = 0.1
-                target_q = batch.rew.unsqueeze(-1) * reward_scale + self.gamma * (1 - batch.done.unsqueeze(-1)) * target_q
-                target_q = torch.clamp(target_q, -100, 100)
+                target_q = batch.rew.unsqueeze(1) * reward_scale + self.gamma * (1 - batch.done.unsqueeze(1)) * target_q
+                target_q = torch.clamp(target_q, -10.0, 10.0)  # Tighter clipping
 
             # Current Q values for critic loss
             current_q1, curr_taus1 = self.critic(batch.obs, batch.act, return_taus=True)
             current_q2, curr_taus2 = self.critic(batch.obs, batch.act, return_taus=True)
 
-            # Compute quantile Huber loss for both critics
+            if current_q1.dim() == 3:
+                current_q1 = current_q1.squeeze(-1)
+            if current_q2.dim() == 3:
+                current_q2 = current_q2.squeeze(-1)
+
+            # Compute critic losses with Huber loss
             critic_loss1 = quantile_huber_loss(current_q1, target_q, curr_taus1, kappa=1.0)
             critic_loss2 = quantile_huber_loss(current_q2, target_q, curr_taus2, kappa=1.0)
             critic_loss = critic_loss1 + critic_loss2
 
-            # Critic optimization
+            # Critic optimization with gradient clipping
             self.critic_optim.zero_grad()
             self.scaler.scale(critic_loss).backward()
             self.scaler.unscale_(self.critic_optim)
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
             self.scaler.step(self.critic_optim)
             self.scaler.update()
 
-            # Update target network
-            self.soft_update(self.critic_target, self.critic, self.tau)
+            # Soft update of target network with rate limiting
+            self.soft_update(self.critic_target, self.critic, min(self.tau, 0.005))
 
+        mean_q1 = current_q1.mean().item()
+        mean_q2 = current_q2.mean().item()
+        mean_target_q = target_q.mean().item()
+
+        print("\nDetailed Training Stats:")
         print(f"Actor Loss: {actor_loss.item():.6f}")
-        print(f"Critic Loss: {critic_loss.item():.6f}")
-        print(f"Alpha: {self.get_alpha.item():.6f}, Alpha Loss: {alpha_loss.item():.6f}")
+        print(f"Critic Loss 1: {critic_loss1.item():.6f}")
+        print(f"Critic Loss 2: {critic_loss2.item():.6f}")
+        print(f"Total Critic Loss: {critic_loss.item():.6f}")
+        print(f"Alpha Loss: {alpha_loss.item():.6f}")
+        print(f"Alpha: {self.get_alpha.item():.6f}")
+        print(f"Mean Q1: {mean_q1:.6f}")
+        print(f"Mean Q2: {mean_q2:.6f}")
+        print(f"Mean Target Q: {mean_target_q:.6f}")
+        print(f"Log Prob Mean: {log_prob.mean().item():.6f}")
+        print("-" * 50)
 
         return SACSummary(
             loss=critic_loss.item() + actor_loss.item(),
@@ -335,7 +365,6 @@ class CustomSACPolicy(SACPolicy):
             alpha=self.get_alpha.item(),
             train_time=time.time() - start_time
         )
-
 # ---------------------------
 # Custom Models for SAC + IQN
 # ---------------------------
@@ -501,17 +530,18 @@ class IQNCritic(nn.Module):
 
         market_state = state[:, :, :self.market_dim]
         position_state = state[:, -1, self.market_dim:self.market_dim + self.position_dim] 
-        trade_state = state[:, :, self.market_dim + self.position_dim:]
+        trade_state = state[:, -1, self.market_dim + self.position_dim:]  # Changed to use last timestep
 
         position_out = self.position_fc(position_state)
         trade_out = self.trade_fc(trade_state)
-        market_out = self.market_fc(market_state)
+        market_out = self.market_fc(market_state[:, -1])  # Use last timestep for market state too
 
         x = torch.cat([trade_out, market_out], dim=-1)
+        x = x.unsqueeze(1)  # Add time dimension for GRU [batch_size, 1, feature_dim]
 
         state_h = torch.zeros(self.num_layers, batch_size, self.gru_hidden_dim, device=device)
         x, _ = self.gru(x, state_h)
-        x = x[:, -1, :]
+        x = x[:, -1, :]  # Take last timestep output
 
         x = torch.cat([x, position_out, action], dim=-1)
         x = self.fusion_fc(x)
@@ -524,25 +554,33 @@ class IQNCritic(nn.Module):
         
         return (q_values, taus) if return_taus else q_values
 
+
 def quantile_huber_loss(ip, target, taus, kappa=1.0):
-    # Ensure proper dimensions: [batch_size, num_quantiles]
+    # Ensure proper dimensions
     if ip.dim() == 3:
-        ip = ip.squeeze(-1)
+        ip = ip.squeeze(-1)  # [batch_size, num_quantiles]
     if target.dim() == 3:
-        target = target.squeeze(-1)
+        target = target.squeeze(-1)  # [batch_size, num_quantiles]
+    elif target.dim() == 1:
+        target = target.unsqueeze(1)  # [batch_size, 1]
     
-    # Expand target to match input dimensions
-    target = target.unsqueeze(1).expand_as(ip)
+    # Now target is [batch_size, 1] or [batch_size, num_quantiles]
+    # and ip is [batch_size, num_quantiles]
+    if target.shape[1] == 1:
+        target = target.expand_as(ip)  # Expand to match ip dimensions
     
     # Calculate TD error
-    td_error = target - ip
+    td_error = target - ip  # [batch_size, num_quantiles]
     
     # Calculate Huber loss
-    huber_loss = F.huber_loss(ip, target, delta=kappa, reduction="none")
+    huber_loss = F.huber_loss(ip, target, delta=kappa, reduction="none")  # [batch_size, num_quantiles]
     
-    # Calculate quantile loss
-    tau_expanded = taus.unsqueeze(-1)  # [batch_size, num_quantiles, 1]
-    quantile_weight = (tau_expanded - (td_error.detach() < 0).float()).abs()
+    # Ensure taus has correct shape [batch_size, num_quantiles]
+    if taus.dim() == 3:
+        taus = taus.squeeze(-1)
+    
+    # Calculate quantile weights
+    quantile_weight = (taus - (td_error.detach() < 0).float()).abs()
     
     # Apply asymmetric loss
     asymmetric_factor = 1.2
@@ -933,7 +971,7 @@ policy = CustomSACPolicy(
     critic=critic,
     actor_optim=Adam(actor.parameters(), lr=1e-4),
     critic_optim=critic_optim,
-    tau=0.005, gamma=0.99, alpha=0.2,
+    tau=0.005, gamma=0.99, alpha=2.0,
     action_space=env_action_space
 )
 
