@@ -240,7 +240,6 @@ class CustomSACPolicy(SACPolicy):
         return Batch(act=act, state=h, dist=dist, log_prob=log_prob)
 
     def learn(self, batch: Batch, **kwargs):
-        """Performs a learning step using SAC with IQN."""
         start_time = time.time()
 
         # Convert batch data to tensors
@@ -262,22 +261,21 @@ class CustomSACPolicy(SACPolicy):
             # Generate taus for current and target Q-values
             batch_size = batch.obs.shape[0]
             curr_taus = torch.rand(batch_size, self.critic.num_quantiles, device=device)
-            target_taus = torch.rand(batch_size, self.critic.num_quantiles, device=device)
 
             # Current Q values with quantiles
-            current_q1, _ = self.critic(batch.obs, act_pred, curr_taus)
-            current_q2, _ = self.critic(batch.obs, act_pred, curr_taus)
+            current_q1, curr_taus = self.critic(batch.obs, act_pred, curr_taus, return_taus=True)
+            current_q2, _ = self.critic(batch.obs, act_pred, curr_taus, return_taus=True)
             q_min = torch.min(current_q1, current_q2).mean(dim=-1)
             actor_loss = (self.get_alpha * log_prob - q_min).mean()
 
-            # Actor optimization
+            # Rest of the actor optimization remains the same
             self.actor_optim.zero_grad()
             self.scaler.scale(actor_loss).backward()
             self.scaler.unscale_(self.actor_optim)
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
             self.scaler.step(self.actor_optim)
 
-            # Alpha optimization
+            # Alpha optimization remains the same
             alpha_loss = -(self.get_alpha * (log_prob + self.target_entropy).detach()).mean()
             self.alpha_optim.zero_grad()
             self.scaler.scale(alpha_loss).backward()
@@ -297,15 +295,17 @@ class CustomSACPolicy(SACPolicy):
                 next_log_prob = next_dist.log_prob(next_act)
                 next_log_prob = next_log_prob - torch.sum(torch.log(1 - next_act.pow(2) + 1e-6), dim=-1)
 
-                target_q, _ = self.critic_target(batch.obs_next, next_act, target_taus)
+                target_q, target_taus = self.critic_target(batch.obs_next, next_act, return_taus=True)
+                if target_q.dim() == 3:
+                    target_q = target_q.squeeze(-1)
                 target_q = target_q - self.get_alpha.detach() * next_log_prob.unsqueeze(-1)
                 reward_scale = 0.1
                 target_q = batch.rew.unsqueeze(-1) * reward_scale + self.gamma * (1 - batch.done.unsqueeze(-1)) * target_q
                 target_q = torch.clamp(target_q, -100, 100)
 
             # Current Q values for critic loss
-            current_q1, curr_taus1 = self.critic(batch.obs, batch.act, curr_taus)
-            current_q2, curr_taus2 = self.critic(batch.obs, batch.act, curr_taus)
+            current_q1, curr_taus1 = self.critic(batch.obs, batch.act, return_taus=True)
+            current_q2, curr_taus2 = self.critic(batch.obs, batch.act, return_taus=True)
 
             # Compute quantile Huber loss for both critics
             critic_loss1 = quantile_huber_loss(current_q1, target_q, curr_taus1, kappa=1.0)
@@ -335,6 +335,7 @@ class CustomSACPolicy(SACPolicy):
             alpha=self.get_alpha.item(),
             train_time=time.time() - start_time
         )
+
 # ---------------------------
 # Custom Models for SAC + IQN
 # ---------------------------
@@ -480,9 +481,7 @@ class IQNCritic(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
                     
-                    
-
-    def forward(self, state, action):
+    def forward(self, state, action, taus=None, return_taus=False):
         device = next(self.parameters()).device
 
         if isinstance(state, np.ndarray):
@@ -516,22 +515,42 @@ class IQNCritic(nn.Module):
 
         x = torch.cat([x, position_out, action], dim=-1)
         x = self.fusion_fc(x)
+        
+        # Output shape: [batch_size, num_quantiles]
         q_values = self.q_values(x)
+        
         if taus is None:
             taus = torch.rand(batch_size, self.num_quantiles, device=device)
-        return q_values, taus
-
+        
+        return (q_values, taus) if return_taus else q_values
 
 def quantile_huber_loss(ip, target, taus, kappa=1.0):
-    target = target.unsqueeze(-1).expand_as(ip)  
-    td_error = target - ip  
+    # Ensure proper dimensions: [batch_size, num_quantiles]
+    if ip.dim() == 3:
+        ip = ip.squeeze(-1)
+    if target.dim() == 3:
+        target = target.squeeze(-1)
+    
+    # Expand target to match input dimensions
+    target = target.unsqueeze(1).expand_as(ip)
+    
+    # Calculate TD error
+    td_error = target - ip
+    
+    # Calculate Huber loss
     huber_loss = F.huber_loss(ip, target, delta=kappa, reduction="none")
-    loss = (taus - (td_error.detach() < 0).float()).abs() * huber_loss
-    asymmetric_factor = 1.2  
-    loss = torch.where(td_error < 0,
-                      loss * asymmetric_factor,
-                      loss)
-    return loss.mean()
+    
+    # Calculate quantile loss
+    tau_expanded = taus.unsqueeze(-1)  # [batch_size, num_quantiles, 1]
+    quantile_weight = (tau_expanded - (td_error.detach() < 0).float()).abs()
+    
+    # Apply asymmetric loss
+    asymmetric_factor = 1.2
+    weighted_loss = torch.where(td_error < 0,
+                              huber_loss * asymmetric_factor * quantile_weight,
+                              huber_loss * quantile_weight)
+    
+    return weighted_loss.mean()
 
 
 from tianshou.data import Collector, Batch
