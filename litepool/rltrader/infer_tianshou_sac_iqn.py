@@ -25,21 +25,6 @@ from tianshou.env import DummyVectorEnv
 
 device = torch.device("cuda")
 
-#-------------------------------------
-# Make environment
-#------------------------------------
-num_of_envs=32
-
-env = litepool.make(
-    "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
-    num_threads=num_of_envs, is_prod=False, is_inverse_instr=True, api_key="",
-    api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
-    maker_fee=-0.0001, taker_fee=0.0005, foldername="./train_files/",
-    balance=1.0, start=1, max=72001*10
-)
-
-env.spec.id = 'RlTrader-v0'
-
 class VecNormalize:
     def __init__(self, env, num_env, norm_obs=True, norm_reward=True, clip_obs=10., clip_reward=10., gamma=0.99, epsilon=1e-8):
         self.env = env
@@ -144,18 +129,6 @@ class RunningMeanStd:
         self.var = new_var
         self.count = tot_count
 
-# Wrap environment with VecNormalize
-env = VecNormalize(
-    env,
-    num_env=num_of_envs,
-    norm_obs=True,
-    norm_reward=True,
-    clip_obs=10.,
-    clip_reward=10.,
-    gamma=0.99
-)
-
-env_action_space = env.action_space
 
 #-----------------------------
 # Custom SAC policy
@@ -209,8 +182,8 @@ class CustomSACPolicy(SACPolicy):
         )
 
         # Directly use alpha as a trainable parameter
-        self.alpha = nn.Parameter(torch.tensor([alpha], dtype=torch.float32, device=device), requires_grad=True)
-        self.target_entropy = -np.prod(action_space.shape).item()
+        self.alpha = torch.tensor([alpha], dtype=torch.float32, device=device, requires_grad=True)
+        self.target_entropy = -0.2 * np.prod(action_space.shape).item()
 
         # Optimizer for alpha (no log transformation)
         self.alpha_optim = torch.optim.Adam([self.alpha], lr=1e-4)
@@ -225,7 +198,8 @@ class CustomSACPolicy(SACPolicy):
 
     @property
     def get_alpha(self):
-        return self.alpha.clamp_min(1e-5)  
+        """Returns the current entropy coefficient alpha."""
+        return self.alpha.clamp(1e-5, 2.0)  # Clamping alpha to prevent instability
 
     def forward(self, batch: Batch, state=None, **kwargs):
         obs = batch.obs
@@ -283,7 +257,7 @@ class CustomSACPolicy(SACPolicy):
 
             # Alpha optimization with adjusted target entropy
             target_entropy = -0.5 * np.prod(self.actor.action_dim)  # Less negative target entropy
-            alpha_loss = -(self.alpha * (log_prob.detach() + self.target_entropy)).mean()
+            alpha_loss = -(self.get_alpha * (log_prob.detach() + target_entropy)).mean()
             
             self.alpha_optim.zero_grad()
             self.scaler.scale(alpha_loss).backward()
@@ -592,434 +566,112 @@ def quantile_huber_loss(ip, target, taus, kappa=1.0):
     return weighted_loss.mean()
 
 
-from tianshou.data import Collector, Batch
-from collections import namedtuple
-import time
-from dataclasses import dataclass
+import numpy as np
+import torch
+import litepool
+from pathlib import Path
 
-class MetricLogger:
-    def __init__(self, print_interval=1000):
-        self.print_interval = print_interval
-        self.last_print_step = 0
-        self.episode_rewards = []
-        self.episode_lengths = []
-        
-    def log(self, step_count, info, rew, policy):
-        if step_count % self.print_interval == 0:
-            print(f"\nStep: {step_count}")
-            print("Env | Net_PnL   | R_PnL     | UR_PnL    | Fees       | Trades   | Drawdown | Leverage | Reward")
-            print("-" * 80)
-            
-            # Print one line per environment
-            for ii in info['env_id']:
-                net_pnl = info['realized_pnl'][ii] + info['unrealized_pnl'][ii] - info['fees'][ii]
-                print(f"{ii:3d} | {net_pnl:+7.6f} | {info['realized_pnl'][ii]:+6.6f} | "
-                      f"{info['unrealized_pnl'][ii]:+6.6f} | {info['fees'][ii]:+6.6f} | "
-                      f"{info['trade_count'][ii]} | {info['drawdown'][ii]:+8.6f} | "
-                      f"{info['leverage'][ii]:+8.6f} | {rew[ii]:+8.6f}")
-            
-            if hasattr(policy, 'get_alpha'):
-                print(f"\nAlpha: {policy.get_alpha.item():.6f}")
-            print("-" * 80)
+env = litepool.make(
+    "RlTrader-v0", env_type="gymnasium", num_envs=64, batch_size=64,
+    num_threads=64, is_prod=False,  
+    is_inverse_instr=True, 
+    api_key="your_api_key",
+    api_secret="your_api_secret", 
+    symbol="BTC-PERPETUAL",
+    tick_size=0.5, 
+    min_amount=10,
+    maker_fee=-0.0001, 
+    taker_fee=0.0005, 
+    foldername="./test_files/",
+    balance=1.0
+)
 
-@dataclass
-class CollectStats:
-    n_ep: int
-    n_st: int
-    rews: np.ndarray
-    lens: np.ndarray
-    rew: float
-    len: float
-    rew_std: float
-    len_std: float
-    n_collected_steps: int
-    n_collected_episodes: int
-    returns_stat: object
-    lens_stat: object
-    rewards_stat: object
-    episodes: int
-    reward_sum: float
-    length_sum: int
-    collect_time: float
-    step_time: float
-    returns: np.ndarray
-    lengths: np.ndarray
-    continuous_step: int
+env.spec.id = 'RlTrader-v0'
 
-class GPUCollector(Collector):
-    def __init__(self, policy, env, buffer=None, preprocess_fn=None, device='cuda', **kwargs):
-        super().__init__(policy, env, buffer, **kwargs)
-        self.device = device
-        self.preprocess_fn = preprocess_fn
-        self.env_active = False  # Track if environments are already running
-        self.continuous_step_count = 0
-        self.data = Batch()
-        self.reset_batch_data()
+env = VecNormalize(
+    env,
+    num_env=64,
+    norm_obs=True,
+    norm_reward=True,
+    clip_obs=10.,
+    clip_reward=10.,
+    gamma=0.99
+)
 
-    def reset_batch_data(self):
-        """Reset the internal batch data but maintain environment state"""
-        if not self.env_active:
-            self.data.obs_next = None
-            self.data.obs = None
-        self.data.act = None
-        self.data.rew = None
-        self.data.done = None
-        self.data.terminated = None
-        self.data.truncated = None
-        self.data.info = None
-        self.data.policy = Batch()
-        self.data.state = None
+env_action_space = env.action_space
 
-    def reset_env(self, gym_reset_kwargs=None):
-        """Reset the environment only if not already active"""
-        if not self.env_active:
-            gym_reset_kwargs = gym_reset_kwargs if gym_reset_kwargs else {}
-            obs = self.env.reset(**gym_reset_kwargs)
-            if isinstance(obs, tuple):
-                obs, info = obs
-            else:
-                info = None
-
-            if isinstance(obs, torch.Tensor):
-                obs = obs.to(self.device)
-            else:
-                obs = torch.as_tensor(obs, device=self.device)
-
-            self.data.obs = obs
-            self.data.info = info
-            self.env_active = True
-
-        return self.data.obs, self.data.info
-
-    def _collect(self, n_step=None, n_episode=None, random=False, render=None, gym_reset_kwargs=None):
-        if n_step is not None:
-            assert n_episode is None, "Only one of n_step or n_episode is allowed"
-        assert not self.env.is_async, "Please use AsyncCollector if using async venv."
-        
-        start_time = time.time()
-        local_step_count = 0  # Local counter for this collection cycle
-        episode_count = 0
-        episode_rews = []
-        episode_lens = []
-
-        while True:
-            if self.data.obs is None:
-                obs, info = self.reset_env()
-                self.data.obs = obs
-                self.data.info = info
-
-            # Convert observation to tensor on device and wrap in Batch
-            if isinstance(self.data.obs, torch.Tensor):
-                obs_batch = Batch(obs=self.data.obs.to(self.device))
-            else:
-                obs_batch = Batch(obs=torch.as_tensor(self.data.obs, device=self.device))
-
-            with torch.no_grad():
-                result = self.policy(obs_batch, state=self.data.state)
-
-            self.data.act = result.act
-            self.data.state = result.state if hasattr(result, 'state') else None
-
-            # Convert action to numpy array before stepping
-            if isinstance(self.data.act, torch.Tensor):
-                action = self.data.act.cpu().numpy()
-            else:
-                action = np.array(self.data.act)
-            
-            # Step the environment with numpy action
-            result = self.env.step(action)
-            if len(result) == 5:  # gymnasium style
-                obs_next, rew, terminated, truncated, info = result
-                done = np.logical_or(terminated, truncated)
-            else:  # old gym style
-                obs_next, rew, done, info = result
-                terminated = done
-                truncated = False
-            
-            if hasattr(self, 'logger'):
-                self.logger.log(self.continuous_step_count, info, rew, self.policy)
-
-            if isinstance(obs_next, torch.Tensor):
-                obs_next = obs_next.to(self.device)
-            else:
-                obs_next = torch.as_tensor(obs_next, device=self.device)
-                
-            if isinstance(rew, torch.Tensor):
-                rew = rew.to(self.device)
-            else:
-                rew = torch.as_tensor(rew, device=self.device)
-
-            self.data.obs_next = obs_next
-            self.data.rew = rew
-            self.data.done = done
-            self.data.terminated = terminated
-            self.data.truncated = truncated
-            self.data.info = info
-
-            if self.preprocess_fn:
-                self.data = self.preprocess_fn(self.data)
-
-            # Convert tensors to numpy for buffer
-            if isinstance(self.data.obs, torch.Tensor):
-                obs = self.data.obs.cpu().numpy()
-            else:
-                obs = self.data.obs
-
-            if isinstance(self.data.act, torch.Tensor):
-                act = self.data.act.cpu().numpy()
-            else:
-                act = self.data.act
-
-            if isinstance(self.data.rew, torch.Tensor):
-                rew = self.data.rew.cpu().numpy()
-            else:
-                rew = self.data.rew
-
-            if isinstance(self.data.obs_next, torch.Tensor):
-                obs_next = self.data.obs_next.cpu().numpy()
-            else:
-                obs_next = self.data.obs_next
-
-            batch = Batch(
-                obs=obs,
-                act=act,
-                rew=rew,
-                done=self.data.done,
-                terminated=self.data.terminated,
-                truncated=self.data.truncated,
-                obs_next=obs_next,
-                info=self.data.info,
-                policy=self.data.policy if hasattr(self.data, 'policy') else None,
-                state=self.data.state if hasattr(self.data, 'state') else None
-            )
-
-            # Save to buffer
-            ptr, ep_rew, ep_len, ep_idx = self.buffer.add(batch)
-
-            local_step_count += 1
-            self.continuous_step_count += 1  # Update continuous counter
-
-            # Handle vectorized environment episode completion
-            if isinstance(ep_len, np.ndarray):
-                for idx, (l, r) in enumerate(zip(ep_len, ep_rew)):
-                    if l is not None:  # episode ended
-                        episode_lens.append(l)
-                        episode_rews.append(r)
-                        episode_count += 1
-                        if n_episode and episode_count >= n_episode:
-                            break
-            else:
-                if ep_len is not None:  # single environment episode ended
-                    episode_lens.append(ep_len)
-                    episode_rews.append(ep_rew)
-                    episode_count += 1
-
-            if n_episode and episode_count >= n_episode:
-                break
-
-            if n_step and local_step_count >= n_step:
-                break
-
-            self.data.obs = self.data.obs_next
-
-        class StatClass:
-            def __init__(self, mean_val, std_val):
-                self.mean = mean_val
-                self._std = std_val
-            
-            def std(self):
-                return self._std
-
-        if episode_count > 0:
-            rews, lens = list(map(np.array, [episode_rews, episode_lens]))
-            mean_rew = rews.mean()
-            mean_len = lens.mean()
-            std_rew = rews.std()
-            std_len = lens.std()
-            
-            # Basic statistics with mean and std
-            return_stat = StatClass(mean_rew, std_rew)
-            return_stat.n_ep = episode_count
-            return_stat.n_st = local_step_count
-            return_stat.rews = rews
-            return_stat.lens = lens
-            return_stat.rew = mean_rew
-            return_stat.len = mean_len
-            return_stat.rew_std = std_rew
-            return_stat.len_std = std_len
-            
-            # Length statistics
-            lens_stat = StatClass(mean_len, std_len)
-            lens_stat.n_ep = episode_count
-            lens_stat.n_st = local_step_count
-            lens_stat.lens = lens
-            lens_stat.len = mean_len
-            lens_stat.len_std = std_len
-            
-            # Reward statistics
-            rewards_stat = StatClass(mean_rew, std_rew)
-            rewards_stat.n_ep = episode_count
-            rewards_stat.n_st = local_step_count
-            rewards_stat.rews = rews
-            rewards_stat.rew = mean_rew
-            rewards_stat.rew_std = std_rew
-        else:
-            empty_arr = np.array([])
-            return_stat = StatClass(0.0, 0.0)
-            return_stat.n_ep = episode_count
-            return_stat.n_st = local_step_count
-            
-            lens_stat = StatClass(0.0, 0.0)
-            lens_stat.n_ep = episode_count
-            lens_stat.n_st = local_step_count
-            lens_stat.lens = empty_arr
-            lens_stat.len = 0.0
-            lens_stat.len_std = 0.0
-            
-            rewards_stat = StatClass(0.0, 0.0)
-            rewards_stat.n_ep = episode_count
-            rewards_stat.n_st = local_step_count
-            rewards_stat.rews = empty_arr
-            rewards_stat.rew = 0.0
-            rewards_stat.rew_std = 0.0
-
-        collect_time = time.time() - start_time
-        step_time = collect_time / local_step_count if local_step_count else 0
-
-        return CollectStats(
-            n_ep=episode_count,
-            n_st=local_step_count,
-            rews=np.array(episode_rews) if episode_rews else empty_arr,
-            lens=np.array(episode_lens) if episode_lens else empty_arr,
-            rew=mean_rew if episode_count > 0 else 0.0,
-            len=mean_len if episode_count > 0 else 0.0,
-            rew_std=std_rew if episode_count > 0 else 0.0,
-            len_std=std_len if episode_count > 0 else 0.0,
-            n_collected_steps=local_step_count,
-            n_collected_episodes=episode_count,
-            returns_stat=return_stat,
-            lens_stat=lens_stat,
-            rewards_stat=rewards_stat,
-            episodes=episode_count,
-            reward_sum=float(np.sum(episode_rews)) if episode_rews else 0.0,
-            length_sum=int(np.sum(episode_lens)) if episode_lens else 0,
-            collect_time=collect_time,
-            step_time=step_time,
-            returns=np.array(episode_rews) if episode_rews else empty_arr,
-            lengths=np.array(episode_lens) if episode_lens else empty_arr,
-            continuous_step=self.continuous_step_count
-        )
-
-def save_checkpoint_fn(epoch, env_step, gradient_step):
-    try:
-        checkpoint_dir = results_dir / "checkpoints"
-        checkpoint_dir.mkdir(exist_ok=True, parents=True)
-
-        # Save model checkpoint
-        checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch}_step_{env_step}.pth"
-        torch.save({
-            'epoch': epoch,
-            'env_step': env_step,
-            'gradient_step': gradient_step,
-            'policy_state_dict': policy.state_dict(),
-            'alpha_optim_state_dict': policy.alpha_optim.state_dict(),
-            'actor_optim_state_dict': policy.actor_optim.state_dict(),
-            'critic_optim_state_dict': policy.critic_optim.state_dict(),
-            'alpha_optim_state_dict': policy.alpha_optim.state_dict()
-        }, checkpoint_path)
-
-        # Save buffer at epoch intervals
-        if env_step % (7201*num_of_envs) == 0:  # Save every epoch
-            buffer_path = checkpoint_dir / f"buffer_epoch_{epoch}_step_{env_step}.h5"
-            buffer.save_hdf5(buffer_path)
-
-        print(f"Saved checkpoint at epoch {epoch}, step {env_step}")
-        return True
-
-    except Exception as e:
-        print(f"Error saving checkpoint: {e}")
-        return False
-
-
-# ---------------------------
-# Training Setup
-# ---------------------------
-results_dir = Path("results")
-results_dir.mkdir(exist_ok=True)
-
-# Initialize models and optimizers
 actor = RecurrentActor().to(device)
 critic = IQNCritic().to(device)
-critic_optim = Adam(critic.parameters(), lr=1e-4)
 
 policy = CustomSACPolicy(
     actor=actor,
     critic=critic,
-    actor_optim=Adam(actor.parameters(), lr=1e-4),
-    critic_optim=critic_optim,
-    tau=0.005, gamma=0.99, alpha=2.0,
-    action_space=env_action_space
-)
+    actor_optim=torch.optim.Adam(actor.parameters(), lr=3e-4),
+    critic_optim=torch.optim.Adam(critic.parameters(), lr=3e-4),
+    action_space=env_action_space,
+    tau=0.005,
+    gamma=0.99,
+    alpha=0.2
+).to(device)
 
-policy = policy.to(device)
+results_dir = Path("results")
+model_path = results_dir / "final_model.pth"
 
-# Load model if exists
-final_checkpoint_path = results_dir / "final_model.pth"
-final_buffer_path = results_dir / "final_buffer.h5"
-start_epoch = 0
-
-if final_checkpoint_path.exists():
-    print(f"Loading model from {final_checkpoint_path}")
-    saved_model = torch.load(final_checkpoint_path)
-    policy.load_state_dict(saved_model['policy_state_dict'])
-    policy.alpha_optim.load_state_dict(checkpoint['alpha_optim_state_dict'])
-    policy.actor_optim.load_state_dict(saved_model['actor_optim_state_dict'])
-    policy.critic_optim.load_state_dict(saved_model['critic_optim_state_dict'])
-    policy.alpha_optim.load_state_dict(saved_model['alpha_optim_state_dict'])
-    start_epoch = saved_model.get('epoch', 0)
-    print(f"Resumed from epoch {start_epoch}")
+if model_path.exists():
+    print("Loading model for inference...")
+    checkpoint = torch.load(model_path)
+    policy.load_state_dict(checkpoint['policy_state_dict'])
+    print("Model loaded successfully")
 else:
-    print(f"Could not find model {final_checkpoint_path}")
-    
-if final_buffer_path.exists():
-    print(f"Loading buffer from {final_buffer_path}")
-    buffer = VectorReplayBuffer.load_hdf5(final_buffer_path, device=device)
-    print(f"Buffer loaded with {len(buffer)} transitions")
-else:
-    print(f"Could not find buffer {final_buffer_path}")
-    buffer = VectorReplayBuffer(
-        total_size=100000,
-        buffer_num=num_of_envs,
-        device=device
-    )
+    raise FileNotFoundError("No trained model found!")
 
-logger = MetricLogger(print_interval=1000)
-collector = GPUCollector(policy, env, buffer, device=device, exploration_noise=True)
-collector.logger = logger
+# Set to evaluation mode
+policy.eval()
 
-trainer = OffpolicyTrainer(
-    policy=policy,
-    train_collector=collector,
-    max_epoch=30,
-    step_per_epoch=72,
-    step_per_collect=32*16,
-    update_per_step=0.01,
-    episode_per_test=0,
-    batch_size=num_of_envs,
-    test_in_train=False,
-    verbose=True,
-    save_checkpoint_fn=save_checkpoint_fn,
-    resume_from_log=True
-)
+def inference_loop():
+    obs, info = env.reset()
+    state = None
+    counter = 0 
+    while True:
+        with torch.no_grad():
+            if isinstance(obs, np.ndarray):
+                obs = torch.from_numpy(obs).float().to(device)
+            
+            # Prepare batch
+            obs_batch = Batch(obs=obs)
+            
+            # Get action from policy
+            result = policy(obs_batch, state=state)
+            action = result.act
+            state = result.state if hasattr(result, 'state') else None
+            
+            # Convert action to numpy if necessary
+            if isinstance(action, torch.Tensor):
+                action = action.cpu().numpy()
+            
+            # Step environment
+            obs, reward, terminated, truncated, info = env.step(action)
+            
+            if counter % 1000 == 0: 
+                for ii in info['env_id']:
+                    print(f"Balance: {info['balance'][ii]:.6f}, "
+                          f"Realized PnL: {info['realized_pnl'][ii]:.6f}, "
+                          f"Unrealized PnL: {info['unrealized_pnl'][ii]:.6f}, "
+                          f"Fees: {info['fees'][ii]:.6f}, "
+                          f"Trade Count: {info['trade_count'][ii]}, "
+                          f"Drawdown: {info['drawdown'][ii]:.6f}, "
+                          f"Leverage: {info['leverage'][ii]:.4f}")
 
-trainer.run()
+            counter += 1
+            if np.any(terminated) or np.any(truncated):
+                #obs, info = env.reset()
+                state = None
+                break
 
-# Save final results
-torch.save({
-    'policy_state_dict': policy.state_dict(),
-    'actor_optim_state_dict': policy.actor_optim.state_dict(),
-    'critic_optim_state_dict': policy.critic_optim.state_dict(),
-    'alpha_optim_state_dict': policy.alpha_optim.state_dict()
-}, final_checkpoint_path)
-
-buffer.save_hdf5(final_buffer_path)
+try:
+    print("Starting inference...")
+    inference_loop()
+except KeyboardInterrupt:
+    print("\nInference stopped by user")
+finally:
+    env.close()

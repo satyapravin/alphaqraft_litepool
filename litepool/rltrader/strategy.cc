@@ -37,7 +37,7 @@ void Strategy::quote(const std::vector<double>& buy_spreads,
 	auto posInfo = position.getPositionInfo(bid_prices[0], ask_prices[0]);
 	auto leverage = posInfo.leverage;
         auto initBalance = position.getInitialBalance();
-        auto skew = static_cast<int>(2 * leverage);
+        auto skew = static_cast<int>(3 * leverage);
         auto bid_skew_multiplier = 1.0;
         auto ask_skew_multiplier  = 1.0;
 
@@ -52,21 +52,21 @@ void Strategy::quote(const std::vector<double>& buy_spreads,
        	auto base_bid_price = bid_prices[0];
 	auto base_ask_price = ask_prices[0];
 
-	auto bid_width = 0.0003 * base_bid_price;
-        auto ask_width = 0.0003 * base_ask_price;
+	auto bid_width = 0.0001 * base_bid_price;
+        auto ask_width = 0.0001 * base_ask_price;
         
 	if (this->exchange.isDummy())	
             this->exchange.cancelOrders();
 
         for (auto ii = 0; ii < buy_spreads.size(); ++ii) {
-             auto bid_spread = std::floor(buy_spreads[ii] * bid_width / tick_size) * tick_size;
-	     auto ask_spread = std::floor(sell_spreads[ii] * ask_width / tick_size) * tick_size;
+             auto bid_spread = std::floor(buy_spreads[ii] * (ii+1) * bid_width / tick_size) * tick_size;
+	     auto ask_spread = std::floor(sell_spreads[ii] * (ii+1) * ask_width / tick_size) * tick_size;
 	     auto bid_quote = base_bid_price - bid_spread * bid_skew_multiplier;
 	     auto ask_quote = base_ask_price + ask_spread * ask_skew_multiplier;
 	     base_bid_price = std::min(base_bid_price, bid_quote);
 	     base_ask_price = std::max(base_ask_price, ask_quote);
-	     auto bid_size = buy_volumes[ii] * initBalance * 0.05;
-	     auto ask_size = sell_volumes[ii] * initBalance * 0.05;
+	     auto bid_size = buy_volumes[ii] * initBalance * 0.005;
+	     auto ask_size = sell_volumes[ii] * initBalance * 0.005;
 	     bid_size = instrument.getMinAmount() + instrument.getTradeAmount(bid_size, base_bid_price);
 	     ask_size = instrument.getMinAmount() + instrument.getTradeAmount(ask_size, base_bid_price);
 	     if (bid_size > 0 && base_bid_price <= bid_prices[0] + 1e-10) {
