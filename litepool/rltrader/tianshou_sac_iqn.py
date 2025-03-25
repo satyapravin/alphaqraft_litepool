@@ -972,10 +972,9 @@ if final_checkpoint_path.exists():
     print(f"Loading model from {final_checkpoint_path}")
     saved_model = torch.load(final_checkpoint_path)
     policy.load_state_dict(saved_model['policy_state_dict'])
-    policy.alpha_optim.load_state_dict(checkpoint['alpha_optim_state_dict'])
+    policy.alpha_optim.load_state_dict(saved_model['alpha_optim_state_dict'])
     policy.actor_optim.load_state_dict(saved_model['actor_optim_state_dict'])
     policy.critic_optim.load_state_dict(saved_model['critic_optim_state_dict'])
-    policy.alpha_optim.load_state_dict(saved_model['alpha_optim_state_dict'])
     start_epoch = saved_model.get('epoch', 0)
     print(f"Resumed from epoch {start_epoch}")
 else:
