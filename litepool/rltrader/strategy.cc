@@ -65,8 +65,9 @@ void Strategy::quote(const std::vector<double>& buy_spreads,
 	     auto ask_quote = base_ask_price + ask_spread * ask_skew_multiplier;
 	     base_bid_price = std::min(base_bid_price, bid_quote);
 	     base_ask_price = std::max(base_ask_price, ask_quote);
-	     auto bid_size = buy_volumes[ii] * initBalance * 0.005;
-	     auto ask_size = sell_volumes[ii] * initBalance * 0.005;
+	     auto bid_size = (1 + buy_volumes[ii]) * initBalance * 0.01;
+	     auto ask_size = (1 + sell_volumes[ii]) * initBalance * 0.01;
+
 	     bid_size = instrument.getMinAmount() + instrument.getTradeAmount(bid_size, base_bid_price);
 	     ask_size = instrument.getMinAmount() + instrument.getTradeAmount(ask_size, base_bid_price);
 	     if (bid_size > 0 && base_bid_price <= bid_prices[0] + 1e-10) {

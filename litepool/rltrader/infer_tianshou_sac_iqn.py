@@ -617,10 +617,25 @@ policy = CustomSACPolicy(
 results_dir = Path("results")
 model_path = results_dir / "final_model.pth"
 
+from collections import OrderedDict
+
+def load_model(checkpoint_path):
+    checkpoint = torch.load(checkpoint_path)
+
+    state_dict = checkpoint['policy_state_dict']
+    if 'alpha' in state_dict:
+        new_state_dict = OrderedDict()
+        for k, v in state_dict.items():
+            if k != 'alpha':
+                new_state_dict[k] = v
+        checkpoint['policy_state_dict'] = new_state_dict
+
+    policy.load_state_dict(checkpoint['policy_state_dict'], strict=False)  # Allow missing keys
+    return policy
+
 if model_path.exists():
     print("Loading model for inference...")
-    checkpoint = torch.load(model_path)
-    policy.load_state_dict(checkpoint['policy_state_dict'])
+    policy = load_model(model_path)
     print("Model loaded successfully")
 else:
     raise FileNotFoundError("No trained model found!")

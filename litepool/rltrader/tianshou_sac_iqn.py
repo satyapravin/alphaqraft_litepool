@@ -28,7 +28,7 @@ device = torch.device("cuda")
 #-------------------------------------
 # Make environment
 #------------------------------------
-num_of_envs=32
+num_of_envs=64
 
 env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
@@ -461,7 +461,7 @@ class RecurrentActor(nn.Module):
 
 
 class IQNCritic(nn.Module):
-    def __init__(self, state_dim=2420, action_dim=12, hidden_dim=128, num_quantiles=32, gru_hidden_dim=128, num_layers=2):
+    def __init__(self, state_dim=2420, action_dim=12, hidden_dim=128, num_quantiles=64, gru_hidden_dim=128, num_layers=2):
         super().__init__()
         self.num_quantiles = num_quantiles
         self.num_layers = num_layers
@@ -957,7 +957,7 @@ policy = CustomSACPolicy(
     critic=critic,
     actor_optim=Adam(actor.parameters(), lr=1e-4),
     critic_optim=critic_optim,
-    tau=0.005, gamma=0.99, alpha=2.0,
+    tau=0.005, gamma=0.99, alpha=5.0,
     action_space=env_action_space
 )
 
@@ -1001,7 +1001,7 @@ trainer = OffpolicyTrainer(
     train_collector=collector,
     max_epoch=30,
     step_per_epoch=72,
-    step_per_collect=32*16,
+    step_per_collect=64*16,
     update_per_step=0.01,
     episode_per_test=0,
     batch_size=num_of_envs,
