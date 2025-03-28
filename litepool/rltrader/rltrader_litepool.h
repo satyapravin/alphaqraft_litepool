@@ -72,8 +72,8 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) ActionSpec(const Config& conf) {
-    return MakeDict("action"_.Bind(Spec<float>({12}, {{-1., -1., -1., -1., -1., -1., -1., -1., -1., -1., -1, -1.},
-				                      { 1.,  1.,  1.,  1.,  1.,  1.,  1.,  1.,  1.,  1.,  1., 1.}})));
+    return MakeDict("action"_.Bind(Spec<float>({4}, {{-1., -1., -1., -1.},
+				                     { 1.,  1.,  1.,  1.}})));
   }
 };
 
@@ -98,9 +98,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   int start_read = 0;
   int max_read = 0;
   long long steps = 0;
-  double ewma_realized = 0;
-  double ewma_unrealized = 0;
-  double ewma_fees = 0;
+  double previous_reward = 0;
 
   std::unique_ptr<RLTrader::BaseInstrument> instr_ptr;
   std::unique_ptr<RLTrader::BaseExchange> exchange_ptr;
@@ -151,9 +149,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
 
   void Reset() override {
     steps = 0;
-    ewma_realized = 0;
-    ewma_unrealized = 0;
-    ewma_fees = 0;
+    previous_reward = 0;
     adaptor_ptr->reset();
     isDone = false;
     WriteState();
@@ -161,25 +157,14 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
 
   void Step(const Action& action_dict) override { 
       double buy_spread_1 = static_cast<double>(action_dict["action"_][0]);
-      double buy_spread_2 = static_cast<double>(action_dict["action"_][1]);
-      double buy_spread_3 = static_cast<double>(action_dict["action"_][2]);
+      double sell_spread_1 = static_cast<double>(action_dict["action"_][1]);
+      double buy_volume_1 = static_cast<double>(action_dict["action"_][2]);
+      double sell_volume_1 = static_cast<double>(action_dict["action"_][3]);
 
-      double sell_spread_1 = static_cast<double>(action_dict["action"_][3]);
-      double sell_spread_2 = static_cast<double>(action_dict["action"_][4]);
-      double sell_spread_3 = static_cast<double>(action_dict["action"_][5]);
-
-      double buy_volume_1 = static_cast<double>(action_dict["action"_][6]);
-      double buy_volume_2 = static_cast<double>(action_dict["action"_][7]);
-      double buy_volume_3 = static_cast<double>(action_dict["action"_][8]);
-
-      double sell_volume_1 = static_cast<double>(action_dict["action"_][9]);
-      double sell_volume_2 = static_cast<double>(action_dict["action"_][10]);
-      double sell_volume_3 = static_cast<double>(action_dict["action"_][11]);
-
-      std::vector<double> buy_spreads = {buy_spread_1, buy_spread_2, buy_spread_3};
-      std::vector<double> sell_spreads = {sell_spread_1, sell_spread_2, sell_spread_3};
-      std::vector<double> buy_volumes = {buy_volume_1, buy_volume_2, buy_volume_3};
-      std::vector<double> sell_volumes = {sell_volume_1, sell_volume_2, sell_volume_3};
+      std::vector<double> buy_spreads = {buy_spread_1};
+      std::vector<double> sell_spreads = {sell_spread_1};
+      std::vector<double> buy_volumes = {buy_volume_1};
+      std::vector<double> sell_volumes = {sell_volume_1};
 
       for (auto ii = 0; ii < buy_spreads.size(); ++ii) {
           buy_spreads[ii] += 1.0;
@@ -217,11 +202,9 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     state["info:trade_count"_] = info["trade_count"];
     state["info:drawdown"_] = info["drawdown"];
     state["info:fees"_] = info["fees"];
-    ewma_realized = 0.95 * ewma_realized + 0.05 * info["realized_pnl"];
-    ewma_unrealized = 0.95 * ewma_unrealized + 0.05 * info["unrealized_pnl"];
-    ewma_fees = 0.95 * ewma_fees + 0.05 * info["fees"];
-    auto reward = ewma_realized + ewma_unrealized - ewma_fees;
-    state["reward"_] = reward * 1000;
+    auto current_reward = info["realized_pnl"] + info["unrealized_pnl"] - info["fees"];
+    state["reward"_] = (current_reward - previous_reward) * 1000;
+    previous_reward = current_reward;
     state["obs"_].Assign(data.begin(), data.size());
   }
 
