@@ -34,8 +34,8 @@ env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
     num_threads=num_of_envs, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
-    maker_fee=-0.00001, taker_fee=0.0005, foldername="./train_files/",
-    balance=1.0, start=1, max=72001*10
+    maker_fee=-0.00005, taker_fee=0.0005, foldername="./train_files/",
+    balance=1.0, start=36001*10, max=7201*10
 )
 
 env.spec.id = 'RlTrader-v0'
@@ -371,7 +371,7 @@ class CustomSACPolicy(SACPolicy):
 # ---------------------------
 
 class RecurrentActor(nn.Module):
-    def __init__(self, state_dim=2420, action_dim=12, hidden_dim=64, gru_hidden_dim=128, num_layers=2):
+    def __init__(self, state_dim=2420, action_dim=4, hidden_dim=64, gru_hidden_dim=128, num_layers=2):
         super().__init__()
         self.gru_hidden_dim = gru_hidden_dim
         self.num_layers = num_layers
@@ -461,7 +461,7 @@ class RecurrentActor(nn.Module):
 
 
 class IQNCritic(nn.Module):
-    def __init__(self, state_dim=2420, action_dim=12, hidden_dim=128, num_quantiles=64, gru_hidden_dim=128, num_layers=2):
+    def __init__(self, state_dim=2420, action_dim=4, hidden_dim=128, num_quantiles=64, gru_hidden_dim=128, num_layers=2):
         super().__init__()
         self.num_quantiles = num_quantiles
         self.num_layers = num_layers
@@ -955,9 +955,9 @@ critic_optim = Adam(critic.parameters(), lr=1e-4)
 policy = CustomSACPolicy(
     actor=actor,
     critic=critic,
-    actor_optim=Adam(actor.parameters(), lr=1e-4),
+    actor_optim=Adam(actor.parameters(), lr=3e-4),
     critic_optim=critic_optim,
-    tau=0.005, gamma=0.99, alpha=5.0,
+    tau=0.005, gamma=0.95, alpha=2.0,
     action_space=env_action_space
 )
 
@@ -1000,8 +1000,8 @@ trainer = OffpolicyTrainer(
     policy=policy,
     train_collector=collector,
     max_epoch=10,
-    step_per_epoch=72,
-    step_per_collect=64*16,
+    step_per_epoch=16,
+    step_per_collect=64*5,
     update_per_step=0.01,
     episode_per_test=0,
     batch_size=num_of_envs,
