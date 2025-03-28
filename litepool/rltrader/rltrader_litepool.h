@@ -98,7 +98,9 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   int start_read = 0;
   int max_read = 0;
   long long steps = 0;
-  double prev_reward = 0;
+  double ewma_realized = 0;
+  double ewma_unrealized = 0;
+  double ewma_fees = 0;
 
   std::unique_ptr<RLTrader::BaseInstrument> instr_ptr;
   std::unique_ptr<RLTrader::BaseExchange> exchange_ptr;
@@ -149,8 +151,9 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
 
   void Reset() override {
     steps = 0;
-    prev_reward = 0;
-
+    ewma_realized = 0;
+    ewma_unrealized = 0;
+    ewma_fees = 0;
     adaptor_ptr->reset();
     isDone = false;
     WriteState();
@@ -214,21 +217,11 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     state["info:trade_count"_] = info["trade_count"];
     state["info:drawdown"_] = info["drawdown"];
     state["info:fees"_] = info["fees"];
-    auto curr_data_rpnl = info["realized_pnl"];
-    auto curr_data_upnl = info["unrealized_pnl"];
-    auto curr_data_fees = info["fees"];
-    auto reward = 0.0;
-   
-    reward = curr_data_rpnl + curr_data_upnl - curr_data_fees;
-    if (reward > 0 && isDone) reward /= (0.0001 + std::abs(info["drawdown"]));
-    else reward += info["leverage"] * (info["mid_price"] - info["average_price"]);
-
-    if (!isDone) {
-        reward = prev_reward * 0.95 + reward * 0.05;
-	prev_reward = reward;
-    }
-
-    state["reward"_] = reward * 10;
+    ewma_realized = 0.95 * ewma_realized + 0.05 * info["realized_pnl"];
+    ewma_unrealized = 0.95 * ewma_unrealized + 0.05 * info["unrealized_pnl"];
+    ewma_fees = 0.95 * ewma_fees + 0.05 * info["fees"];
+    auto reward = ewma_realized + ewma_unrealized - ewma_fees;
+    state["reward"_] = reward * 1000;
     state["obs"_].Assign(data.begin(), data.size());
   }
 

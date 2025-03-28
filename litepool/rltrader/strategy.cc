@@ -37,7 +37,7 @@ void Strategy::quote(const std::vector<double>& buy_spreads,
 	auto posInfo = position.getPositionInfo(bid_prices[0], ask_prices[0]);
 	auto leverage = posInfo.leverage;
         auto initBalance = position.getInitialBalance();
-        auto skew = static_cast<int>(3 * leverage);
+        auto skew = static_cast<int>(5 * leverage);
         auto bid_skew_multiplier = 1.0;
         auto ask_skew_multiplier  = 1.0;
 

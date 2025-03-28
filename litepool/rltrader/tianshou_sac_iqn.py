@@ -34,7 +34,7 @@ env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
     num_threads=num_of_envs, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
-    maker_fee=-0.0001, taker_fee=0.0005, foldername="./train_files/",
+    maker_fee=-0.00001, taker_fee=0.0005, foldername="./train_files/",
     balance=1.0, start=1, max=72001*10
 )
 
@@ -251,7 +251,7 @@ class CustomSACPolicy(SACPolicy):
         self.training = True
         
         # Temperature for Q-value scaling
-        temp = 0.1  
+        temp = 1.0  
 
         with autocast(device_type="cuda"):
             # Actor forward pass
@@ -312,7 +312,7 @@ class CustomSACPolicy(SACPolicy):
                 target_q = torch.min(target_q1, target_q2) * temp
                 target_q = target_q - (self.get_alpha.detach() * next_log_prob.unsqueeze(1))
                 
-                reward_scale = 0.1
+                reward_scale = 1.0
                 target_q = batch.rew.unsqueeze(1) * reward_scale + self.gamma * (1 - batch.done.unsqueeze(1)) * target_q
                 target_q = torch.clamp(target_q, -10.0, 10.0)  # Tighter clipping
 
@@ -999,7 +999,7 @@ collector.logger = logger
 trainer = OffpolicyTrainer(
     policy=policy,
     train_collector=collector,
-    max_epoch=30,
+    max_epoch=10,
     step_per_epoch=72,
     step_per_collect=64*16,
     update_per_step=0.01,
