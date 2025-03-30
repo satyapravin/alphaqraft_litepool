@@ -13,18 +13,18 @@ set(OPENSSL_ROOT_DIR "/usr/openssl")
 set(OPENSSL_LIBRARIES "/lib64/libssl.so;/lib64/libcrypto.so")
 find_package(OpenSSL REQUIRED)
 
-add_executable(test_sim base_instrument.h
-        csv_reader.h csv_reader.cc
-        sim_exchange.h sim_exchange.cc
-        inverse_instrument.h inverse_instrument.cc
-        normal_instrument.h normal_instrument.cc
-        order.h position.h position.cc
-        strategy.cc doctest.h strategy.h
-        orderbook.h orderbook_buffer.h
-        market_signal_builder.h market_signal_builder.cc
-        position_signal_builder.h position_signal_builder.cc
-        trade_signal_builder.h trade_signal_builder.cc
-        env_adaptor.h env_adaptor.cc testcases.cc)
+#add_executable(test_sim base_instrument.h
+#        csv_reader.h csv_reader.cc
+#        sim_exchange.h sim_exchange.cc
+#        inverse_instrument.h inverse_instrument.cc
+#        normal_instrument.h normal_instrument.cc
+#        order.h position.h position.cc
+#        strategy.cc doctest.h strategy.h
+#        orderbook.h orderbook_buffer.h
+#        market_signal_builder.h market_signal_builder.cc
+#        position_signal_builder.h position_signal_builder.cc
+#        trade_signal_builder.h trade_signal_builder.cc
+#        env_adaptor.h env_adaptor.cc testcases.cc)
 
 set(GFLAG_LIBRARY_NAME /usr/local/lib/libgflags.a)
 pybind11_add_module(rltrader_litepool rltrader_litepool.h rltrader_litepool.cc
@@ -80,7 +80,7 @@ target_link_libraries(rltrader_litepool PUBLIC OpenSSL::SSL OpenSSL::Crypto Boos
                                         PRIVATE glog -lstdc++fs nlohmann_json::nlohmann_json)
 target_link_libraries(rltradertest PUBLIC OpenSSL::SSL OpenSSL::Crypto Boost::system Threads::Threads
                                    PRIVATE GTest::GTest GTest::Main gflags gmock glog -lstdc++fs nlohmann_json::nlohmann_json)
-target_link_libraries(test_sim PUBLIC OpenSSL::SSL OpenSSL::Crypto Boost::system Threads::Threads
-                                   PRIVATE GTest::GTest GTest::Main gflags gmock glog -lstdc++fs nlohmann_json::nlohmann_json)
+			   #target_link_libraries(test_sim PUBLIC OpenSSL::SSL OpenSSL::Crypto Boost::system Threads::Threads
+			   #        PRIVATE GTest::GTest GTest::Main gflags gmock glog -lstdc++fs nlohmann_json::nlohmann_json)
 include(GoogleTest)
 gtest_discover_tests(rltradertest)

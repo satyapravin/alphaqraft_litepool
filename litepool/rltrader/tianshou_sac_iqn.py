@@ -108,11 +108,19 @@ class VecNormalize:
 
         return obs, rews, terminateds, truncateds, infos
 
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
+    
+    def reset(self, indices=None, **kwargs):
+        if indices is None:
+            obs, info = self.env.reset(**kwargs)
+        else:
+            obs, info = self.env.reset(indices, **kwargs)
 
         if self.norm_obs:
             self.obs_rms.update(obs)
+            if indices is None:
+                self.returns = np.zeros(self.num_env)
+            else:
+                self.returns[indices] = 0.0
             obs = self.normalize_obs(obs)
 
         return obs, info
@@ -371,7 +379,7 @@ class CustomSACPolicy(SACPolicy):
 # ---------------------------
 
 class RecurrentActor(nn.Module):
-    def __init__(self, state_dim=2420, action_dim=4, hidden_dim=64, gru_hidden_dim=128, num_layers=2):
+    def __init__(self, state_dim=2420, action_dim=6, hidden_dim=64, gru_hidden_dim=128, num_layers=2):
         super().__init__()
         self.gru_hidden_dim = gru_hidden_dim
         self.num_layers = num_layers
@@ -697,10 +705,12 @@ class GPUCollector(Collector):
         assert not self.env.is_async, "Please use AsyncCollector if using async venv."
         
         start_time = time.time()
-        local_step_count = 0  # Local counter for this collection cycle
+        local_step_count = 0
         episode_count = 0
         episode_rews = []
         episode_lens = []
+        episode_lens_dict = {i: 0 for i in range(num_of_envs)}  # Track length per env
+        episode_rews_dict = {i: 0.0 for i in range(num_of_envs)}  # Track rewards per env
 
         while True:
             if self.data.obs is None:
@@ -797,91 +807,90 @@ class GPUCollector(Collector):
             ptr, ep_rew, ep_len, ep_idx = self.buffer.add(batch)
 
             local_step_count += 1
-            self.continuous_step_count += 1  # Update continuous counter
+            self.continuous_step_count += 1
 
-            # Handle vectorized environment episode completion
-            if isinstance(ep_len, np.ndarray):
-                for idx, (l, r) in enumerate(zip(ep_len, ep_rew)):
-                    if l is not None:  # episode ended
-                        episode_lens.append(l)
-                        episode_rews.append(r)
-                        episode_count += 1
-                        if n_episode and episode_count >= n_episode:
-                            break
-            else:
-                if ep_len is not None:  # single environment episode ended
-                    episode_lens.append(ep_len)
-                    episode_rews.append(ep_rew)
+            # Handle episode completion and resets
+            # For each environment
+            for idx in range(num_of_envs):
+            # Accumulate rewards and lengths
+                episode_lens_dict[idx] += 1
+                episode_rews_dict[idx] += rew[idx]
+
+                # Check if environment was reset (either through done flag or checking info)
+                env_reset = done[idx] or (isinstance(info, dict) and 
+                                          'reset' in info and 
+                                          info['reset'][idx])
+
+                if env_reset:
+                    # Record completed episode
+                    episode_lens.append(episode_lens_dict[idx])
+                    episode_rews.append(episode_rews_dict[idx])
                     episode_count += 1
 
+                    # Reset tracking for this environment
+                    episode_lens_dict[idx] = 0
+                    episode_rews_dict[idx] = 0.0
+
+                    # Reset this specific environment
+                    reset_indices = np.array([idx], dtype=np.int64)
+                    single_obs, _ = self.env.reset(indices=reset_indices)
+                    if isinstance(self.data.obs_next, torch.Tensor):
+                        self.data.obs_next[idx] = torch.as_tensor(single_obs[0], device=self.device)
+                    else:
+                        self.data.obs_next[idx] = single_obs[0]
+
+            # Check termination conditions
             if n_episode and episode_count >= n_episode:
                 break
-
             if n_step and local_step_count >= n_step:
                 break
 
             self.data.obs = self.data.obs_next
 
-        class StatClass:
-            def __init__(self, mean_val, std_val):
-                self.mean = mean_val
-                self._std = std_val
-            
-            def std(self):
-                return self._std
-
+        # Create statistics
         if episode_count > 0:
-            rews, lens = list(map(np.array, [episode_rews, episode_lens]))
+            rews = np.array(episode_rews)
+            lens = np.array(episode_lens)
             mean_rew = rews.mean()
             mean_len = lens.mean()
             std_rew = rews.std()
             std_len = lens.std()
-            
-            # Basic statistics with mean and std
-            return_stat = StatClass(mean_rew, std_rew)
-            return_stat.n_ep = episode_count
-            return_stat.n_st = local_step_count
-            return_stat.rews = rews
-            return_stat.lens = lens
-            return_stat.rew = mean_rew
-            return_stat.len = mean_len
-            return_stat.rew_std = std_rew
-            return_stat.len_std = std_len
-            
-            # Length statistics
-            lens_stat = StatClass(mean_len, std_len)
-            lens_stat.n_ep = episode_count
-            lens_stat.n_st = local_step_count
-            lens_stat.lens = lens
-            lens_stat.len = mean_len
-            lens_stat.len_std = std_len
-            
-            # Reward statistics
-            rewards_stat = StatClass(mean_rew, std_rew)
-            rewards_stat.n_ep = episode_count
-            rewards_stat.n_st = local_step_count
-            rewards_stat.rews = rews
-            rewards_stat.rew = mean_rew
-            rewards_stat.rew_std = std_rew
         else:
             empty_arr = np.array([])
-            return_stat = StatClass(0.0, 0.0)
-            return_stat.n_ep = episode_count
-            return_stat.n_st = local_step_count
-            
-            lens_stat = StatClass(0.0, 0.0)
-            lens_stat.n_ep = episode_count
-            lens_stat.n_st = local_step_count
-            lens_stat.lens = empty_arr
-            lens_stat.len = 0.0
-            lens_stat.len_std = 0.0
-            
-            rewards_stat = StatClass(0.0, 0.0)
-            rewards_stat.n_ep = episode_count
-            rewards_stat.n_st = local_step_count
-            rewards_stat.rews = empty_arr
-            rewards_stat.rew = 0.0
-            rewards_stat.rew_std = 0.0
+            rews = lens = empty_arr
+            mean_rew = mean_len = std_rew = std_len = 0.0
+
+        class StatClass:
+            def __init__(self, mean_val, std_val):
+                self.mean = mean_val
+                self._std = std_val
+            def std(self):
+                return self._std
+
+        # Create stat objects
+        return_stat = StatClass(mean_rew, std_rew)
+        return_stat.n_ep = episode_count
+        return_stat.n_st = local_step_count
+        return_stat.rews = rews
+        return_stat.lens = lens
+        return_stat.rew = mean_rew
+        return_stat.len = mean_len
+        return_stat.rew_std = std_rew
+        return_stat.len_std = std_len
+
+        lens_stat = StatClass(mean_len, std_len)
+        lens_stat.n_ep = episode_count
+        lens_stat.n_st = local_step_count
+        lens_stat.lens = lens
+        lens_stat.len = mean_len
+        lens_stat.len_std = std_len
+
+        rewards_stat = StatClass(mean_rew, std_rew)
+        rewards_stat.n_ep = episode_count
+        rewards_stat.n_st = local_step_count
+        rewards_stat.rews = rews
+        rewards_stat.rew = mean_rew
+        rewards_stat.rew_std = std_rew
 
         collect_time = time.time() - start_time
         step_time = collect_time / local_step_count if local_step_count else 0
@@ -889,26 +898,27 @@ class GPUCollector(Collector):
         return CollectStats(
             n_ep=episode_count,
             n_st=local_step_count,
-            rews=np.array(episode_rews) if episode_rews else empty_arr,
-            lens=np.array(episode_lens) if episode_lens else empty_arr,
-            rew=mean_rew if episode_count > 0 else 0.0,
-            len=mean_len if episode_count > 0 else 0.0,
-            rew_std=std_rew if episode_count > 0 else 0.0,
-            len_std=std_len if episode_count > 0 else 0.0,
+            rews=rews,
+            lens=lens,
+            rew=mean_rew,
+            len=mean_len,
+            rew_std=std_rew,
+            len_std=std_len,
             n_collected_steps=local_step_count,
             n_collected_episodes=episode_count,
             returns_stat=return_stat,
             lens_stat=lens_stat,
             rewards_stat=rewards_stat,
             episodes=episode_count,
-            reward_sum=float(np.sum(episode_rews)) if episode_rews else 0.0,
-            length_sum=int(np.sum(episode_lens)) if episode_lens else 0,
+            reward_sum=float(np.sum(rews)) if len(rews) > 0 else 0.0,
+            length_sum=int(np.sum(lens)) if len(lens) > 0 else 0,
             collect_time=collect_time,
             step_time=step_time,
-            returns=np.array(episode_rews) if episode_rews else empty_arr,
-            lengths=np.array(episode_lens) if episode_lens else empty_arr,
+            returns=rews,
+            lengths=lens,
             continuous_step=self.continuous_step_count
         )
+
 
 def save_checkpoint_fn(epoch, env_step, gradient_step):
     try:
@@ -999,8 +1009,8 @@ collector.logger = logger
 trainer = OffpolicyTrainer(
     policy=policy,
     train_collector=collector,
-    max_epoch=10,
-    step_per_epoch=16,
+    max_epoch=100,
+    step_per_epoch=2,
     step_per_collect=64*64,
     update_per_step=0.01,
     episode_per_test=0,

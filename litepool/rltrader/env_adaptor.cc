@@ -40,11 +40,9 @@ void EnvAdaptor::getState(std::array<double, 242*10>& st) {
     st = state;
 }
 
-void EnvAdaptor::quote(const std::vector<double>& buy_spreads, 
-		       const std::vector<double>& sell_spreads, 
-		       const std::vector<double>& buy_volumes, 
-		       const std::vector<double>& sell_volumes) {
-    this->strategy.quote(buy_spreads, sell_spreads, buy_volumes, sell_volumes, bid_prices, ask_prices);
+void EnvAdaptor::quote(const double& mid_spread, const double& gamma, const double& kappa,
+		       const double& annual_vol, const double& sec_horizon, const double& target_q) {
+    this->strategy.quote(mid_spread, gamma, kappa, annual_vol, sec_horizon, target_q, bid_prices, ask_prices);
 }
 
 void EnvAdaptor::reset() {

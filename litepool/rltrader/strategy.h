@@ -13,10 +13,12 @@ namespace RLTrader {
 			
 		void reset();
 
-		void quote(const std::vector<double>& buy_spreads, 
-			   const std::vector<double>& sell_spreads, 
-			   const std::vector<double>& buy_volumes, 
-			   const std::vector<double>& sell_volumes,
+		void quote(const double& mid_spread,
+			   const double& gamma,
+			   const double& kappa,
+			   const double& annual_vol,
+			   const double& sec_horizon,
+			   const double& target_q,
 		           FixedVector<double, 20>& bid_prices, 
 			   FixedVector<double, 20>& ask_prices);
 
