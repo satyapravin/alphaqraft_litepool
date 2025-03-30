@@ -49,15 +49,13 @@ void Strategy::quote(const double& mid_spread,
 	auto leverage = posInfo.leverage;
         auto initBalance = position.getInitialBalance();
 	auto mid_price = (bid_prices[0] + ask_prices[0]) * 0.5;
-	auto q_target = target_q - leverage;
+	auto q_target = (target_q - leverage) * initBalance;
 	auto sigma = annual_vol * mid_price / (24.0 * 3600 * 365.25);
 	auto ref_price = mid_price + mid_spread;
-	auto spread_opt = gamma * sigma * sigma * sec_horizon + (2 / kappa);
-	auto inventory_skew = gamma * sigma * sigma * q_target * sec_horizon; 
-	auto delta_bid = (spread_opt / 2) + inventory_skew;
-        auto delta_ask = (spread_opt / 2) - inventory_skew;
-        auto bid_price = mid_price - delta_bid;
-        auto ask_price = mid_price + delta_ask;
+	auto spread_opt = gamma / mid_price * sigma * sigma * sec_horizon + (2 / kappa);
+	auto inventory_skew = gamma / mid_price * sigma * sigma * q_target * sec_horizon; 
+        auto bid_price = ref_price - spread_opt / 2 + inventory_skew;
+        auto ask_price = ref_price + spread_opt / 2 + inventory_skew;
 
         bid_price = std::floor(bid_price / tick_size) * tick_size;
 	ask_price = std::ceil(ask_price / tick_size) * tick_size;
@@ -69,9 +67,9 @@ void Strategy::quote(const double& mid_spread,
 	auto ask_size = instrument.getMinAmount();
 
 	if (q_target > 0) {
-	    bid_size = instrument.getTradeAmount(std::abs(q_target), bid_price);
+	    bid_size = instrument.getTradeAmount(std::abs(q_target) * initBalance, bid_price);
 	} else if (q_target < 0) {
-	    ask_size = instrument.getTradeAmount(std::abs(q_target), ask_price);
+	    ask_size = instrument.getTradeAmount(std::abs(q_target) * initBalance, ask_price);
 	}
 
 	if (exchange.isDummy()) exchange.cancelOrders();

@@ -165,14 +165,13 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
       double target_q = static_cast<double>(action_dict["action"_][5]);
 
       mid_spread *= 0.002;                  // -1 to +1 * 20 bps
-      gamma += 1.1;                         // -1 to +1 into 0.1 to 2.01 
-      gamma /= 200;                         // 0.005 to 0.1005
+      gamma += 1.01;                         // -1 to +1 into 0.01 to 2.01 
+      gamma /= 2;                           // 0.005 to 1.005
       kappa = (kappa + 1.01) * 100.0;       // -1 to +1 to 1 to 201
       annual_vol += 1.01;                   // -1 to +1 to 0.01 to 2.01
       annual_vol /= 2;                      // 0.005 to 1.005
       horizon_in_sec += 1.01;               // -1 to +1 to 0.01 to 2.01
       horizon_in_sec *= 600;                // multiplied by 600 seconds
-     
      
       
       adaptor_ptr->quote(mid_spread, gamma, kappa, annual_vol, horizon_in_sec, target_q);

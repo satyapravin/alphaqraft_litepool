@@ -35,7 +35,7 @@ env = litepool.make(
     num_threads=num_of_envs, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
     maker_fee=-0.00005, taker_fee=0.0005, foldername="./train_files/",
-    balance=1.0, start=36001*10, max=7201*10
+    balance=1.0, start=3601*10, max=64001*10
 )
 
 env.spec.id = 'RlTrader-v0'
@@ -309,20 +309,17 @@ class CustomSACPolicy(SACPolicy):
                 next_log_prob = next_dist.log_prob(next_act)
                 next_log_prob = next_log_prob - torch.sum(torch.log(1 - next_act.pow(2) + 1e-6), dim=-1)
 
-                target_q1, target_taus = self.critic_target(batch.obs_next, next_act, return_taus=True)
-                target_q2, _ = self.critic_target(batch.obs_next, next_act, return_taus=True)
-                
-                if target_q1.dim() == 3:
-                    target_q1 = target_q1.squeeze(-1)
-                if target_q2.dim() == 3:
-                    target_q2 = target_q2.squeeze(-1)
-                    
+                # Sample new taus for target Q
+                taus_target = torch.rand(batch.obs.shape[0], self.critic.num_quantiles, device=device)
+                target_q1, target_taus1 = self.critic_target(batch.obs_next, next_act, taus=taus_target, return_taus=True)
+                target_q2, target_taus2 = self.critic_target(batch.obs_next, next_act, taus=taus_target, return_taus=True)
+
                 target_q = torch.min(target_q1, target_q2) * temp
                 target_q = target_q - (self.get_alpha.detach() * next_log_prob.unsqueeze(1))
-                
+
                 reward_scale = 1.0
                 target_q = batch.rew.unsqueeze(1) * reward_scale + self.gamma * (1 - batch.done.unsqueeze(1)) * target_q
-                target_q = torch.clamp(target_q, -10.0, 10.0)  # Tighter clipping
+                target_q = torch.clamp(target_q, -10.0, 10.0) 
 
             # Current Q values for critic loss
             current_q1, curr_taus1 = self.critic(batch.obs, batch.act, return_taus=True)
@@ -334,8 +331,8 @@ class CustomSACPolicy(SACPolicy):
                 current_q2 = current_q2.squeeze(-1)
 
             # Compute critic losses with Huber loss
-            critic_loss1 = quantile_huber_loss(current_q1, target_q, curr_taus1, kappa=1.0)
-            critic_loss2 = quantile_huber_loss(current_q2, target_q, curr_taus2, kappa=1.0)
+            critic_loss1 = quantile_huber_loss(current_q1, target_q, curr_taus1, target_taus1, kappa=1.0)
+            critic_loss2 = quantile_huber_loss(current_q2, target_q, curr_taus2, target_taus2, kappa=1.0)
             critic_loss = critic_loss1 + critic_loss2
 
             # Critic optimization with gradient clipping
@@ -430,12 +427,12 @@ class RecurrentActor(nn.Module):
 
         # Split the features
         market_state = obs[:, :, :self.market_dim]
-        position_state = obs[:, -1, self.market_dim:self.market_dim + self.position_dim]
-        trade_state = obs[:, -1, self.market_dim + self.position_dim:self.market_dim + self.position_dim + self.trade_dim]
+        position_state = obs[:, :, self.market_dim:self.market_dim + self.position_dim]
+        trade_state = obs[:, :, self.market_dim + self.position_dim:self.market_dim + self.position_dim + self.trade_dim]
 
         position_out = self.position_fc(position_state)
         trade_out = self.trade_fc(trade_state)
-        market_out = self.market_fc(market_state[:, -1])  # Use only the last timestep
+        market_out = self.market_fc(market_state)  
 
         x = torch.cat([trade_out, market_out], dim=-1)
 
@@ -469,7 +466,7 @@ class RecurrentActor(nn.Module):
 
 
 class IQNCritic(nn.Module):
-    def __init__(self, state_dim=2420, action_dim=4, hidden_dim=128, num_quantiles=64, gru_hidden_dim=128, num_layers=2):
+    def __init__(self, state_dim=2420, action_dim=6, hidden_dim=128, num_quantiles=64, gru_hidden_dim=128, num_layers=2):
         super().__init__()
         self.num_quantiles = num_quantiles
         self.num_layers = num_layers
@@ -564,40 +561,31 @@ class IQNCritic(nn.Module):
         return (q_values, taus) if return_taus else q_values
 
 
-def quantile_huber_loss(ip, target, taus, kappa=1.0):
-    # Ensure proper dimensions
-    if ip.dim() == 3:
-        ip = ip.squeeze(-1)  # [batch_size, num_quantiles]
-    if target.dim() == 3:
-        target = target.squeeze(-1)  # [batch_size, num_quantiles]
-    elif target.dim() == 1:
-        target = target.unsqueeze(1)  # [batch_size, 1]
+def quantile_huber_loss(pred, target, taus_pred, taus_target, kappa=1.0):
+    """
+    pred: [B, N] - predicted quantile values (critic output)
+    target: [B, M] - target quantile values
+    taus_pred: [B, N] - quantile fractions for predicted quantiles
+    taus_target: [B, M] - quantile fractions for target quantiles
+    """
+    B, N = pred.shape
+    _, M = target.shape
+
+    # Expand dims for pairwise differences
+    pred = pred.unsqueeze(2)        # [B, N, 1]
+    target = target.unsqueeze(1)    # [B, 1, M]
+    td_error = target - pred        # [B, N, M]
+
+    # Compute Huber loss
+    huber = F.smooth_l1_loss(pred.expand(-1, -1, M), target.expand(-1, N, -1), reduction="none")
     
-    # Now target is [batch_size, 1] or [batch_size, num_quantiles]
-    # and ip is [batch_size, num_quantiles]
-    if target.shape[1] == 1:
-        target = target.expand_as(ip)  # Expand to match ip dimensions
-    
-    # Calculate TD error
-    td_error = target - ip  # [batch_size, num_quantiles]
-    
-    # Calculate Huber loss
-    huber_loss = F.huber_loss(ip, target, delta=kappa, reduction="none")  # [batch_size, num_quantiles]
-    
-    # Ensure taus has correct shape [batch_size, num_quantiles]
-    if taus.dim() == 3:
-        taus = taus.squeeze(-1)
-    
-    # Calculate quantile weights
-    quantile_weight = (taus - (td_error.detach() < 0).float()).abs()
-    
-    # Apply asymmetric loss
-    asymmetric_factor = 1.2
-    weighted_loss = torch.where(td_error < 0,
-                              huber_loss * asymmetric_factor * quantile_weight,
-                              huber_loss * quantile_weight)
-    
-    return weighted_loss.mean()
+    # Quantile weighting
+    taus_pred = taus_pred.unsqueeze(2)  # [B, N, 1]
+    weight = torch.abs(taus_pred - (td_error.detach() < 0).float())  # [B, N, M]
+
+    quantile_loss = weight * huber  # [B, N, M]
+    return quantile_loss.mean()
+
 
 
 from tianshou.data import Collector, Batch
@@ -939,7 +927,7 @@ def save_checkpoint_fn(epoch, env_step, gradient_step):
         }, checkpoint_path)
 
         # Save buffer at epoch intervals
-        if env_step % (7201*num_of_envs) == 0:  # Save every epoch
+        if env_step % (6401*num_of_envs) == 0:  # Save every epoch
             buffer_path = checkpoint_dir / f"buffer_epoch_{epoch}_step_{env_step}.h5"
             buffer.save_hdf5(buffer_path)
 
@@ -1009,9 +997,9 @@ collector.logger = logger
 trainer = OffpolicyTrainer(
     policy=policy,
     train_collector=collector,
-    max_epoch=100,
-    step_per_epoch=2,
-    step_per_collect=64*64,
+    max_epoch=10,
+    step_per_epoch=100,
+    step_per_collect=64*10,
     update_per_step=0.01,
     episode_per_test=0,
     batch_size=num_of_envs,
