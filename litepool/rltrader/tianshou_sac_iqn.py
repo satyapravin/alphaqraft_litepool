@@ -412,8 +412,8 @@ class RecurrentActor(nn.Module):
         self.mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Linear(hidden_dim, action_dim)
 
-        self.log_std.weight.data.uniform_(-3, -2)
-        self.log_std.bias.data.uniform_(-3, -2)
+        self.log_std.weight.data.uniform_(-1, 0)
+        self.log_std.bias.data.uniform_(-1, 0)
 
     def forward(self, obs, state=None, info=None):
         if isinstance(obs, Batch):
@@ -446,11 +446,12 @@ class RecurrentActor(nn.Module):
 
         x, new_state = self.gru(x, state)
         x = x[:, -1, :]
+        position_out = position_out[:, -1, :]
         x = torch.cat([x, position_out], dim=-1)
         x = self.fusion_fc(x)
 
         mean = self.mean(x)
-        log_std = self.log_std(x).clamp(-20, 2)
+        log_std = self.log_std(x).clamp(-10, 2)
         std = log_std.exp() + 1e-6
 
         loc = mean
@@ -534,20 +535,18 @@ class IQNCritic(nn.Module):
             state = state.view(batch_size, self.time_steps, self.feature_dim)
 
         market_state = state[:, :, :self.market_dim]
-        position_state = state[:, -1, self.market_dim:self.market_dim + self.position_dim] 
-        trade_state = state[:, -1, self.market_dim + self.position_dim:]  # Changed to use last timestep
+        position_state = state[:, :, self.market_dim:self.market_dim + self.position_dim] 
+        trade_state = state[:, :, self.market_dim + self.position_dim:]  # Changed to use last timestep
 
         position_out = self.position_fc(position_state)
         trade_out = self.trade_fc(trade_state)
-        market_out = self.market_fc(market_state[:, -1])  # Use last timestep for market state too
+        market_out = self.market_fc(market_state)  
 
         x = torch.cat([trade_out, market_out], dim=-1)
-        x = x.unsqueeze(1)  # Add time dimension for GRU [batch_size, 1, feature_dim]
-
         state_h = torch.zeros(self.num_layers, batch_size, self.gru_hidden_dim, device=device)
         x, _ = self.gru(x, state_h)
         x = x[:, -1, :]  # Take last timestep output
-
+        position_out = position_out[:, -1, :]
         x = torch.cat([x, position_out, action], dim=-1)
         x = self.fusion_fc(x)
         
