@@ -38,7 +38,7 @@ void Strategy::quote(const double& mid_spread,
                      FixedVector<double, 20>& ask_prices) {
 
 	assert(mid_spread > -0.003 && mid_spread < 0.003);
-	assert(gamma > 0 && gamma < 1);
+	assert(gamma > 0 && gamma < 2);
 	assert(kappa > 0 && kappa < 210);
 	assert(annual_vol > 0 && annual_vol < 2);
 	assert(sec_horizon > 0 && sec_horizon < 3600);
@@ -63,15 +63,11 @@ void Strategy::quote(const double& mid_spread,
 	if (bid_price > bid_prices[0]) bid_price = bid_prices[0];
 	if (ask_price < ask_prices[0]) ask_price = ask_prices[0];
 
-	auto bid_size = instrument.getMinAmount();
-	auto ask_size = instrument.getMinAmount();
+	auto bid_size = instrument.getTradeAmount(0.01 * initBalance, bid_price);
+	auto ask_size = instrument.getTradeAmount(0.01 * initBalance, ask_price);
 
-	if (q_target > 0) {
-	    bid_size = instrument.getTradeAmount(std::abs(q_target) * initBalance, bid_price);
-	} else if (q_target < 0) {
-	    ask_size = instrument.getTradeAmount(std::abs(q_target) * initBalance, ask_price);
-	}
-
+	if (q_target > 0) bid_size *= 3;
+	if (q_target < 0) ask_size *= 3;
 	if (exchange.isDummy()) exchange.cancelOrders();
 	    
 	this->exchange.quote(std::to_string(++order_id), OrderSide::BUY, bid_price, bid_size);

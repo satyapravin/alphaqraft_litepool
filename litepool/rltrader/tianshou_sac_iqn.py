@@ -34,34 +34,32 @@ env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
     num_threads=num_of_envs, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
-    maker_fee=-0.00005, taker_fee=0.0005, foldername="./train_files/",
+    maker_fee=-0.0000, taker_fee=0.0005, foldername="./train_files/",
     balance=1.0, start=3601*10, max=64001*10
 )
 
 env.spec.id = 'RlTrader-v0'
 
 class VecNormalize:
-    def __init__(self, env, num_env, norm_obs=True, norm_reward=True, clip_obs=10., clip_reward=10., gamma=0.99, epsilon=1e-8):
+    def __init__(self, env, num_envs, norm_obs=True, norm_reward=True, clip_obs=10., clip_reward=10., gamma=0.99, epsilon=1e-8):
         self.env = env
+        self.num_envs = num_envs
         self.norm_obs = norm_obs
         self.norm_reward = norm_reward
         self.clip_obs = clip_obs
         self.clip_reward = clip_reward
-        self.epsilon = epsilon
         self.gamma = gamma
-        self.num_env = num_env
+        self.epsilon = epsilon
 
-        obs_shape = self.env.observation_space.shape
-        self.obs_rms = [RunningMeanStd(shape=obs_shape) for _ in range(self.num_env)]
-        self.ret_rms = [RunningMeanStd(shape=()) for _ in range(self.num_env)]
-        self.returns = np.zeros(self.num_env)
+        self.time_steps = 10
+        self.feature_dim = 242
+
+        self.obs_rms = RunningMeanStd(shape=(self.feature_dim,))
+        self.ret_rms = RunningMeanStd(shape=())
+        self.returns = torch.zeros(self.num_envs, device=device)
 
     def __len__(self):
-        return self.num_env
-
-    @property
-    def num_envs(self):
-        return self.num_env
+        return self.num_envs
 
     def close(self):
         return self.env.close()
@@ -82,98 +80,94 @@ class VecNormalize:
         return self.env.seed(seed)
 
     def normalize_obs(self, obs):
-        if self.norm_obs:
-            normed = []
-            for i in range(self.num_env):
-                mean = self.obs_rms[i].mean
-                var = self.obs_rms[i].var
-                normed_obs = (obs[i] - mean) / np.sqrt(var + self.epsilon)
-                normed.append(np.clip(normed_obs, -self.clip_obs, self.clip_obs))
-            return np.stack(normed)
-        return obs
+        if not self.norm_obs:
+            return obs
+
+        obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
+        batch_size = obs.shape[0]
+
+        # Reshape to [B, T, F]
+        obs = obs.view(batch_size, self.time_steps, self.feature_dim)
+        flat_obs = obs.view(-1, self.feature_dim)
+
+        self.obs_rms.update(flat_obs)
+        normed = (flat_obs - self.obs_rms.mean) / torch.sqrt(self.obs_rms.var + self.epsilon)
+        normed = torch.clamp(normed, -self.clip_obs, self.clip_obs)
+
+        normed = normed.view(batch_size, self.time_steps, self.feature_dim)
+        return normed.view(batch_size, -1)  # Flatten back to [B, 2420]
 
     def normalize_reward(self, reward):
-        if self.norm_reward:
-            normed = []
-            for i in range(self.num_env):
-                std = np.sqrt(self.ret_rms[i].var + self.epsilon)
-                normed_rew = reward[i] / std
-                normed.append(np.clip(normed_rew, -self.clip_reward, self.clip_reward))
-            return np.array(normed)
-        return reward
+        if not self.norm_reward:
+            return reward
+        reward = torch.as_tensor(reward, dtype=torch.float32, device=device)
+        self.ret_rms.update(self.returns)
+        normed = reward / torch.sqrt(self.ret_rms.var + self.epsilon)
+        return torch.clamp(normed, -self.clip_reward, self.clip_reward)
 
     def step(self, actions):
         obs, rews, terminateds, truncateds, infos = self.env.step(actions)
 
-        if self.norm_obs:
-            for i in range(self.num_env):
-                self.obs_rms[i].update(obs[i:i+1])
-            obs = self.normalize_obs(obs)
+        obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
+        rews = torch.as_tensor(rews, dtype=torch.float32, device=device)
 
-        if self.norm_reward:
-            self.returns = self.returns * self.gamma + rews
-            for i in range(self.num_env):
-                self.ret_rms[i].update(np.array([self.returns[i]]))
-            rews = self.normalize_reward(rews)
+        self.returns = self.returns * self.gamma + rews
 
-        dones = np.logical_or(terminateds, truncateds)
+        obs = self.normalize_obs(obs)
+        rews = self.normalize_reward(rews)
+
+        dones = torch.logical_or(torch.as_tensor(terminateds), torch.as_tensor(truncateds))
         self.returns[dones] = 0.0
 
-        return obs, rews, terminateds, truncateds, infos
+        return obs.cpu().numpy(), rews.cpu().numpy(), terminateds, truncateds, infos
 
     def reset(self, indices=None, **kwargs):
         if indices is None:
             obs, info = self.env.reset(**kwargs)
-            if self.norm_obs:
-                for i in range(self.num_env):
-                    self.obs_rms[i].update(obs[i:i+1])
-                    self.returns[i] = 0.0
-                obs = self.normalize_obs(obs)
         else:
-            obs, info = self.env.reset(indices, **kwargs)
-            if self.norm_obs:
-                for i in indices:
-                    self.obs_rms[i].update(obs[i:i+1])
-                    self.returns[i] = 0.0
-                obs = self.normalize_obs(obs)
+            for idx in indices:
+                obs, info = self.env.reset(idx, **kwargs)
 
-        return obs, info
+        obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
+        self.returns.zero_()
+        obs = self.normalize_obs(obs)
+        return obs.cpu().numpy(), info
 
     def __getattr__(self, name):
         return getattr(self.env, name)
 
 class RunningMeanStd:
     def __init__(self, shape=(), epsilon=1e-4):
-        self.mean = np.zeros(shape, dtype=np.float64)
-        self.var = np.ones(shape, dtype=np.float64)
-        self.count = epsilon
+        self.mean = torch.zeros(shape, dtype=torch.float32, device=device)
+        self.var = torch.ones(shape, dtype=torch.float32, device=device)
+        self.count = torch.tensor(epsilon, dtype=torch.float32, device=device)
 
-    def update(self, x):
-        batch_mean = np.mean(x, axis=0)
-        batch_var = np.var(x, axis=0)
+    def update(self, x: torch.Tensor):
+        batch_mean = x.mean(dim=0)
+        batch_var = x.var(dim=0, unbiased=False)
         batch_count = x.shape[0]
 
         delta = batch_mean - self.mean
-        tot_count = self.count + batch_count
+        total_count = self.count + batch_count
 
-        new_mean = self.mean + delta * batch_count / tot_count
+        new_mean = self.mean + delta * batch_count / total_count
         m_a = self.var * self.count
         m_b = batch_var * batch_count
-        M2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
-        new_var = M2 / tot_count
+        M2 = m_a + m_b + delta.pow(2) * self.count * batch_count / total_count
+        new_var = M2 / total_count
 
         self.mean = new_mean
         self.var = new_var
-        self.count = tot_count
+        self.count = total_count
 
 # Wrap environment with VecNormalize
 env = VecNormalize(
     env,
-    num_env=num_of_envs,
+    num_envs=num_of_envs,
     norm_obs=True,
     norm_reward=True,
-    clip_obs=1000000.,
-    clip_reward=10.,
+    clip_obs=10000000.,
+    clip_reward=1000.,
     gamma=0.99
 )
 
@@ -255,10 +249,6 @@ class CustomSACPolicy(SACPolicy):
         dist = Independent(Normal(loc, scale), 1)
         act = dist.rsample()
         log_prob = dist.log_prob(act)
-        print("loc shape:", loc.shape)          # Expected: [64, 6]
-        print("scale shape:", scale.shape)      # Expected: [64, 6]
-        print("act shape:", act.shape)          # Expected: [64, 6]
-        print("act std across envs:", act.std(dim=0))  # Should NOT be ~0
         # Apply tanh squashing
         act = torch.tanh(act)
         log_prob = log_prob - torch.sum(torch.log(1 - act.pow(2) + 1e-6), dim=-1)
