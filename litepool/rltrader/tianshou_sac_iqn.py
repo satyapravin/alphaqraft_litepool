@@ -50,8 +50,10 @@ class VecNormalize:
         self.epsilon = epsilon
         self.gamma = gamma
         self.num_env = num_env
-        self.obs_rms = RunningMeanStd(shape=self.env.observation_space.shape)
-        self.ret_rms = RunningMeanStd(shape=())
+
+        obs_shape = self.env.observation_space.shape
+        self.obs_rms = [RunningMeanStd(shape=obs_shape) for _ in range(self.num_env)]
+        self.ret_rms = [RunningMeanStd(shape=()) for _ in range(self.num_env)]
         self.returns = np.zeros(self.num_env)
 
     def __len__(self):
@@ -59,7 +61,7 @@ class VecNormalize:
 
     @property
     def num_envs(self):
-        return self.num_envs
+        return self.num_env
 
     def close(self):
         return self.env.close()
@@ -81,26 +83,37 @@ class VecNormalize:
 
     def normalize_obs(self, obs):
         if self.norm_obs:
-            obs = np.clip((obs - self.obs_rms.mean) / np.sqrt(self.obs_rms.var + self.epsilon),
-                         -self.clip_obs, self.clip_obs)
+            normed = []
+            for i in range(self.num_env):
+                mean = self.obs_rms[i].mean
+                var = self.obs_rms[i].var
+                normed_obs = (obs[i] - mean) / np.sqrt(var + self.epsilon)
+                normed.append(np.clip(normed_obs, -self.clip_obs, self.clip_obs))
+            return np.stack(normed)
         return obs
 
     def normalize_reward(self, reward):
         if self.norm_reward:
-            reward = np.clip(reward / np.sqrt(self.ret_rms.var + self.epsilon),
-                           -self.clip_reward, self.clip_reward)
+            normed = []
+            for i in range(self.num_env):
+                std = np.sqrt(self.ret_rms[i].var + self.epsilon)
+                normed_rew = reward[i] / std
+                normed.append(np.clip(normed_rew, -self.clip_reward, self.clip_reward))
+            return np.array(normed)
         return reward
 
     def step(self, actions):
         obs, rews, terminateds, truncateds, infos = self.env.step(actions)
 
         if self.norm_obs:
-            self.obs_rms.update(obs)
+            for i in range(self.num_env):
+                self.obs_rms[i].update(obs[i:i+1])
             obs = self.normalize_obs(obs)
 
         if self.norm_reward:
             self.returns = self.returns * self.gamma + rews
-            self.ret_rms.update(self.returns)
+            for i in range(self.num_env):
+                self.ret_rms[i].update(np.array([self.returns[i]]))
             rews = self.normalize_reward(rews)
 
         dones = np.logical_or(terminateds, truncateds)
@@ -108,20 +121,21 @@ class VecNormalize:
 
         return obs, rews, terminateds, truncateds, infos
 
-    
     def reset(self, indices=None, **kwargs):
         if indices is None:
             obs, info = self.env.reset(**kwargs)
+            if self.norm_obs:
+                for i in range(self.num_env):
+                    self.obs_rms[i].update(obs[i:i+1])
+                    self.returns[i] = 0.0
+                obs = self.normalize_obs(obs)
         else:
             obs, info = self.env.reset(indices, **kwargs)
-
-        if self.norm_obs:
-            self.obs_rms.update(obs)
-            if indices is None:
-                self.returns = np.zeros(self.num_env)
-            else:
-                self.returns[indices] = 0.0
-            obs = self.normalize_obs(obs)
+            if self.norm_obs:
+                for i in indices:
+                    self.obs_rms[i].update(obs[i:i+1])
+                    self.returns[i] = 0.0
+                obs = self.normalize_obs(obs)
 
         return obs, info
 
@@ -158,7 +172,7 @@ env = VecNormalize(
     num_env=num_of_envs,
     norm_obs=True,
     norm_reward=True,
-    clip_obs=10.,
+    clip_obs=1000000.,
     clip_reward=10.,
     gamma=0.99
 )
@@ -241,7 +255,10 @@ class CustomSACPolicy(SACPolicy):
         dist = Independent(Normal(loc, scale), 1)
         act = dist.rsample()
         log_prob = dist.log_prob(act)
-
+        print("loc shape:", loc.shape)          # Expected: [64, 6]
+        print("scale shape:", scale.shape)      # Expected: [64, 6]
+        print("act shape:", act.shape)          # Expected: [64, 6]
+        print("act std across envs:", act.std(dim=0))  # Should NOT be ~0
         # Apply tanh squashing
         act = torch.tanh(act)
         log_prob = log_prob - torch.sum(torch.log(1 - act.pow(2) + 1e-6), dim=-1)
