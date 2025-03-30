@@ -444,7 +444,6 @@ class RecurrentActor(nn.Module):
         if state.shape == (batch_size, self.num_layers, self.gru_hidden_dim):
             state = state.transpose(0, 1).contiguous()
 
-        x = x.unsqueeze(1)  # Add time dimension for GRU
         x, new_state = self.gru(x, state)
         x = x[:, -1, :]
         x = torch.cat([x, position_out], dim=-1)
