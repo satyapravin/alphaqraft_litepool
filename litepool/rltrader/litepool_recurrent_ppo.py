@@ -147,20 +147,39 @@ class CustomRecurrentPolicy(RecurrentActorCriticPolicy):
         return actions, values, log_prob, lstm_states_out
 
     def evaluate_actions(self, obs, actions, lstm_states, episode_starts):
-        features = self.extract_features(obs)
+        features = self.extract_features(obs)  # shape: (batch, time_steps, 32)
         batch_size = features.shape[0]
         
         # Handle lstm_states
         if lstm_states is None:
             hidden_state = torch.zeros(1, batch_size, self.hidden_state_size, device=features.device)
         else:
-            hidden_state = lstm_states.pi[0] if hasattr(lstm_states, 'pi') else lstm_states[0]
+            # Extract hidden state properly
+            if hasattr(lstm_states, 'pi'):
+                hidden_state = lstm_states.pi[0]
+            else:
+                hidden_state = lstm_states[0]
+                
             if isinstance(hidden_state, tuple):
                 hidden_state = hidden_state[0]
+                
+            # If hidden state is 1D, reshape it properly
+            if len(hidden_state.shape) == 1:
+                hidden_state = hidden_state.unsqueeze(0).unsqueeze(0)
+                hidden_state = hidden_state.expand(1, batch_size, self.hidden_state_size)
+            # If hidden state is 2D, add batch dimension
+            elif len(hidden_state.shape) == 2:
+                hidden_state = hidden_state.unsqueeze(0)
+                
+            # Ensure correct dimensions
+            if hidden_state.shape[1] != batch_size or hidden_state.shape[2] != self.hidden_state_size:
+                hidden_state = torch.zeros(1, batch_size, self.hidden_state_size, device=features.device)
 
-        # Handle episode_starts
+        # Handle episode_starts with correct broadcasting
         if episode_starts is not None:
-            episode_starts = episode_starts.to(features.device).float().view(1, -1, 1)
+            episode_starts = episode_starts.to(features.device)
+            if len(episode_starts.shape) == 1:
+                episode_starts = episode_starts.view(1, -1, 1)
             hidden_state = hidden_state * (1.0 - episode_starts)
         
         features, new_hidden = self.gru(features, hidden_state)
@@ -273,7 +292,7 @@ env = VecMonitor(env)
 model = RecurrentPPO(
     policy=CustomRecurrentPolicy,
     env=env,
-    learning_rate=1e-4,
+    learning_rate=2e-4,
     n_steps=512,
     batch_size=64,
     n_epochs=10,
