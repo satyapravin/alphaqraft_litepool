@@ -19,6 +19,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 time_steps = 10
 feature_dim = 242
 
+
 # -----------------------
 # Feature Extractor
 # -----------------------
@@ -53,7 +54,6 @@ class TradingFeatureExtractor(BaseFeaturesExtractor):
             nn.ReLU()
         )
 
-        # Final projection to ensure correct output dimension
         self.final_projection = nn.Linear(32, features_dim)
         self.output_dim = features_dim
 
@@ -62,156 +62,16 @@ class TradingFeatureExtractor(BaseFeaturesExtractor):
         obs = obs.view(batch_size, time_steps, feature_dim)
 
         market = obs[:, :, :self.market_dim]
-        position = obs[:, -1, self.market_dim:self.market_dim + self.position_dim]
+        position = obs[:, :, self.market_dim:self.market_dim + self.position_dim]
         trade = obs[:, :, self.market_dim + self.position_dim:]
 
-        trade_out = self.trade_fc(trade)  # [batch_size, time_steps, 8]
-        market_out = self.market_fc(market)  # [batch_size, time_steps, 16]
-        position_out = self.position_fc(position).unsqueeze(1).expand(-1, time_steps, -1)  # [batch_size, time_steps, 8]
+        trade_out = self.trade_fc(trade)
+        market_out = self.market_fc(market)
+        position_out = self.position_fc(position)
 
-        # Concatenate all features
-        x = torch.cat([market_out, trade_out, position_out], dim=-1)  # [batch_size, time_steps, 32]
-        x = self.final_projection(x)  # [batch_size, time_steps, features_dim]
+        x = torch.cat([market_out, trade_out, position_out], dim=-1)
+        x = self.final_projection(x)
         return x
-
-# -----------------------
-# Custom Recurrent Policy
-# -----------------------
-from dataclasses import dataclass
-
-@dataclass
-class SimpleLSTMStates:
-    pi: tuple
-    vf: tuple
-
-class CustomRecurrentPolicy(RecurrentActorCriticPolicy):
-    def __init__(self, *args, **kwargs):
-        super().__init__(
-            *args,
-            **kwargs,
-            features_extractor_class=TradingFeatureExtractor,
-            features_extractor_kwargs={"features_dim": 32},
-        )
-
-        self.hidden_state_size = 256  # Changed to match the actual size being used
-        self.gru = nn.GRU(input_size=32, hidden_size=self.hidden_state_size, batch_first=True)
-        self.mlp = nn.Sequential(
-            nn.Linear(self.hidden_state_size, 64),
-            nn.ReLU()
-        )
-
-        self.action_net = nn.Linear(64, self.action_space.shape[0])
-        self.value_net = nn.Linear(64, 1)
-
-    def forward(self, obs, lstm_states, episode_starts, deterministic=False):
-        features = self.extract_features(obs)  # shape: (batch, time_steps, 32)
-        batch_size = features.shape[0]
-
-        # Handle lstm_states with proper dimensionality
-        if lstm_states is None:
-            hidden_state = torch.zeros(1, batch_size, self.hidden_state_size, device=features.device)
-        else:
-            # Extract hidden state from the SimpleLSTMStates object
-            hidden_state = lstm_states.pi[0] if hasattr(lstm_states, 'pi') else lstm_states[0]
-            if isinstance(hidden_state, tuple):
-                hidden_state = hidden_state[0]
-            
-            if hidden_state is None:
-                hidden_state = torch.zeros(1, batch_size, self.hidden_state_size, device=features.device)
-            
-
-        # Ensure episode_starts has the correct shape for broadcasting
-        episode_starts = episode_starts.to(features.device).float().view(1, -1, 1)
-        
-        # Reset hidden states where episode starts
-        hidden_state = hidden_state * (1.0 - episode_starts)
-
-        # Pass through GRU
-        features, new_hidden = self.gru(features, hidden_state)
-
-        # Use last time step
-        x = features[:, -1, :]
-        x = self.mlp(x)
-
-        distribution = self._get_action_dist_from_latent(x)
-        actions = distribution.get_actions(deterministic=deterministic)
-        log_prob = distribution.log_prob(actions)
-        values = self.value_net(x)
-
-        # Create output states
-        mask = torch.ones_like(values)
-        lstm_states_out = SimpleLSTMStates(
-            pi=(new_hidden, mask),
-            vf=(new_hidden, mask)
-        )
-        return actions, values, log_prob, lstm_states_out
-
-    def evaluate_actions(self, obs, actions, lstm_states, episode_starts):
-        features = self.extract_features(obs)  # shape: (batch, time_steps, 32)
-        batch_size = features.shape[0]
-        
-        # Handle lstm_states
-        if lstm_states is None:
-            hidden_state = torch.zeros(1, batch_size, self.hidden_state_size, device=features.device)
-        else:
-            # Extract hidden state properly
-            if hasattr(lstm_states, 'pi'):
-                hidden_state = lstm_states.pi[0]
-            else:
-                hidden_state = lstm_states[0]
-                
-            if isinstance(hidden_state, tuple):
-                hidden_state = hidden_state[0]
-                
-            # If hidden state is 1D, reshape it properly
-            if len(hidden_state.shape) == 1:
-                hidden_state = hidden_state.unsqueeze(0).unsqueeze(0)
-                hidden_state = hidden_state.expand(1, batch_size, self.hidden_state_size)
-            # If hidden state is 2D, add batch dimension
-            elif len(hidden_state.shape) == 2:
-                hidden_state = hidden_state.unsqueeze(0)
-                
-            # Ensure correct dimensions
-            if hidden_state.shape[1] != batch_size or hidden_state.shape[2] != self.hidden_state_size:
-                hidden_state = torch.zeros(1, batch_size, self.hidden_state_size, device=features.device)
-
-        # Handle episode_starts with correct broadcasting
-        if episode_starts is not None:
-            episode_starts = episode_starts.to(features.device)
-            if len(episode_starts.shape) == 1:
-                episode_starts = episode_starts.view(1, -1, 1)
-            hidden_state = hidden_state * (1.0 - episode_starts)
-        
-        features, new_hidden = self.gru(features, hidden_state)
-        x = features[:, -1, :]
-        x = self.mlp(x)
-
-        distribution = self._get_action_dist_from_latent(x)
-        log_prob = distribution.log_prob(actions)
-        entropy = distribution.entropy()
-        values = self.value_net(x)
-
-        return values, log_prob, entropy
-
-    def predict_values(self, obs, lstm_states=None, episode_starts=None):
-        features = self.extract_features(obs)
-        batch_size = features.shape[0]
-
-        if lstm_states is None:
-            hidden_state = torch.zeros(1, batch_size, self.hidden_state_size, 
-                                     device=features.device)
-        else:
-            hidden_state = lstm_states[0]
-            if isinstance(hidden_state, tuple):
-                hidden_state = hidden_state[0]
-            hidden_state = hidden_state.reshape(1, batch_size, self.hidden_state_size)
-
-        features, _ = self.gru(features, hidden_state)
-        x = features[:, -1, :]
-        x = self.mlp(x)
-        values = self.value_net(x)
-
-        return values
 
 # -----------------------
 # LitePool VecAdapter
@@ -279,7 +139,7 @@ env = litepool.make("RlTrader-v0", env_type="gymnasium",
     tick_size=0.5, min_amount=10,
     maker_fee=-0.00001, taker_fee=0.0005,
     foldername="./train_files/",
-    balance=1.0, start=1, max=3601 * 10)
+    balance=1.0, start=36000*10, max=7201* 10)
 
 env.spec.id = 'RlTrader-v0'
 env = VecAdapter(env)
@@ -290,18 +150,24 @@ env = VecMonitor(env)
 # Create RecurrentPPO Model
 # -----------------------
 model = RecurrentPPO(
-    policy=CustomRecurrentPolicy,
+    policy="MlpLstmPolicy",
+    policy_kwargs={
+        "features_extractor_class": TradingFeatureExtractor,
+        "features_extractor_kwargs": {"features_dim": 64},
+    },
     env=env,
     learning_rate=2e-4,
-    n_steps=512,
-    batch_size=64,
+    n_steps=2048,          
+    batch_size=256,       
     n_epochs=10,
-    gamma=0.95,
+    gamma=0.99,          
     gae_lambda=0.95,
     clip_range=0.2,
     ent_coef=0.01,
+    vf_coef=0.5,        
+    max_grad_norm=0.5, 
     device=device,
-    verbose=1,
+    verbose=1
 )
 
 # -----------------------
@@ -315,5 +181,9 @@ if os.path.exists("recurrent_ppo_rltrader.zip"):
 # Training Loop
 # -----------------------
 for i in range(500):
-    model.learn(total_timesteps=36005 * 64)
+    model.learn(
+        total_timesteps=36005 * 64,
+        reset_num_timesteps=False,
+        progress_bar=True
+    )
     model.save("recurrent_ppo_rltrader")
