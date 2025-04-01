@@ -16,8 +16,10 @@ import litepool
 from litepool.python.protocol import LitePool
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 time_steps = 10
 feature_dim = 242
+
 
 class TradingFeatureExtractor(BaseFeaturesExtractor):
     def __init__(self, observation_space: spaces.Box, features_dim: int = 32, num_envs: int = 32):
@@ -83,14 +85,10 @@ class TradingFeatureExtractor(BaseFeaturesExtractor):
 
     def forward(self, obs: torch.Tensor, env_indices=None, dones=None) -> torch.Tensor:
         device = obs.device
-        
-        # Handle different input shapes
-        if len(obs.shape) == 3:  # (batch_size, seq_len, feature_dim)
-            batch_size, seq_len, _ = obs.shape
-            # Take only the last timestep
-            obs = obs[:, -1, :]
-        else:  # (batch_size, feature_dim)
-            batch_size = obs.shape[0]
+        batch_size = obs.shape[0] 
+        print(batch_size) 
+        # Reshape (batch_size, time_steps * feature_dim) -> (batch_size, time_steps, feature_dim)
+        obs = obs.view(batch_size, time_steps, feature_dim)
         
         # Move hidden states to the correct device
         if self.hidden_states[0].device != device:
@@ -105,10 +103,13 @@ class TradingFeatureExtractor(BaseFeaturesExtractor):
             if len(done_indices) > 0:
                 self.reset_hidden_states(done_indices)
 
+        # Process each timestep
+        obs_reshaped = obs.view(-1, feature_dim)  # (batch_size * time_steps, feature_dim)
+
         # Split features
-        market = obs[:, :self.market_dim]
-        position = obs[:, self.market_dim:self.market_dim + self.position_dim]
-        trade = obs[:, self.market_dim + self.position_dim:]
+        market = obs_reshaped[:, :self.market_dim]
+        position = obs_reshaped[:, self.market_dim:self.market_dim + self.position_dim]
+        trade = obs_reshaped[:, self.market_dim + self.position_dim:]
 
         # Process features
         trade_out = self.trade_fc(trade)
@@ -118,8 +119,8 @@ class TradingFeatureExtractor(BaseFeaturesExtractor):
         # Combine features
         combined = torch.cat([market_out, trade_out, position_out], dim=-1)
         
-        # Add sequence dimension for LSTM
-        combined = combined.unsqueeze(1)  # (batch_size, 1, hidden_dim)
+        # Reshape back to sequence form for LSTM
+        combined = combined.view(batch_size, time_steps, -1)  # (batch_size, time_steps, hidden_dim)
 
         # Get relevant hidden states
         if env_indices is not None:
@@ -129,18 +130,18 @@ class TradingFeatureExtractor(BaseFeaturesExtractor):
         else:
             hidden_states = self.hidden_states
 
-        # Process through LSTM and immediately detach the new hidden states
+        # Process through LSTM
         lstm_out, (h_n, c_n) = self.lstm(combined, hidden_states)
         
-        # Always detach the hidden states after each forward pass
+        # Update hidden states
         if env_indices is not None:
             self.hidden_states[0][:, env_indices] = h_n.detach()
             self.hidden_states[1][:, env_indices] = c_n.detach()
         else:
             self.hidden_states = (h_n.detach(), c_n.detach())
 
-        # Remove sequence dimension and apply final linear layer
-        output = self.final_linear(lstm_out.squeeze(1))
+        # Take the last timestep's output
+        output = self.final_linear(lstm_out[:, -1])
 
         return output
 
@@ -151,61 +152,109 @@ class VecAdapter(VecEnvWrapper):
         super().__init__(venv=venv)
         self.steps = 0
         self.action_env_ids = np.arange(self.venv.num_envs, dtype=np.int32)
-
-        # Observation space should be for a single timestep
-        high = np.inf * np.ones(feature_dim)
-        low = -high
-        self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
+        self.last_actions = None
 
     def reset(self):
         self.steps = 0
-        obs = self.venv.reset(self.action_env_ids)[0]
-        # Take only the last timestep from each environment
-        return obs.reshape(self.num_envs, time_steps, feature_dim)[:, -1, :]
+        try:
+            obs = self.venv.reset(self.action_env_ids)[0]
+            if obs is None or obs.size == 0:
+                print("Warning: Received empty observation in reset")
+                # Return zero observation if empty
+                obs = np.zeros((self.num_envs, time_steps * feature_dim))
+            return obs
+        except Exception as e:
+            print(f"Error in reset: {e}")
+            # Return zero observation on error
+            return np.zeros((self.num_envs, time_steps * feature_dim))
+
+    def step_async(self, actions):
+        self.last_actions = actions
+        try:
+            self.venv.step(actions)
+        except Exception as e:
+            print(f"Error in step_async: {e}")
 
     def step_wait(self):
-        obs, rewards, terms, truncs, info_dict = self.venv.recv()
+        try:
+            obs, rewards, terms, truncs, info_dict = self.venv.recv()
 
-        # Take only the last timestep from each environment
-        obs = obs.reshape(self.num_envs, time_steps, feature_dim)[:, -1, :]
+            # Handle empty/invalid observations
+            if obs is None or obs.size == 0:
+                print("Warning: Received empty observation in step_wait")
+                obs = np.zeros((self.num_envs, time_steps * feature_dim))
+                rewards = np.zeros(self.num_envs)
+                terms = np.zeros(self.num_envs, dtype=bool)
+                truncs = np.zeros(self.num_envs, dtype=bool)
+
+            # Ensure rewards has correct shape
+            if not isinstance(rewards, np.ndarray):
+                rewards = np.array(rewards)
+            if rewards.shape != (self.num_envs,):
+                rewards = np.zeros(self.num_envs)
+
+            # Ensure terms and truncs have correct shape
+            if not isinstance(terms, np.ndarray):
+                terms = np.array(terms)
+            if not isinstance(truncs, np.ndarray):
+                truncs = np.array(truncs)
+
+            # Reshape terms and truncs if needed
+            if terms.shape != (self.num_envs,):
+                terms = np.zeros(self.num_envs, dtype=bool)
+            if truncs.shape != (self.num_envs,):
+                truncs = np.zeros(self.num_envs, dtype=bool)
+
+            # Combine terms and truncs into dones
+            dones = np.logical_or(terms, truncs)
+
+        except Exception as e:
+            print(f"Error in step_wait: {e}")
+            # Return zero values on error
+            obs = np.zeros((self.num_envs, time_steps * feature_dim))
+            rewards = np.zeros(self.num_envs)
+            dones = np.zeros(self.num_envs, dtype=bool)
+            info_dict = {"env_id": np.arange(self.num_envs)}
 
         if (np.isnan(obs).any() or np.isinf(obs).any()):
             print("NaN in OBS...................")
+            obs = np.nan_to_num(obs, 0)
 
         if (np.isnan(rewards).any() or np.isinf(rewards).any()):
             print("NaN in REWARDS...................")
             print(rewards)
+            rewards = np.nan_to_num(rewards, 0)
 
-        dones = terms + truncs
         infos = []
-
-        for i in range(len(info_dict["env_id"])):
-            info = {
-                key: info_dict[key][i]
-                for key in info_dict.keys()
-                if isinstance(info_dict[key], np.ndarray)
-            }
+        for i in range(self.num_envs):
+            info = {}
+            if "env_id" in info_dict:
+                for key in info_dict.keys():
+                    if isinstance(info_dict[key], np.ndarray):
+                        info[key] = info_dict[key][i] if i < len(info_dict[key]) else 0
 
             if self.steps % 50 == 0 or dones[i]:
                 print("id:{0}, steps:{1}, fees:{2:.8f}, balance:{3:.6f}, unreal:{4:.8f}, real:{5:.8f}, drawdown:{6:.8f}, leverage:{7:.4f}, count:{8}".format(
-                    info["env_id"], self.steps, info['fees'],
-                    info['balance'] - info['fees'] + info['unrealized_pnl'],
-                    info['unrealized_pnl'], info['realized_pnl'],
-                    info['drawdown'], info['leverage'], info['trade_count']
+                    info.get("env_id", i), self.steps, info.get('fees', 0),
+                    info.get('balance', 0) - info.get('fees', 0) + info.get('unrealized_pnl', 0),
+                    info.get('unrealized_pnl', 0), info.get('realized_pnl', 0),
+                    info.get('drawdown', 0), info.get('leverage', 0), info.get('trade_count', 0)
                 ))
 
             if dones[i]:
                 info["terminal_observation"] = obs[i]
-                reset_obs = self.venv.reset(np.array([i]))[0]
-                obs[i] = reset_obs.reshape(time_steps, feature_dim)[-1]
+                try:
+                    reset_obs = self.venv.reset(np.array([i]))[0]
+                    obs[i] = reset_obs[0] if reset_obs is not None else np.zeros(time_steps * feature_dim)
+                except Exception as e:
+                    print(f"Error in reset during step_wait for env {i}: {e}")
+                    obs[i] = np.zeros(time_steps * feature_dim)
 
             infos.append(info)
 
         self.steps += 1
         return obs, rewards, dones, infos
-# -----------------------
-# Create and Wrap Env
-# -----------------------
+
 num_envs = 64
 env = litepool.make("RlTrader-v0", env_type="gymnasium",
     num_envs=num_envs, batch_size=num_envs,
