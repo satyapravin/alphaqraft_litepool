@@ -19,16 +19,15 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 time_steps = 10
 feature_dim = 242
 
-
-# -----------------------
-# Feature Extractor
-# -----------------------
 class TradingFeatureExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: spaces.Box, features_dim: int = 32):
+    def __init__(self, observation_space: spaces.Box, features_dim: int = 32, num_envs: int = 32):
         super().__init__(observation_space, features_dim)
         self.position_dim = 18
         self.trade_dim = 6
         self.market_dim = feature_dim - (18 + 6)
+        self.hidden_dim = 32
+        self.num_envs = num_envs
+        self.num_layers = 1
 
         self.position_fc = nn.Sequential(
             nn.Linear(self.position_dim, 32),
@@ -54,28 +53,98 @@ class TradingFeatureExtractor(BaseFeaturesExtractor):
             nn.ReLU()
         )
 
-        self.final_projection = nn.Linear(32, features_dim)
+        self.lstm = nn.LSTM(
+            input_size=32,
+            hidden_size=self.hidden_dim,
+            num_layers=self.num_layers,
+            batch_first=True
+        )
+        
+        self.final_linear = nn.Linear(self.hidden_dim, features_dim)
         self.output_dim = features_dim
+        
+        # Initialize hidden states
+        self.reset_all_hidden_states()
 
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        batch_size = obs.shape[0]
-        obs = obs.view(batch_size, time_steps, feature_dim)
+    def reset_hidden_states(self, env_indices):
+        """Reset hidden states for specific environments"""
+        device = next(self.parameters()).device
+        for idx in env_indices:
+            self.hidden_states[0][:, idx] = torch.zeros(self.num_layers, self.hidden_dim, device=device)
+            self.hidden_states[1][:, idx] = torch.zeros(self.num_layers, self.hidden_dim, device=device)
 
-        market = obs[:, :, :self.market_dim]
-        position = obs[:, :, self.market_dim:self.market_dim + self.position_dim]
-        trade = obs[:, :, self.market_dim + self.position_dim:]
+    def reset_all_hidden_states(self):
+        """Reset all hidden states"""
+        device = next(self.parameters()).device
+        self.hidden_states = (
+            torch.zeros(self.num_layers, self.num_envs, self.hidden_dim, device=device),
+            torch.zeros(self.num_layers, self.num_envs, self.hidden_dim, device=device)
+        )
 
+    def forward(self, obs: torch.Tensor, env_indices=None, dones=None) -> torch.Tensor:
+        device = obs.device
+        
+        # Handle different input shapes
+        if len(obs.shape) == 3:  # (batch_size, seq_len, feature_dim)
+            batch_size, seq_len, _ = obs.shape
+            # Take only the last timestep
+            obs = obs[:, -1, :]
+        else:  # (batch_size, feature_dim)
+            batch_size = obs.shape[0]
+        
+        # Move hidden states to the correct device
+        if self.hidden_states[0].device != device:
+            self.hidden_states = (
+                self.hidden_states[0].to(device),
+                self.hidden_states[1].to(device)
+            )
+
+        # Reset hidden states for done episodes
+        if dones is not None:
+            done_indices = torch.where(dones)[0]
+            if len(done_indices) > 0:
+                self.reset_hidden_states(done_indices)
+
+        # Split features
+        market = obs[:, :self.market_dim]
+        position = obs[:, self.market_dim:self.market_dim + self.position_dim]
+        trade = obs[:, self.market_dim + self.position_dim:]
+
+        # Process features
         trade_out = self.trade_fc(trade)
         market_out = self.market_fc(market)
         position_out = self.position_fc(position)
 
-        x = torch.cat([market_out, trade_out, position_out], dim=-1)
-        x = self.final_projection(x)
-        return x
+        # Combine features
+        combined = torch.cat([market_out, trade_out, position_out], dim=-1)
+        
+        # Add sequence dimension for LSTM
+        combined = combined.unsqueeze(1)  # (batch_size, 1, hidden_dim)
 
-# -----------------------
-# LitePool VecAdapter
-# -----------------------
+        # Get relevant hidden states
+        if env_indices is not None:
+            h0 = self.hidden_states[0][:, env_indices]
+            c0 = self.hidden_states[1][:, env_indices]
+            hidden_states = (h0, c0)
+        else:
+            hidden_states = self.hidden_states
+
+        # Process through LSTM and immediately detach the new hidden states
+        lstm_out, (h_n, c_n) = self.lstm(combined, hidden_states)
+        
+        # Always detach the hidden states after each forward pass
+        if env_indices is not None:
+            self.hidden_states[0][:, env_indices] = h_n.detach()
+            self.hidden_states[1][:, env_indices] = c_n.detach()
+        else:
+            self.hidden_states = (h_n.detach(), c_n.detach())
+
+        # Remove sequence dimension and apply final linear layer
+        output = self.final_linear(lstm_out.squeeze(1))
+
+        return output
+
+
 class VecAdapter(VecEnvWrapper):
     def __init__(self, venv: LitePool):
         venv.num_envs = venv.spec.config.num_envs
@@ -83,17 +152,23 @@ class VecAdapter(VecEnvWrapper):
         self.steps = 0
         self.action_env_ids = np.arange(self.venv.num_envs, dtype=np.int32)
 
-    def step_async(self, actions: np.ndarray) -> None:
-        self.actions = actions
-        self.venv.send(self.actions, self.action_env_ids)
+        # Observation space should be for a single timestep
+        high = np.inf * np.ones(feature_dim)
+        low = -high
+        self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
     def reset(self):
         self.steps = 0
-        return self.venv.reset(self.action_env_ids)[0]
+        obs = self.venv.reset(self.action_env_ids)[0]
+        # Take only the last timestep from each environment
+        return obs.reshape(self.num_envs, time_steps, feature_dim)[:, -1, :]
 
     def step_wait(self):
         obs, rewards, terms, truncs, info_dict = self.venv.recv()
-        
+
+        # Take only the last timestep from each environment
+        obs = obs.reshape(self.num_envs, time_steps, feature_dim)[:, -1, :]
+
         if (np.isnan(obs).any() or np.isinf(obs).any()):
             print("NaN in OBS...................")
 
@@ -121,19 +196,20 @@ class VecAdapter(VecEnvWrapper):
 
             if dones[i]:
                 info["terminal_observation"] = obs[i]
-                obs[i] = self.venv.reset(np.array([i]))[0]
+                reset_obs = self.venv.reset(np.array([i]))[0]
+                obs[i] = reset_obs.reshape(time_steps, feature_dim)[-1]
 
             infos.append(info)
 
         self.steps += 1
         return obs, rewards, dones, infos
-
 # -----------------------
 # Create and Wrap Env
 # -----------------------
+num_envs = 64
 env = litepool.make("RlTrader-v0", env_type="gymnasium",
-    num_envs=32, batch_size=32,
-    num_threads=32, is_prod=False,
+    num_envs=num_envs, batch_size=num_envs,
+    num_threads=num_envs, is_prod=False,
     is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL",
     tick_size=0.5, min_amount=10,
@@ -153,7 +229,12 @@ model = RecurrentPPO(
     policy="MlpLstmPolicy",
     policy_kwargs={
         "features_extractor_class": TradingFeatureExtractor,
-        "features_extractor_kwargs": {"features_dim": 64},
+        "features_extractor_kwargs": {
+            "features_dim": 64,
+            "num_envs": num_envs  
+        },
+        "lstm_hidden_size": 64,
+        "n_lstm_layers": 1,
     },
     env=env,
     learning_rate=2e-4,
@@ -169,7 +250,6 @@ model = RecurrentPPO(
     device=device,
     verbose=1
 )
-
 # -----------------------
 # Load Previous Model if Exists
 # -----------------------
