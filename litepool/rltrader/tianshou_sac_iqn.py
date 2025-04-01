@@ -34,8 +34,8 @@ env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
     num_threads=num_of_envs, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
-    maker_fee=-0.0000, taker_fee=0.0005, foldername="./train_files/",
-    balance=1.0, start=3601*10, max=64001*10
+    maker_fee=-0.0001, taker_fee=0.0005, foldername="./train_files/",
+    balance=1.0, start=3601*10, max=64000*10
 )
 
 env.spec.id = 'RlTrader-v0'
@@ -122,12 +122,7 @@ class VecNormalize:
         return obs.cpu().numpy(), rews.cpu().numpy(), terminateds, truncateds, infos
 
     def reset(self, indices=None, **kwargs):
-        if indices is None:
-            obs, info = self.env.reset(**kwargs)
-        else:
-            for idx in indices:
-                obs, info = self.env.reset(idx, **kwargs)
-
+        obs, info = self.env.reset(**kwargs)
         obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
         self.returns.zero_()
         obs = self.normalize_obs(obs)
@@ -229,11 +224,11 @@ class CustomSACPolicy(SACPolicy):
         self.target_entropy = -np.prod(action_space.shape).item()
 
         # Optimizer for alpha (no log transformation)
-        self.alpha_optim = torch.optim.Adam([self.alpha], lr=1e-4)
+        self.alpha_optim = torch.optim.Adam([self.alpha], lr=1e-3)
 
         # Learning rate scheduler for alpha
         self.alpha_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.alpha_optim, T_max=1000000, eta_min=1e-5
+            self.alpha_optim, T_max=1000000, eta_min=1e-3
         )
 
         self.critic_target = copy.deepcopy(critic)
@@ -383,7 +378,7 @@ class CustomSACPolicy(SACPolicy):
 # ---------------------------
 
 class RecurrentActor(nn.Module):
-    def __init__(self, state_dim=2420, action_dim=6, hidden_dim=64, gru_hidden_dim=128, num_layers=2):
+    def __init__(self, state_dim=2420, action_dim=3, hidden_dim=64, gru_hidden_dim=128, num_layers=2):
         super().__init__()
         self.gru_hidden_dim = gru_hidden_dim
         self.num_layers = num_layers
@@ -473,7 +468,7 @@ class RecurrentActor(nn.Module):
 
 
 class IQNCritic(nn.Module):
-    def __init__(self, state_dim=2420, action_dim=6, hidden_dim=128, num_quantiles=64, gru_hidden_dim=128, num_layers=2):
+    def __init__(self, state_dim=2420, action_dim=3, hidden_dim=128, num_quantiles=64, gru_hidden_dim=128, num_layers=2):
         super().__init__()
         self.num_quantiles = num_quantiles
         self.num_layers = num_layers
@@ -953,12 +948,12 @@ results_dir.mkdir(exist_ok=True)
 # Initialize models and optimizers
 actor = RecurrentActor().to(device)
 critic = IQNCritic().to(device)
-critic_optim = Adam(critic.parameters(), lr=1e-4)
+critic_optim = Adam(critic.parameters(), lr=1e-3)
 
 policy = CustomSACPolicy(
     actor=actor,
     critic=critic,
-    actor_optim=Adam(actor.parameters(), lr=3e-4),
+    actor_optim=Adam(actor.parameters(), lr=1e-3),
     critic_optim=critic_optim,
     tau=0.005, gamma=0.95, alpha=2.0,
     action_space=env_action_space

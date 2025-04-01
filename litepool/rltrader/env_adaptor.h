@@ -11,15 +11,14 @@ public:
     EnvAdaptor(Strategy& strat, BaseExchange& exch);
     ~EnvAdaptor()  = default;
     
-    void quote(const double& mid_spread, const double& gamma, const double& kappa, 
-	       const double& annual_vol, const double& sec_horizon, const double& target_q);
+    void quote(const double& mid_spread, const double& skew_multiplier, const double& target_q);
 
     void reset() ;
     bool next() ;
     void getInfo(std::unordered_map<std::string, double>& info) ;
     void getState(std::array<double, 242*10>& state) ;
 private:;
-    void computeState(OrderBook& book);
+    void computeState(size_t ii, OrderBook& book);
     void computeInfo(OrderBook& book);
     Strategy& strategy;
     BaseExchange& exchange;

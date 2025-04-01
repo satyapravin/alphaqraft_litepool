@@ -73,8 +73,8 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) ActionSpec(const Config& conf) {
-    return MakeDict("action"_.Bind(Spec<float>({6}, {{-1., -1., -1., -1., -1., -1.},
-				                     { 1.,  1.,  1.,  1.,  1.,  1.}})));
+    return MakeDict("action"_.Bind(Spec<float>({3}, {{-1., -1., -1.},
+				                     { 1.,  1.,  1.}})));
   }
 };
 
@@ -158,24 +158,10 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
 
   void Step(const Action& action_dict) override { 
       double mid_spread = static_cast<double>(action_dict["action"_][0]);
-      double gamma = static_cast<double>(action_dict["action"_][1]);
-      double kappa = static_cast<double>(action_dict["action"_][2]);
-      double annual_vol = static_cast<double>(action_dict["action"_][3]);
-      double horizon_in_sec = static_cast<double>(action_dict["action"_][4]);
-      double target_q = static_cast<double>(action_dict["action"_][5]);
-
-      assert(gamma >= -1.00 && gamma <= 1.0);
-      mid_spread *= 0.002;                  // -1 to +1 * 20 bps
-      gamma += 1.01;                         // -1 to +1 into 0.01 to 2.01 
-      gamma /= 2;                           // 0.005 to 1.005
-      kappa = (kappa + 1.01) * 100.0;       // -1 to +1 to 1 to 201
-      annual_vol += 1.01;                   // -1 to +1 to 0.01 to 2.01
-      annual_vol /= 2;                      // 0.005 to 1.005
-      horizon_in_sec += 1.01;               // -1 to +1 to 0.01 to 2.01
-      horizon_in_sec *= 600;                // multiplied by 600 seconds
+      double skew_multiplier = static_cast<double>(action_dict["action"_][1]);
+      double target_q = static_cast<double>(action_dict["action"_][2]);
      
-      //std::cout << mid_spread << " " <<  gamma << " " <<  kappa << " " <<  annual_vol << " " <<  horizon_in_sec << " " <<  target_q << std::endl; 
-      adaptor_ptr->quote(mid_spread, gamma, kappa, annual_vol, horizon_in_sec, target_q);
+      adaptor_ptr->quote(mid_spread, skew_multiplier, target_q);
       isDone = !adaptor_ptr->next();
       ++steps;
       WriteState();
@@ -208,9 +194,8 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
 	pnls.pop_front();
     }
 
-    state["reward"_] = current_reward - previous_reward;
+    state["reward"_] = (current_reward - previous_reward) * 10000;
     pnls.push_back(current_reward);
-
     state["obs"_].Assign(data.begin(), data.size());
   }
 

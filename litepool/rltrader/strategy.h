@@ -14,10 +14,7 @@ namespace RLTrader {
 		void reset();
 
 		void quote(const double& mid_spread,
-			   const double& gamma,
-			   const double& kappa,
-			   const double& annual_vol,
-			   const double& sec_horizon,
+			   const double& skew_multiplier,
 			   const double& target_q,
 		           FixedVector<double, 20>& bid_prices, 
 			   FixedVector<double, 20>& ask_prices);

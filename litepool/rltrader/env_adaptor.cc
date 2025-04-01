@@ -21,7 +21,7 @@ bool EnvAdaptor::next() {
         size_t read_slot;
         if(this->exchange.next_read(read_slot, book)) {
             this->strategy.next();
-            computeState(book);
+            computeState(ii, book);
 
             std::copy(book.bid_prices.begin(), book.bid_prices.end(), bid_prices.begin());
             std::copy(book.ask_prices.begin(), book.ask_prices.end(), ask_prices.begin());
@@ -40,9 +40,8 @@ void EnvAdaptor::getState(std::array<double, 242*10>& st) {
     st = state;
 }
 
-void EnvAdaptor::quote(const double& mid_spread, const double& gamma, const double& kappa,
-		       const double& annual_vol, const double& sec_horizon, const double& target_q) {
-    this->strategy.quote(mid_spread, gamma, kappa, annual_vol, sec_horizon, target_q, bid_prices, ask_prices);
+void EnvAdaptor::quote(const double& mid_spread, const double& skew_multiplier, const double& target_q) {
+    this->strategy.quote(mid_spread, skew_multiplier, target_q, bid_prices, ask_prices);
 }
 
 void EnvAdaptor::reset() {
@@ -87,7 +86,7 @@ void EnvAdaptor::computeInfo(OrderBook &book) {
 }
 
 
-void EnvAdaptor::computeState(OrderBook& book)
+void EnvAdaptor::computeState(size_t ii, OrderBook& book)
 {
     auto bid_price = book.bid_prices[0];
     auto ask_price = book.ask_prices[0];
@@ -98,9 +97,9 @@ void EnvAdaptor::computeState(OrderBook& book)
     auto position_signals = position_builder->add_info(position_info, bid_price, ask_price);
     TradeInfo trade_info = strategy.getPosition().getTradeInfo();
     auto trade_signals = trade_builder->add_trade(trade_info, bid_price, ask_price);
-    
-    std::copy_n(state.begin(), market_signals.size(), market_signals.begin());
-    std::copy_n(state.begin() + market_signals.size(), position_signals.size(), position_signals.begin());
-    std::copy_n(state.begin() + market_signals.size() + position_signals.size(), trade_signals.size(), market_signals.begin());
+    size_t state_begin = ii * 242;
+    std::copy_n(market_signals.begin(), market_signals.size(), state.begin() + state_begin);
+    std::copy_n(position_signals.begin(), position_signals.size(), state.begin() + state_begin + market_signals.size());
+    std::copy_n(trade_signals.begin(), trade_signals.size(), state.begin() + state_begin + market_signals.size() + position_signals.size());
     computeInfo(book);
 }
