@@ -200,9 +200,9 @@ env = litepool.make("RlTrader-v0", env_type="gymnasium",
     is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL",
     tick_size=0.5, min_amount=10,
-    maker_fee=-0.00001, taker_fee=0.0005,
+    maker_fee=-0.0001, taker_fee=0.0005,
     foldername="./train_files/",
-    balance=1.0, start=36000*10, max=7201* 10)
+    balance=1.0, start=36000*10, max=7201*30)
 
 env.spec.id = 'RlTrader-v0'
 venv = VecAdapter(env)

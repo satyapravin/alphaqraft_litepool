@@ -34,7 +34,7 @@ env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
     num_threads=num_of_envs, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
-    maker_fee=-0.0001, taker_fee=0.0005, foldername="./train_files/",
+    maker_fee=-0.00005, taker_fee=0.0005, foldername="./train_files/",
     balance=1.0, start=3601*10, max=64000*10
 )
 
@@ -955,7 +955,7 @@ policy = CustomSACPolicy(
     critic=critic,
     actor_optim=Adam(actor.parameters(), lr=1e-3),
     critic_optim=critic_optim,
-    tau=0.005, gamma=0.95, alpha=2.0,
+    tau=0.005, gamma=0.997, alpha=2.0,
     action_space=env_action_space
 )
 
@@ -997,9 +997,9 @@ collector.logger = logger
 trainer = OffpolicyTrainer(
     policy=policy,
     train_collector=collector,
-    max_epoch=10,
-    step_per_epoch=100,
-    step_per_collect=64*10,
+    max_epoch=5,
+    step_per_epoch=3,
+    step_per_collect=64*300,
     update_per_step=0.01,
     episode_per_test=0,
     batch_size=num_of_envs,

@@ -157,11 +157,11 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   }
 
   void Step(const Action& action_dict) override { 
-      double mid_spread = static_cast<double>(action_dict["action"_][0]);
-      double skew_multiplier = static_cast<double>(action_dict["action"_][1]);
+      double bid_spread = static_cast<double>(action_dict["action"_][0]);
+      double ask_spread = static_cast<double>(action_dict["action"_][1]);
       double target_q = static_cast<double>(action_dict["action"_][2]);
      
-      adaptor_ptr->quote(mid_spread, skew_multiplier, target_q);
+      adaptor_ptr->quote(bid_spread, ask_spread, target_q);
       isDone = !adaptor_ptr->next();
       ++steps;
       WriteState();
@@ -189,13 +189,13 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     auto current_reward = info["realized_pnl"] + info["unrealized_pnl"] - info["fees"];
     double previous_reward = 0.0;
 
-    if (pnls.size() > 60) {
+    if (pnls.size() >= 1) {
         previous_reward = pnls.front();
-	pnls.pop_front();
+	if (pnls.size() >= 300) pnls.pop_front();
     }
 
-    state["reward"_] = (current_reward - previous_reward) * 10000;
     pnls.push_back(current_reward);
+    if (steps % 300 == 0)  state["reward"_] = (current_reward - previous_reward) * 1000;
     state["obs"_].Assign(data.begin(), data.size());
   }
 

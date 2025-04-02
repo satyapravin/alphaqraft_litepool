@@ -13,8 +13,8 @@ namespace RLTrader {
 			
 		void reset();
 
-		void quote(const double& mid_spread,
-			   const double& skew_multiplier,
+		void quote(const double& bid_spread,
+			   const double& ask_spread,
 			   const double& target_q,
 		           FixedVector<double, 20>& bid_prices, 
 			   FixedVector<double, 20>& ask_prices);

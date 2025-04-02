@@ -28,8 +28,8 @@ void Strategy::reset() {
 	this->order_id = 0;
 }
 
-void Strategy::quote(const double& mid_spread,
-                     const double& skew_multiplier,
+void Strategy::quote(const double& bid_spread,
+                     const double& ask_spread,
                      const double& target_q,
                      FixedVector<double, 20>& bid_prices,
                      FixedVector<double, 20>& ask_prices) {
@@ -38,11 +38,9 @@ void Strategy::quote(const double& mid_spread,
 	auto leverage = posInfo.leverage;
         auto initBalance = position.getInitialBalance();
 	auto mid_price = (bid_prices[0] + ask_prices[0]) * 0.5;
-	auto q_target = (target_q - leverage) * initBalance;
-	auto spread_opt = mid_spread * 20 * tick_size / 2.0;
-	auto inventory_skew = skew_multiplier * 10 * q_target * tick_size;
-        auto bid_price = mid_price - spread_opt + inventory_skew;
-        auto ask_price = mid_price + spread_opt + inventory_skew;
+	auto q_target = (target_q - leverage);
+        auto bid_price = mid_price - (bid_spread + 1.0) * 30;
+        auto ask_price = mid_price + (ask_spread + 1.0) * 30;
 
         bid_price = std::floor(bid_price / tick_size) * tick_size;
 	ask_price = std::ceil(ask_price / tick_size) * tick_size;
