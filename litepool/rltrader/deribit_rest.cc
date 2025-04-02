@@ -1,4 +1,4 @@
-#include "deribit_rest.h"
+#include "../include/deribit_rest.h"
 
 #include <boost/beast/core.hpp>
 #include <boost/asio.hpp>
@@ -26,6 +26,8 @@ using json = nlohmann::json;
 
 using namespace RLTrader;
 
+static constexpr char DERIBIT_HOST[] = "test.deribit.com";
+
 std::string url_encode(const std::string &value) {
     std::ostringstream escaped;
     escaped.fill('0');
@@ -42,46 +44,88 @@ std::string url_encode(const std::string &value) {
     return escaped.str();
 }
 
-std::string send_get_request(const std::string& host, const std::string& target, const std::string& token) {
+template<typename RequestBody, typename ResponseBody>
+std::string send_request(const std::string& target, 
+                         http::verb method,
+                         const std::function<void(http::request<RequestBody>&)>& request_setup) {
     try {
         net::io_context ioc;
         ssl::context ctx(ssl::context::tlsv12_client);
+        
+        // Load certificates but don't strictly verify
+        ctx.set_default_verify_paths();
+        ctx.set_verify_mode(ssl::verify_none);
+        
         tcp::resolver resolver(ioc);
-        auto const results = resolver.resolve(host, "443");
-
+        auto const results = resolver.resolve(DERIBIT_HOST, "443");
+        
         ssl::stream<tcp::socket> stream(ioc, ctx);
         
-        if(!SSL_set_tlsext_host_name(stream.native_handle(), "www.deribit.com")) {
-            throw beast::system_error(
-                beast::error_code(
-                    static_cast<int>(ERR_get_error()),
-                    net::error::get_ssl_category()
-                ),
-                "Failed to set SNI Hostname"
-            );
+        // Set SNI before connecting
+        if (!SSL_set_tlsext_host_name(stream.native_handle(), DERIBIT_HOST)) {
+            throw beast::system_error(beast::error_code(static_cast<int>(ERR_get_error()), 
+                                     net::error::get_ssl_category()),
+                                     "Failed to set SNI Hostname");
         }
-        connect(stream.next_layer(), results.begin(), results.end());
-        stream.handshake(ssl::stream_base::client);
-
-        http::request<http::empty_body> req(http::verb::get, target, 11);
-        req.set(http::field::host, host);
-        req.set(http::field::content_type, "application/json");
-        req.set(http::field::authorization, "Bearer " + token);
-
+        
+        // Connect to the server
+        boost::asio::connect(beast::get_lowest_layer(stream), results);
+        
+        // Perform handshake with better error handling
+        try {
+            stream.handshake(ssl::stream_base::client);
+        } catch (const beast::system_error& e) {
+            std::cerr << "SSL handshake failed: " << e.what() << std::endl;
+            return "";
+        }
+        
+        // Set up the request
+        http::request<RequestBody> req(method, target, 11);
+        req.set(http::field::host, DERIBIT_HOST);
+        req.set(http::field::user_agent, "Boost Beast");
+        
+        // Apply custom request setup
+        request_setup(req);
+        
+        // Send the request
         http::write(stream, req);
+        
+        // Read the response
         beast::flat_buffer buffer;
-        http::response<http::string_body> res;
-        http::read(stream, buffer, res);
-
-        // Handle SSL shutdown safely
-        boost::system::error_code ec;
-        stream.shutdown(ec);
-        if (ec == boost::asio::error::eof || ec == boost::asio::ssl::error::stream_truncated) {
-            ec.clear();  // Ignore expected shutdown errors
-        } else if (ec) {
-            std::cerr << "SSL Shutdown Error: " << ec.message() << std::endl;
+        http::response<ResponseBody> res;
+        
+        try {
+            http::read(stream, buffer, res);
+        } catch (const beast::system_error& e) {
+            if (e.code() == http::error::end_of_stream) {
+                std::cerr << "Server closed connection" << std::endl;
+            } else {
+                std::cerr << "Read error: " << e.what() << std::endl;
+            }
+            
+            // Even with an error, we might have a partial response
+            if (res.body().empty()) {
+                return "";
+            }
         }
-
+        
+        // Graceful shutdown with error handling
+        beast::error_code ec;
+        stream.shutdown(ec);
+        
+        // Ignore common shutdown errors
+        if (ec == net::error::eof || 
+            ec == ssl::error::stream_truncated ||
+            ec == net::ssl::error::stream_errors::stream_truncated) {
+            // These are expected errors when shutting down SSL connections
+            ec = {};
+        }
+        
+        if (ec) {
+            std::cerr << "Shutdown error: " << ec.message() << std::endl;
+            // Continue anyway, we already have the response
+        }
+        
         return res.body();
     } catch (const std::exception& e) {
         std::cerr << "Request failed: " << e.what() << std::endl;
@@ -89,26 +133,56 @@ std::string send_get_request(const std::string& host, const std::string& target,
     }
 }
 
-std::string get_bearer_token(const std::string& client_id, 
-                           const std::string& client_secret) {
-    std::string auth_body = R"({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "public/auth",
-        "params": {
-            "grant_type": "client_credentials",
-            "client_id": ")" + client_id + R"(",
-            "client_secret": ")" + client_secret + R"("
+std::string send_get_request(const std::string& target, const std::string& token) {
+    return send_request<http::empty_body, http::string_body>(
+        target, 
+        http::verb::get,
+        [&token](auto& req) {
+            req.set(http::field::authorization, "Bearer " + token);
         }
-    })";
+    );
+}
 
-    std::string response = send_get_request("www.deribit.com", "/api/v2/public/auth", auth_body);
+std::string send_post_request(const std::string& target, const std::string& body) {
+    return send_request<http::string_body, http::string_body>(
+        target, 
+        http::verb::post,
+        [&body](auto& req) {
+            req.set(http::field::content_type, "application/json");
+            req.body() = body;
+            req.prepare_payload();
+        }
+    );
+}
 
-    json jsonResponse = json::parse(response);
-    if (jsonResponse.contains("result") && jsonResponse["result"].contains("access_token")) {
-        return jsonResponse["result"]["access_token"];
-    } else {
-        std::cerr << "Authentication failed: " << response << std::endl;
+std::string get_bearer_token(const std::string& client_id, const std::string& client_secret) {
+    try {
+        json auth_json = {
+            {"jsonrpc", "2.0"}, 
+            {"id", 1}, 
+            {"method", "public/auth"},
+            {"params", {
+                {"grant_type", "client_credentials"},
+                {"client_id", client_id},
+                {"client_secret", client_secret}
+            }}
+        };
+
+        std::string response = send_post_request("/api/v2/public/auth", auth_json.dump());
+        std::cout << "API Auth Response: " << response << std::endl;
+
+        if (response.empty()) {
+            throw std::runtime_error("Empty response received from server");
+        }
+
+        auto jsonResponse = json::parse(response, nullptr, false);
+        if (jsonResponse.is_discarded() || !jsonResponse.contains("result") || !jsonResponse["result"].contains("access_token")) {
+            throw std::runtime_error("Authentication failed: " + response);
+        }
+
+        return jsonResponse["result"]["access_token"].get<std::string>();
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to obtain bearer token: " << e.what() << std::endl;
         return "";
     }
 }
@@ -117,86 +191,44 @@ void DeribitREST::fetch_position(const std::string& symbol, double& amount, doub
     try {
         auto bearer_token = get_bearer_token(api_key, api_secret);
         if (bearer_token.empty()) {
-            std::cerr << "Failed to obtain bearer token." << std::endl;
-            return;
+            throw std::runtime_error("Failed to obtain bearer token");
         }
 
         std::string query = "/api/v2/private/get_position?instrument_name=" + symbol;
-        
-        net::io_context ioc;
-        ssl::context ctx(ssl::context::tlsv12_client);
-        ctx.set_verify_mode(ssl::verify_peer);
-        ctx.set_default_verify_paths();
-        
-        tcp::resolver resolver(ioc);
-        beast::ssl_stream<beast::tcp_stream> stream(ioc, ctx);
-        
-        if(!SSL_set_tlsext_host_name(stream.native_handle(), "www.deribit.com")) {
-            throw beast::system_error(
-                beast::error_code(
-                    static_cast<int>(ERR_get_error()),
-                    net::error::get_ssl_category()
-                ),
-                "Failed to set SNI Hostname"
-            );
+        std::string response = send_get_request(query, bearer_token);
+        std::cout << "Position API Response for " << symbol << ": " << response << std::endl;
+
+        if (response.empty()) {
+            throw std::runtime_error("Empty response from server");
         }
-        
-        auto const results = resolver.resolve("www.deribit.com", "443");
-        beast::get_lowest_layer(stream).connect(results);
-        stream.handshake(ssl::stream_base::client);
-        
-        // Set up GET request
-        http::request<http::string_body> req{http::verb::get, query, 11};
-        req.set(http::field::host, "www.deribit.com");
-        req.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
-        req.set(http::field::content_type, "application/json");
-        
-        std::string auth = "Bearer " + bearer_token;
-        req.set(http::field::authorization, auth);
-        
-        // Debug output
-        std::cout << "Authorization: " << auth << std::endl;
-        
-        // Send the request
-        http::write(stream, req);
-        
-        // Receive the response
-        beast::flat_buffer buffer;
-        http::response<http::string_body> res;
-        http::read(stream, buffer, res);
-        
-        std::cout << "Response status: " << res.result_int() << std::endl;
-        std::cout << "Response body: " << res.body() << std::endl;
-        
-        if (res.result() == http::status::ok) {
-            auto j = json::parse(res.body());
-            
-            if (j.contains("result") && !j["result"].is_null()) {
-                const auto& result = j["result"];
+
+        auto j = json::parse(response, nullptr, false);
+        if (j.is_discarded()) {
+            throw std::runtime_error("Invalid JSON response");
+        }
+
+        if (j.contains("error")) {
+            throw std::runtime_error("API error: " + j["error"]["message"].get<std::string>());
+        }
+
+        if (j.contains("result") && !j["result"].is_null()) {
+            const auto& result = j["result"];
+            if (result.contains("size") && result.contains("average_price") && result.contains("direction")) {
                 auto size = result["size"].get<double>();
                 price = result["average_price"].get<double>();
                 amount = result["direction"].get<std::string>() == "buy" ? size : -std::abs(size);
-            } else if (j.contains("error")) {
-                throw std::runtime_error("API error: " + 
-                    j["error"]["message"].get<std::string>());
+            } else {
+                throw std::runtime_error("Missing expected fields in API response");
             }
         } else {
-            throw std::runtime_error("HTTP error: " + 
-                std::to_string(res.result_int()) + 
-                " Body: " + res.body());
+            // No position exists for this instrument
+            amount = 0.0;
+            price = 0.0;
         }
-        
-        // Gracefully close the stream
-        beast::error_code ec;
-        stream.shutdown(ec);
-        if(ec == net::error::eof) {
-            ec = {};
-        }
-        if(ec) {
-            throw beast::system_error{ec};
-        }
-    }
-    catch (const std::exception& e) {
+    } catch (const std::exception& e) {
         std::cerr << "Error getting position: " << e.what() << std::endl;
+        // Initialize with default values on error
+        amount = 0.0;
+        price = 0.0;
     }
 }
