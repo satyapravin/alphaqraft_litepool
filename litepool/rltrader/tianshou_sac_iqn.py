@@ -240,7 +240,7 @@ class CustomSACPolicy(SACPolicy):
 
     def forward(self, batch: Batch, state=None, **kwargs):
         obs = batch.obs
-        loc, scale, h = self.actor(obs, state=state)
+        loc, scale, h, _ = self.actor(obs, state=state)
         dist = Independent(Normal(loc, scale), 1)
         act = dist.rsample()
         log_prob = dist.log_prob(act)
@@ -258,124 +258,97 @@ class CustomSACPolicy(SACPolicy):
             if isinstance(getattr(batch, key), np.ndarray):
                 setattr(batch, key, torch.as_tensor(getattr(batch, key), dtype=torch.float32).to(device))
 
+        # Scale rewards (if necessary)
+        reward_scale = 10.0  # Adjust this based on your environment
+        batch.rew *= reward_scale
+
         self.training = True
-        
-        # Temperature for Q-value scaling
-        temp = 1.0  
 
         with autocast(device_type="cuda"):
-            # Actor forward pass
-            loc, scale, _ = self.actor(batch.obs)
+            # Actor forward pass (predict actions and log probabilities)
+            loc, scale, _, predicted_reward = self.actor(batch.obs)
             dist = Independent(Normal(loc, scale), 1)
             act_pred = dist.rsample()
             log_prob = dist.log_prob(act_pred)
             act_pred = torch.tanh(act_pred)
             log_prob = log_prob - torch.sum(torch.log(1 - act_pred.pow(2) + 1e-6), dim=-1)
 
-            # Current Q values with temperature scaling
-            current_q1, curr_taus1 = self.critic(batch.obs, act_pred, return_taus=True)
-            current_q2, curr_taus2 = self.critic(batch.obs, act_pred, return_taus=True)
-            
-            if current_q1.dim() == 3:
-                current_q1 = current_q1.squeeze(-1)
-            if current_q2.dim() == 3:
-                current_q2 = current_q2.squeeze(-1)
-                
-            q_min = torch.min(current_q1, current_q2).mean(dim=-1) * temp
-            actor_loss = (self.get_alpha * log_prob - q_min).mean()
+            # Critic forward pass (current Q-values)
+            current_q1 = self.critic(batch.obs, act_pred)
+            current_q2 = self.critic(batch.obs, act_pred)
 
-            # Actor optimization with gradient clipping
-            self.actor_optim.zero_grad()
-            self.scaler.scale(actor_loss).backward()
-            self.scaler.unscale_(self.actor_optim)
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
-            self.scaler.step(self.actor_optim)
-
-            # Alpha optimization with adjusted target entropy
-            target_entropy = -0.5 * np.prod(self.actor.action_dim)  # Less negative target entropy
-            alpha_loss = -(self.alpha * (log_prob.detach() + self.target_entropy)).mean()
-            
-            self.alpha_optim.zero_grad()
-            self.scaler.scale(alpha_loss).backward()
-            self.scaler.unscale_(self.alpha_optim)
-            torch.nn.utils.clip_grad_norm_([self.alpha], max_norm=0.5)
-            self.scaler.step(self.alpha_optim)
-            self.scaler.update()
-
-            # Target Q computation with temperature scaling
+            # Target Q-value computation
             with torch.no_grad():
-                next_loc, next_scale, _ = self.actor(batch.obs_next)
+                next_loc, next_scale, _, _ = self.actor(batch.obs_next)
                 next_dist = Independent(Normal(next_loc, next_scale), 1)
                 next_act = next_dist.rsample()
                 next_act = torch.tanh(next_act)
                 next_log_prob = next_dist.log_prob(next_act)
                 next_log_prob = next_log_prob - torch.sum(torch.log(1 - next_act.pow(2) + 1e-6), dim=-1)
 
-                # Sample new taus for target Q
+                # Sample new taus for target Q computation
                 taus_target = torch.rand(batch.obs.shape[0], self.critic.num_quantiles, device=device)
-                target_q1, target_taus1 = self.critic_target(batch.obs_next, next_act, taus=taus_target, return_taus=True)
-                target_q2, target_taus2 = self.critic_target(batch.obs_next, next_act, taus=taus_target, return_taus=True)
+                target_q1, _ = self.critic_target(batch.obs_next, next_act, taus=taus_target, return_taus=True)
+                target_q2, _ = self.critic_target(batch.obs_next, next_act, taus=taus_target, return_taus=True)
 
-                target_q = torch.min(target_q1, target_q2) * temp
+                # Minimize over the two critics and subtract alpha-scaled log probabilities
+                target_q = torch.min(target_q1, target_q2)
                 target_q = target_q - (self.get_alpha.detach() * next_log_prob.unsqueeze(1))
 
-                reward_scale = 1.0
-                target_q = batch.rew.unsqueeze(1) * reward_scale + self.gamma * (1 - batch.done.unsqueeze(1)) * target_q
-                target_q = torch.clamp(target_q, -10.0, 10.0) 
+                # Bellman backup: compute the target Q-values
+                target_q = batch.rew.unsqueeze(1) + self.gamma * (1 - batch.done.unsqueeze(1)) * target_q
+                target_q = torch.clamp(target_q, -10.0, 10.0)  # Optional clamping for stability
 
-            # Current Q values for critic loss
-            current_q1, curr_taus1 = self.critic(batch.obs, batch.act, return_taus=True)
-            current_q2, curr_taus2 = self.critic(batch.obs, batch.act, return_taus=True)
+            # Debug prints for Q-values
+            print(f"Critic Output Q1: {current_q1.mean().item():.6f}")
+            print(f"Critic Output Q2: {current_q2.mean().item():.6f}")
+            print(f"Target Q: {target_q.mean().item():.6f}")
 
-            if current_q1.dim() == 3:
-                current_q1 = current_q1.squeeze(-1)
-            if current_q2.dim() == 3:
-                current_q2 = current_q2.squeeze(-1)
+            # Compute actor loss
+            q_min = torch.min(current_q1, current_q2).mean(dim=-1)
+            actor_loss = (self.get_alpha * log_prob - q_min).mean()
 
-            # Compute critic losses with Huber loss
-            critic_loss1 = quantile_huber_loss(current_q1, target_q, curr_taus1, target_taus1, kappa=1.0)
-            critic_loss2 = quantile_huber_loss(current_q2, target_q, curr_taus2, target_taus2, kappa=1.0)
-            critic_loss = critic_loss1 + critic_loss2
+            # Reward prediction loss
+            reward_loss = F.mse_loss(predicted_reward.squeeze(-1), batch.rew)
 
-            # Critic optimization with gradient clipping
-            self.critic_optim.zero_grad()
-            self.scaler.scale(critic_loss).backward()
-            self.scaler.unscale_(self.critic_optim)
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
-            self.scaler.step(self.critic_optim)
+            # Total loss
+            total_loss = actor_loss + 0.1 * reward_loss
+
+            # Optimize actor
+            self.actor_optim.zero_grad()
+            self.scaler.scale(total_loss).backward()
+            self.scaler.unscale_(self.actor_optim)
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
+            self.scaler.step(self.actor_optim)
+
+            # Update the scaler
             self.scaler.update()
 
-            # Soft update of target network with rate limiting
-            self.soft_update(self.critic_target, self.critic, min(self.tau, 0.005))
-
-        mean_q1 = current_q1.mean().item()
-        mean_q2 = current_q2.mean().item()
-        mean_target_q = target_q.mean().item()
-
-        print("\nDetailed Training Stats:")
-        print(f"Actor Loss: {actor_loss.item():.6f}")
-        print(f"Critic Loss 1: {critic_loss1.item():.6f}")
-        print(f"Critic Loss 2: {critic_loss2.item():.6f}")
-        print(f"Total Critic Loss: {critic_loss.item():.6f}")
-        print(f"Alpha Loss: {alpha_loss.item():.6f}")
-        print(f"Alpha: {self.get_alpha.item():.6f}")
-        print(f"Mean Q1: {mean_q1:.6f}")
-        print(f"Mean Q2: {mean_q2:.6f}")
-        print(f"Mean Target Q: {mean_target_q:.6f}")
-        print(f"Log Prob Mean: {log_prob.mean().item():.6f}")
-        print("-" * 50)
+            # Detailed prints
+            print("\nDetailed Training Stats:")
+            print(f"Actor Loss: {actor_loss.item():.6f}")
+            print(f"Reward Prediction Loss: {reward_loss.item():.6f}")
+            print(f"Total Loss: {total_loss.item():.6f}")
+            print(f"Mean Q1: {current_q1.mean().item():.6f}")
+            print(f"Mean Q2: {current_q2.mean().item():.6f}")
+            print(f"Mean Target Q: {target_q.mean().item():.6f}")
+            print(f"Mean Reward: {batch.rew.mean().item():.6f}")
+            print(f"Log Prob Mean: {log_prob.mean().item():.6f}")
+            print("-" * 50)
 
         return SACSummary(
-            loss=critic_loss.item() + actor_loss.item(),
+            loss=total_loss.item(),
             loss_actor=actor_loss.item(),
-            loss_critic=critic_loss.item(),
-            loss_alpha=alpha_loss.item(),
+            loss_critic=0,  # Update this if critic loss is used
+            loss_alpha=0,  # Update this if alpha_loss is used
             alpha=self.get_alpha.item(),
             train_time=time.time() - start_time
         )
+
 # ---------------------------
 # Custom Models for SAC + IQN
 # ---------------------------
+
 class RecurrentActor(nn.Module):
     def __init__(self, state_dim=2420, action_dim=3, hidden_dim=64, gru_hidden_dim=128, num_layers=2, predict_steps=10):
         super().__init__()
@@ -420,6 +393,12 @@ class RecurrentActor(nn.Module):
             nn.LayerNorm(hidden_dim * 2), nn.Linear(hidden_dim * 2, hidden_dim), nn.ReLU()
         )
 
+        # Reward prediction head
+        self.reward_predictor = nn.Sequential(
+            nn.Linear(gru_hidden_dim, 64), nn.ReLU(),  # Intermediate hidden layer
+            nn.Linear(64, 1)  # Predicts a single scalar (cumulative reward)
+        )
+
         # Output layers for action distribution
         self.mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Linear(hidden_dim, action_dim)
@@ -454,26 +433,27 @@ class RecurrentActor(nn.Module):
         # Initialize GRU state if not provided
         if state is None:
             state = torch.zeros(self.num_layers, batch_size, self.gru_hidden_dim, device=obs.device)
-
-        # Reshape state if necessary
         elif state.shape == (batch_size, self.num_layers, self.gru_hidden_dim):
-            state = state.transpose(0, 1).contiguous()
+            state = state.transpose(0, 1).contiguous()  # Fix shape to (num_layers, batch_size, gru_hidden_dim)
 
         # GRU forward pass
         x, new_state = self.gru(x, state)  # x: (batch_size, time_steps, gru_hidden_dim)
 
         # Take the last timestep output
-        x = x[:, -1, :]  # Shape: (batch_size, gru_hidden_dim)
+        x_last = x[:, -1, :]  # Shape: (batch_size, gru_hidden_dim)
 
         # Predict future features
-        future_features = self.future_predictor(x)  # Shape: (batch_size, feature_dim * predict_steps)
+        future_features = self.future_predictor(x_last)  # Shape: (batch_size, feature_dim * predict_steps)
         future_features = future_features.view(batch_size, -1)  # Flatten to (batch_size, predict_steps * feature_dim)
+
+        # Predict cumulative reward
+        predicted_reward = self.reward_predictor(x_last)  # Shape: (batch_size, 1)
 
         # Extract the last timestep of position features
         position_out = position_out[:, -1, :]  # Shape: (batch_size, 32)
 
         # Concatenate GRU output, future features, and position features
-        x = torch.cat([x, future_features, position_out], dim=-1)  # Shape: (batch_size, fusion_fc_input_dim)
+        x = torch.cat([x_last, future_features, position_out], dim=-1)  # Shape: (batch_size, fusion_fc_input_dim)
 
         # Fuse features
         x = self.fusion_fc(x)  # Shape: (batch_size, hidden_dim)
@@ -486,7 +466,7 @@ class RecurrentActor(nn.Module):
         loc = mean
         scale = std
 
-        return loc, scale, new_state.detach().transpose(0, 1)
+        return loc, scale, new_state.detach().transpose(0, 1), predicted_reward
 
 class IQNCritic(nn.Module):
     def __init__(self, state_dim=2420, action_dim=3, hidden_dim=128, num_quantiles=64, gru_hidden_dim=128, num_layers=2):
