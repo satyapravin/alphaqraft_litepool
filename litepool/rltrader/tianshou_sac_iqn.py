@@ -274,8 +274,8 @@ class CustomSACPolicy(SACPolicy):
             log_prob = log_prob - torch.sum(torch.log(1 - act_pred.pow(2) + 1e-6), dim=-1)
 
             # Critic forward pass (current Q-values)
-            current_q1 = self.critic(batch.obs, act_pred)
-            current_q2 = self.critic(batch.obs, act_pred)
+            current_q1, _ = self.critic(batch.obs, act_pred)
+            current_q2, _ = self.critic(batch.obs, act_pred)
 
             with torch.no_grad():
                 next_loc, next_scale, _, _ = self.actor(batch.obs_next)
@@ -287,8 +287,8 @@ class CustomSACPolicy(SACPolicy):
 
                 # Sample new taus for target Q computation
                 taus_target = torch.rand(batch.obs.shape[0], self.critic.num_quantiles, device=device)
-                target_q1 = self.critic_target(batch.obs_next, next_act, taus=taus_target)
-                target_q2 = self.critic_target(batch.obs_next, next_act, taus=taus_target)
+                target_q1, _ = self.critic_target(batch.obs_next, next_act, taus=taus_target)
+                target_q2, _ = self.critic_target(batch.obs_next, next_act, taus=taus_target)
 
                 # Use only the first element of the tuple (q_values) for torch.min
                 target_q = torch.min(target_q1, target_q2)  # Fix: Extract q_values
@@ -528,7 +528,7 @@ class IQNCritic(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
 
-    def forward(self, state, action, taus=None, return_taus=False, state_h=None):
+    def forward(self, state, action, taus=None, state_h=None):
         device = next(self.parameters()).device
 
         if isinstance(state, np.ndarray):
@@ -583,7 +583,7 @@ class IQNCritic(nn.Module):
         if taus is None:
             taus = torch.rand(batch_size, self.num_quantiles, device=device)
 
-        return (q_values, taus, new_state_h) if return_taus else (q_values, new_state_h)
+        return q_values, new_state_h
 
 
 def quantile_huber_loss(pred, target, taus_pred, taus_target, kappa=1.0):
