@@ -277,7 +277,6 @@ class CustomSACPolicy(SACPolicy):
             current_q1 = self.critic(batch.obs, act_pred)
             current_q2 = self.critic(batch.obs, act_pred)
 
-            # Target Q-value computation
             with torch.no_grad():
                 next_loc, next_scale, _, _ = self.actor(batch.obs_next)
                 next_dist = Independent(Normal(next_loc, next_scale), 1)
@@ -288,17 +287,17 @@ class CustomSACPolicy(SACPolicy):
 
                 # Sample new taus for target Q computation
                 taus_target = torch.rand(batch.obs.shape[0], self.critic.num_quantiles, device=device)
-                target_q1, _ = self.critic_target(batch.obs_next, next_act, taus=taus_target, return_taus=True)
-                target_q2, _ = self.critic_target(batch.obs_next, next_act, taus=taus_target, return_taus=True)
+                target_q1 = self.critic_target(batch.obs_next, next_act, taus=taus_target)
+                target_q2 = self.critic_target(batch.obs_next, next_act, taus=taus_target)
 
-                # Minimize over the two critics and subtract alpha-scaled log probabilities
-                target_q = torch.min(target_q1, target_q2)
+                # Use only the first element of the tuple (q_values) for torch.min
+                target_q = torch.min(target_q1, target_q2)  # Fix: Extract q_values
                 target_q = target_q - (self.get_alpha.detach() * next_log_prob.unsqueeze(1))
 
                 # Bellman backup: compute the target Q-values
                 target_q = batch.rew.unsqueeze(1) + self.gamma * (1 - batch.done.unsqueeze(1)) * target_q
                 target_q = torch.clamp(target_q, -10.0, 10.0)  # Optional clamping for stability
-
+            
             # Debug prints for Q-values
             print(f"Critic Output Q1: {current_q1.mean().item():.6f}")
             print(f"Critic Output Q2: {current_q2.mean().item():.6f}")
@@ -344,6 +343,13 @@ class CustomSACPolicy(SACPolicy):
             alpha=self.get_alpha.item(),
             train_time=time.time() - start_time
         )
+
+    def update_hidden_states(self, obs, act, state_h1, state_h2):
+        """Update critic hidden states for all environments"""
+        with torch.no_grad():
+            _, state_h1 = self.critic(obs, act, state_h=state_h1)
+            _, state_h2 = self.critic(obs, act, state_h=state_h2)
+        return state_h1.detach(), state_h2.detach()
 
 # ---------------------------
 # Custom Models for SAC + IQN
@@ -522,7 +528,7 @@ class IQNCritic(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
 
-    def forward(self, state, action, taus=None, return_taus=False):
+    def forward(self, state, action, taus=None, return_taus=False, state_h=None):
         device = next(self.parameters()).device
 
         if isinstance(state, np.ndarray):
@@ -552,11 +558,12 @@ class IQNCritic(nn.Module):
         # Concatenate trade and market features
         x = torch.cat([trade_out, market_out], dim=-1)  # Shape: (batch_size, time_steps, 64)
 
-        # Initialize GRU state
-        state_h = torch.zeros(self.num_layers, batch_size, self.gru_hidden_dim, device=device)
+        # Initialize GRU state if not provided
+        if state_h is None:
+            state_h = torch.zeros(self.num_layers, batch_size, self.gru_hidden_dim, device=device)
 
         # GRU forward pass
-        x, _ = self.gru(x, state_h)  # x: (batch_size, time_steps, gru_hidden_dim)
+        x, new_state_h = self.gru(x, state_h)  # x: (batch_size, time_steps, gru_hidden_dim)
 
         # Take the last timestep output
         x = x[:, -1, :]  # Shape: (batch_size, gru_hidden_dim)
@@ -576,7 +583,7 @@ class IQNCritic(nn.Module):
         if taus is None:
             taus = torch.rand(batch_size, self.num_quantiles, device=device)
 
-        return (q_values, taus) if return_taus else q_values
+        return (q_values, taus, new_state_h) if return_taus else (q_values, new_state_h)
 
 
 def quantile_huber_loss(pred, target, taus_pred, taus_target, kappa=1.0):
@@ -670,6 +677,14 @@ class GPUCollector(Collector):
         self.data = Batch()
         self.reset_batch_data()
 
+        # Add hidden states for each environment
+        self.state_h1 = torch.zeros(
+            policy.critic.num_layers, env.num_envs, policy.critic.gru_hidden_dim, device=device
+        )
+        self.state_h2 = torch.zeros(
+            policy.critic.num_layers, env.num_envs, policy.critic.gru_hidden_dim, device=device
+        )
+
     def reset_batch_data(self):
         """Reset the internal batch data but maintain environment state"""
         if not self.env_active:
@@ -703,20 +718,29 @@ class GPUCollector(Collector):
             self.data.info = info
             self.env_active = True
 
+            # Reset hidden states for all environments
+            self.state_h1.zero_()
+            self.state_h2.zero_()
+
         return self.data.obs, self.data.info
+
+    def _reset_hidden_states(self, indices):
+        """Reset the hidden states for specific environments"""
+        self.state_h1[:, indices, :] = 0
+        self.state_h2[:, indices, :] = 0
 
     def _collect(self, n_step=None, n_episode=None, random=False, render=None, gym_reset_kwargs=None):
         if n_step is not None:
             assert n_episode is None, "Only one of n_step or n_episode is allowed"
         assert not self.env.is_async, "Please use AsyncCollector if using async venv."
-        
+
         start_time = time.time()
         local_step_count = 0
         episode_count = 0
         episode_rews = []
         episode_lens = []
-        episode_lens_dict = {i: 0 for i in range(num_of_envs)}  # Track length per env
-        episode_rews_dict = {i: 0.0 for i in range(num_of_envs)}  # Track rewards per env
+        episode_lens_dict = {i: 0 for i in range(self.env.num_envs)}  # Track length per env
+        episode_rews_dict = {i: 0.0 for i in range(self.env.num_envs)}  # Track rewards per env
 
         while True:
             if self.data.obs is None:
@@ -731,6 +755,7 @@ class GPUCollector(Collector):
                 obs_batch = Batch(obs=torch.as_tensor(self.data.obs, device=self.device))
 
             with torch.no_grad():
+                # Use the critic's hidden states for the current environments
                 result = self.policy(obs_batch, state=self.data.state)
 
             self.data.act = result.act
@@ -741,7 +766,7 @@ class GPUCollector(Collector):
                 action = self.data.act.cpu().numpy()
             else:
                 action = np.array(self.data.act)
-            
+
             # Step the environment with numpy action
             result = self.env.step(action)
             if len(result) == 5:  # gymnasium style
@@ -751,7 +776,7 @@ class GPUCollector(Collector):
                 obs_next, rew, done, info = result
                 terminated = done
                 truncated = False
-            
+
             if hasattr(self, 'logger'):
                 self.logger.log(self.continuous_step_count, info, rew, self.policy)
 
@@ -759,11 +784,16 @@ class GPUCollector(Collector):
                 obs_next = obs_next.to(self.device)
             else:
                 obs_next = torch.as_tensor(obs_next, device=self.device)
-                
+
             if isinstance(rew, torch.Tensor):
                 rew = rew.to(self.device)
             else:
                 rew = torch.as_tensor(rew, device=self.device)
+
+            # Update hidden states for all environments
+            self.state_h1, self.state_h2 = self.policy.update_hidden_states(
+                obs_next, self.data.act, self.state_h1, self.state_h2
+            )
 
             self.data.obs_next = obs_next
             self.data.rew = rew
@@ -774,6 +804,11 @@ class GPUCollector(Collector):
 
             if self.preprocess_fn:
                 self.data = self.preprocess_fn(self.data)
+
+            # Reset hidden states for environments that are done
+            for idx in range(self.env.num_envs):
+                if done[idx]:
+                    self._reset_hidden_states(idx)
 
             # Convert tensors to numpy for buffer
             if isinstance(self.data.obs, torch.Tensor):
