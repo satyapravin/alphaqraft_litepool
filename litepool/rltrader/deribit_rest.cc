@@ -1,4 +1,4 @@
-#include "../include/deribit_rest.h"
+#include "deribit_rest.h"
 
 #include <boost/beast/core.hpp>
 #include <boost/asio.hpp>
@@ -26,7 +26,7 @@ using json = nlohmann::json;
 
 using namespace RLTrader;
 
-static constexpr char DERIBIT_HOST[] = "test.deribit.com";
+static constexpr char DERIBIT_HOST[] = "www.deribit.com";
 
 std::string url_encode(const std::string &value) {
     std::ostringstream escaped;

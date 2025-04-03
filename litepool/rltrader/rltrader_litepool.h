@@ -186,7 +186,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     state["info:trade_count"_] = info["trade_count"];
     state["info:drawdown"_] = info["drawdown"];
     state["info:fees"_] = info["fees"];
-    auto current_reward = info["realized_pnl"] + info["unrealized_pnl"] - info["fees"];
+    auto current_reward = info["realized_pnl"] + std::min(0.0, info["unrealized_pnl"]) - info["fees"];
     double previous_reward = 0.0;
 
     if (pnls.size() >= 1) {
@@ -195,7 +195,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     }
 
     pnls.push_back(current_reward);
-    if (steps % 300 == 0)  state["reward"_] = (current_reward - previous_reward) * 1000;
+    state["reward"_] = (current_reward - previous_reward) * 1000;
     state["obs"_].Assign(data.begin(), data.size());
   }
 
