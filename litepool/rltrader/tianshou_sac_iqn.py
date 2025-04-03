@@ -250,20 +250,19 @@ class CustomSACPolicy(SACPolicy):
 
         return Batch(act=act, state=h, dist=dist, log_prob=log_prob)
 
-    def learn(self, batch: Batch, **kwargs):
+
+    def learn(self, batch: Batch, state_h1=None, state_h2=None, **kwargs):
         start_time = time.time()
 
-        # Convert batch data to tensors
         for key in ['obs', 'act', 'rew', 'done', 'obs_next']:
             if isinstance(getattr(batch, key), np.ndarray):
                 setattr(batch, key, torch.as_tensor(getattr(batch, key), dtype=torch.float32).to(device))
 
-        batch.rew *= 10.0  # Reward scaling
+        batch.rew *= 10.0  # reward scaling
 
         self.training = True
 
         with autocast(device_type="cuda"):
-            # Actor forward pass
             loc, scale, _, predicted_reward = self.actor(batch.obs)
             dist = Independent(Normal(loc, scale), 1)
             act_pred = dist.rsample()
@@ -271,11 +270,9 @@ class CustomSACPolicy(SACPolicy):
             act_pred = torch.tanh(act_pred)
             log_prob = log_prob - torch.sum(torch.log(1 - act_pred.pow(2) + 1e-6), dim=-1)
 
-            # Critic forward pass (current Q-values)
-            current_q1_out = self.critic(batch.obs, act_pred)
-            current_q2_out = self.critic(batch.obs, act_pred)
-            
-            # Extract Q-values from critic outputs
+            current_q1_out = self.critic(batch.obs, act_pred, state_h=state_h1)
+            current_q2_out = self.critic(batch.obs, act_pred, state_h=state_h2)
+
             current_q1 = process_critic_output(current_q1_out)
             current_q2 = process_critic_output(current_q2_out)
 
@@ -287,46 +284,27 @@ class CustomSACPolicy(SACPolicy):
                 next_log_prob = next_dist.log_prob(next_act)
                 next_log_prob = next_log_prob - torch.sum(torch.log(1 - next_act.pow(2) + 1e-6), dim=-1)
 
-                # Sample new taus for target Q computation
-                taus_target = torch.rand(batch.obs.shape[0], self.critic.num_quantiles, device=device)
-                target_q1_out = self.critic_target(batch.obs_next, next_act)
-                target_q2_out = self.critic_target(batch.obs_next, next_act)
-                
-                # Extract Q-values from target critic outputs
+                target_q1_out = self.critic_target(batch.obs_next, next_act, state_h=state_h1)
+                target_q2_out = self.critic_target(batch.obs_next, next_act, state_h=state_h2)
+
                 target_q1 = process_critic_output(target_q1_out)
                 target_q2 = process_critic_output(target_q2_out)
 
-                # Use min of target Q-values
                 target_q = torch.min(target_q1, target_q2)
                 target_q = target_q - (self.get_alpha.detach() * next_log_prob.unsqueeze(1))
-
-                # Bellman backup
                 target_q = batch.rew.unsqueeze(1) + self.gamma * (1 - batch.done.unsqueeze(1)) * target_q
                 target_q = torch.clamp(target_q, -10.0, 10.0)
 
-            # Debug prints
-            print(f"Critic Output Q1: {current_q1.mean().item():.6f}")
-            print(f"Critic Output Q2: {current_q2.mean().item():.6f}")
-            print(f"Target Q: {target_q.mean().item():.6f}")
-
-            # Compute actor loss
             q_min = torch.min(current_q1, current_q2).mean(dim=-1)
             actor_loss = (self.get_alpha * log_prob - q_min).mean()
-
-            # Reward prediction loss
             reward_loss = F.mse_loss(predicted_reward.squeeze(-1), batch.rew)
-
-            # Total loss
             total_loss = actor_loss + 0.1 * reward_loss
 
-            # Optimize actor
             self.actor_optim.zero_grad()
             self.scaler.scale(total_loss).backward()
             self.scaler.unscale_(self.actor_optim)
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
             self.scaler.step(self.actor_optim)
-
-            # Update the scaler
             self.scaler.update()
 
             # Detailed prints
@@ -350,12 +328,26 @@ class CustomSACPolicy(SACPolicy):
             train_time=time.time() - start_time
         )
 
+    def update(self, sample_size, buffer, **kwargs):
+        batch, indices = buffer.sample(sample_size)
+
+        state_h1 = getattr(batch, "state_h1", None)
+        state_h2 = getattr(batch, "state_h2", None)
+        if state_h1 is not None:
+            state_h1 = state_h1.to(device)
+        if state_h2 is not None:
+            state_h2 = state_h2.to(device)
+
+        result = self.learn(batch=batch, state_h1=state_h1, state_h2=state_h2)
+        return result
+
     def update_hidden_states(self, obs, act, state_h1, state_h2):
         """Update critic hidden states for all environments"""
         with torch.no_grad():
             _, state_h1 = self.critic(obs, act, state_h=state_h1)
             _, state_h2 = self.critic(obs, act, state_h=state_h2)
         return state_h1.detach(), state_h2.detach()
+
 
 # ---------------------------
 # Custom Models for SAC + IQN
@@ -853,6 +845,8 @@ class GPUCollector(Collector):
                 state=self.data.state if hasattr(self.data, 'state') else None
             )
 
+            batch.state_h1 = self.state_h1.clone().detach().cpu()
+            batch.state_h2 = self.state_h2.clone().detach().cpu()
             # Save to buffer
             ptr, ep_rew, ep_len, ep_idx = self.buffer.add(batch)
 
