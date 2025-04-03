@@ -250,7 +250,6 @@ class CustomSACPolicy(SACPolicy):
 
         return Batch(act=act, state=h, dist=dist, log_prob=log_prob)
 
-
     def learn(self, batch: Batch, state_h1=None, state_h2=None, **kwargs):
         start_time = time.time()
 
@@ -263,7 +262,7 @@ class CustomSACPolicy(SACPolicy):
         self.training = True
 
         B = batch.obs.shape[0]
-        N = self.critic.num_quantiles   # Number of quantiles to sample
+        N = self.critic.num_quantiles  # Number of quantiles to sample
 
         with autocast(device_type="cuda"):
             # ----- Actor forward -----
@@ -278,9 +277,12 @@ class CustomSACPolicy(SACPolicy):
             taus_pred = torch.rand(B, N, device=device)
             taus_target = torch.rand(B, N, device=device)
 
+            state_h1_detached = state_h1.detach() if state_h1 is not None else None
+            state_h2_detached = state_h2.detach() if state_h2 is not None else None
+            
             # ----- Critic forward -----
-            current_q1, _ = self.critic(batch.obs, act_pred, taus=taus_pred, state_h=state_h1)
-            current_q2, _ = self.critic(batch.obs, act_pred, taus=taus_pred, state_h=state_h2)
+            current_q1, _ = self.critic(batch.obs, act_pred, taus=taus_pred, state_h=state_h1_detached)
+            current_q2, _ = self.critic(batch.obs, act_pred, taus=taus_pred, state_h=state_h2_detached)
 
             # ----- Target Q computation -----
             with torch.no_grad():
@@ -290,9 +292,11 @@ class CustomSACPolicy(SACPolicy):
                 next_act = torch.tanh(next_act)
                 next_log_prob = next_dist.log_prob(next_act)
                 next_log_prob = next_log_prob - torch.sum(torch.log(1 - next_act.pow(2) + 1e-6), dim=-1)
+                target_q1, _ = self.critic_target(batch.obs_next, next_act, taus=taus_target, state_h=state_h1_detached)
+                target_q2, _ = self.critic_target(batch.obs_next, next_act, taus=taus_target, state_h=state_h2_detached)
 
-                target_q1, _ = self.critic_target(batch.obs_next, next_act, taus=taus_target, state_h=state_h1)
-                target_q2, _ = self.critic_target(batch.obs_next, next_act, taus=taus_target, state_h=state_h2)
+                target_q1 = target_q1.detach()
+                target_q2 = target_q2.detach()
 
                 target_q = torch.min(target_q1, target_q2)
                 target_q = target_q - (self.get_alpha.detach() * next_log_prob.unsqueeze(1))
@@ -312,9 +316,10 @@ class CustomSACPolicy(SACPolicy):
             self.scaler.update()
 
             # ----- Actor Loss -----
-            q_min = torch.min(current_q1, current_q2).mean(dim=-1)
+            q_min = torch.min(current_q1.detach(), current_q2.detach()).mean(dim=-1)
             actor_loss = (self.get_alpha * log_prob - q_min).mean()
-            reward_loss = F.mse_loss(predicted_reward.squeeze(-1), batch.rew)
+
+            reward_loss = F.mse_loss(predicted_reward.detach().squeeze(-1), batch.rew)
             total_loss = actor_loss + 0.1 * reward_loss
 
             self.actor_optim.zero_grad()
@@ -345,6 +350,7 @@ class CustomSACPolicy(SACPolicy):
             alpha=self.get_alpha.item(),
             train_time=time.time() - start_time
         )
+
     def update(self, sample_size, buffer, **kwargs):
         batch, indices = buffer.sample(sample_size)
 
