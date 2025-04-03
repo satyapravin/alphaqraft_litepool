@@ -376,9 +376,8 @@ class CustomSACPolicy(SACPolicy):
 # ---------------------------
 # Custom Models for SAC + IQN
 # ---------------------------
-
 class RecurrentActor(nn.Module):
-    def __init__(self, state_dim=2420, action_dim=3, hidden_dim=64, gru_hidden_dim=128, num_layers=2):
+    def __init__(self, state_dim=2420, action_dim=3, hidden_dim=64, gru_hidden_dim=128, num_layers=2, predict_steps=10):
         super().__init__()
         self.gru_hidden_dim = gru_hidden_dim
         self.num_layers = num_layers
@@ -386,34 +385,46 @@ class RecurrentActor(nn.Module):
         self.time_steps = 10
         self.max_action = 1
         self.position_dim = 18
-        self.trade_dim = 6  # Keep original trade_dim
+        self.trade_dim = 6
         self.market_dim = 218
         self.action_dim = action_dim
+        self.predict_steps = predict_steps
 
+        # Feature extractors
         self.position_fc = nn.Sequential(
             nn.Linear(self.position_dim, 64), nn.ReLU(), nn.LayerNorm(64),
             nn.Linear(64, 32), nn.ReLU()
         )
-
         self.trade_fc = nn.Sequential(
             nn.Linear(self.trade_dim, 64), nn.ReLU(), nn.LayerNorm(64),
             nn.Linear(64, 32), nn.ReLU()
         )
-
         self.market_fc = nn.Sequential(
             nn.Linear(self.market_dim, 128), nn.ReLU(), nn.LayerNorm(128),
             nn.Linear(128, 32), nn.ReLU()
         )
 
+        # GRU for temporal feature extraction
         self.gru = nn.GRU(64, gru_hidden_dim, num_layers=num_layers, batch_first=True)
+
+        # Future prediction network
+        self.future_predictor = nn.Sequential(
+            nn.Linear(gru_hidden_dim, gru_hidden_dim), nn.ReLU(),
+            nn.Linear(gru_hidden_dim, self.feature_dim * self.predict_steps)
+        )
+
+        # Fusion layer
+        fusion_fc_input_dim = gru_hidden_dim + (self.predict_steps * self.feature_dim) + 32
         self.fusion_fc = nn.Sequential(
-            nn.Linear(gru_hidden_dim + 32, hidden_dim * 2), nn.ReLU(),
+            nn.Linear(fusion_fc_input_dim, hidden_dim * 2), nn.ReLU(),
             nn.LayerNorm(hidden_dim * 2), nn.Linear(hidden_dim * 2, hidden_dim), nn.ReLU()
         )
 
+        # Output layers for action distribution
         self.mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Linear(hidden_dim, action_dim)
 
+        # Initialize log_std weights and biases
         self.log_std.weight.data.uniform_(-1, 0)
         self.log_std.bias.data.uniform_(-1, 0)
 
@@ -424,51 +435,62 @@ class RecurrentActor(nn.Module):
         obs = torch.as_tensor(obs, dtype=torch.float32, device=next(self.parameters()).device)
         batch_size = obs.shape[0]
 
-        # Reshape the input to (batch_size, time_steps, feature_dim)
+        # Reshape to (batch_size, time_steps, feature_dim)
         obs = obs.view(batch_size, self.time_steps, -1)
 
-        # Split the features
+        # Split features
         market_state = obs[:, :, :self.market_dim]
         position_state = obs[:, :, self.market_dim:self.market_dim + self.position_dim]
         trade_state = obs[:, :, self.market_dim + self.position_dim:self.market_dim + self.position_dim + self.trade_dim]
 
-        position_out = self.position_fc(position_state)
-        trade_out = self.trade_fc(trade_state)
-        market_out = self.market_fc(market_state)  
+        # Feature processing
+        position_out = self.position_fc(position_state)  # Shape: (batch_size, time_steps, 32)
+        trade_out = self.trade_fc(trade_state)  # Shape: (batch_size, time_steps, 32)
+        market_out = self.market_fc(market_state)  # Shape: (batch_size, time_steps, 32)
 
-        x = torch.cat([trade_out, market_out], dim=-1)
+        # Concatenate trade and market features
+        x = torch.cat([trade_out, market_out], dim=-1)  # Shape: (batch_size, time_steps, 64)
 
+        # Initialize GRU state if not provided
         if state is None:
             state = torch.zeros(self.num_layers, batch_size, self.gru_hidden_dim, device=obs.device)
-        elif isinstance(state, list):
-            state = state[0]
 
-        if state.shape == (batch_size, self.num_layers, self.gru_hidden_dim):
+        # Reshape state if necessary
+        elif state.shape == (batch_size, self.num_layers, self.gru_hidden_dim):
             state = state.transpose(0, 1).contiguous()
 
-        x, new_state = self.gru(x, state)
-        x = x[:, -1, :]
-        position_out = position_out[:, -1, :]
-        x = torch.cat([x, position_out], dim=-1)
-        x = self.fusion_fc(x)
+        # GRU forward pass
+        x, new_state = self.gru(x, state)  # x: (batch_size, time_steps, gru_hidden_dim)
 
-        mean = self.mean(x)
-        log_std = self.log_std(x).clamp(-10, 2)
+        # Take the last timestep output
+        x = x[:, -1, :]  # Shape: (batch_size, gru_hidden_dim)
+
+        # Predict future features
+        future_features = self.future_predictor(x)  # Shape: (batch_size, feature_dim * predict_steps)
+        future_features = future_features.view(batch_size, -1)  # Flatten to (batch_size, predict_steps * feature_dim)
+
+        # Extract the last timestep of position features
+        position_out = position_out[:, -1, :]  # Shape: (batch_size, 32)
+
+        # Concatenate GRU output, future features, and position features
+        x = torch.cat([x, future_features, position_out], dim=-1)  # Shape: (batch_size, fusion_fc_input_dim)
+
+        # Fuse features
+        x = self.fusion_fc(x)  # Shape: (batch_size, hidden_dim)
+
+        # Output mean and std for action distribution
+        mean = self.mean(x)  # Shape: (batch_size, action_dim)
+        log_std = self.log_std(x).clamp(-10, 2)  # Shape: (batch_size, action_dim)
         std = log_std.exp() + 1e-6
 
         loc = mean
         scale = std
 
-        if loc.dim() == 1:
-            loc = loc.unsqueeze(0)
-        if scale.dim() == 1:
-            scale = scale.unsqueeze(0)
-
         return loc, scale, new_state.detach().transpose(0, 1)
 
 
 class IQNCritic(nn.Module):
-    def __init__(self, state_dim=2420, action_dim=3, hidden_dim=128, num_quantiles=64, gru_hidden_dim=128, num_layers=2):
+    def __init__(self, state_dim=2420, action_dim=3, hidden_dim=128, num_quantiles=64, gru_hidden_dim=128, num_layers=2, predict_steps=10):
         super().__init__()
         self.num_quantiles = num_quantiles
         self.num_layers = num_layers
@@ -477,28 +499,30 @@ class IQNCritic(nn.Module):
         self.time_steps = 10
         self.position_dim = 18
         self.trade_dim = 6
-        self.market_dim = 218  
+        self.market_dim = 218
+        self.predict_steps = predict_steps
 
-        # Initialize layers first
+        # Feature extractors
         self.position_fc = nn.Sequential(
             nn.Linear(self.position_dim, 64), nn.ReLU(), nn.LayerNorm(64),
             nn.Linear(64, 32), nn.ReLU()
         )
-
         self.trade_fc = nn.Sequential(
             nn.Linear(self.trade_dim, 64), nn.ReLU(), nn.LayerNorm(64),
             nn.Linear(64, 32), nn.ReLU()
         )
-
         self.market_fc = nn.Sequential(
             nn.Linear(self.market_dim, 128), nn.ReLU(), nn.LayerNorm(128),
             nn.Linear(128, 32), nn.ReLU()
         )
 
+        # GRU for temporal feature extraction
         self.gru = nn.GRU(64, gru_hidden_dim, num_layers=num_layers, batch_first=True)
 
+        # Fusion layer: input size includes GRU output, position features, actions, and future predictions
+        fusion_fc_input_dim = gru_hidden_dim + self.position_dim + action_dim + (predict_steps * self.feature_dim)
         self.fusion_fc = nn.Sequential(
-            nn.Linear(gru_hidden_dim + 32 + action_dim, hidden_dim * 2),
+            nn.Linear(fusion_fc_input_dim, hidden_dim * 2),
             nn.BatchNorm1d(hidden_dim * 2),
             nn.ReLU(),
             nn.LayerNorm(hidden_dim * 2),
@@ -507,18 +531,20 @@ class IQNCritic(nn.Module):
             nn.ReLU()
         )
 
+        # Q-value output
         self.q_values = nn.Sequential(
             nn.Linear(hidden_dim, num_quantiles),
             nn.LayerNorm(num_quantiles)
         )
 
+        # Initialize weights
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.orthogonal_(m.weight, gain=0.1)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
-                    
-    def forward(self, state, action, taus=None, return_taus=False):
+
+    def forward(self, state, action, future_features=None, taus=None, return_taus=False):
         device = next(self.parameters()).device
 
         if isinstance(state, np.ndarray):
@@ -527,7 +553,7 @@ class IQNCritic(nn.Module):
             action = torch.from_numpy(action).to(device)
 
         state = torch.as_tensor(state, dtype=torch.float32, device=device)
-        
+
         batch_size = state.shape[0]
         if action.shape[0] != batch_size:
             action = action.expand(batch_size, -1)
@@ -536,30 +562,50 @@ class IQNCritic(nn.Module):
         if state.dim() == 2 and state.shape[1] == expected_flat_dim:
             state = state.view(batch_size, self.time_steps, self.feature_dim)
 
+        # Feature extraction
         market_state = state[:, :, :self.market_dim]
-        position_state = state[:, :, self.market_dim:self.market_dim + self.position_dim] 
-        trade_state = state[:, :, self.market_dim + self.position_dim:]  # Changed to use last timestep
+        position_state = state[:, :, self.market_dim:self.market_dim + self.position_dim]
+        trade_state = state[:, :, self.market_dim + self.position_dim:]
 
-        position_out = self.position_fc(position_state)
-        trade_out = self.trade_fc(trade_state)
-        market_out = self.market_fc(market_state)  
+        position_out = self.position_fc(position_state)  # Shape: (batch_size, time_steps, 32)
+        trade_out = self.trade_fc(trade_state)  # Shape: (batch_size, time_steps, 32)
+        market_out = self.market_fc(market_state)  # Shape: (batch_size, time_steps, 32)
 
-        x = torch.cat([trade_out, market_out], dim=-1)
+        # Concatenate trade and market features
+        x = torch.cat([trade_out, market_out], dim=-1)  # Shape: (batch_size, time_steps, 64)
+
+        # Initialize GRU state
         state_h = torch.zeros(self.num_layers, batch_size, self.gru_hidden_dim, device=device)
-        x, _ = self.gru(x, state_h)
-        x = x[:, -1, :]  # Take last timestep output
-        position_out = position_out[:, -1, :]
-        x = torch.cat([x, position_out, action], dim=-1)
-        x = self.fusion_fc(x)
-        
-        # Output shape: [batch_size, num_quantiles]
-        q_values = self.q_values(x)
-        
+
+        # GRU forward pass
+        x, _ = self.gru(x, state_h)  # x: (batch_size, time_steps, gru_hidden_dim)
+
+        # Take the last timestep output
+        x = x[:, -1, :]  # Shape: (batch_size, gru_hidden_dim)
+
+        # Flatten future features
+        if future_features is not None:
+            future_features = future_features.view(batch_size, -1)  # Shape: (batch_size, predict_steps * feature_dim)
+
+        # Extract the last timestep of position features
+        position_out = position_out[:, -1, :]  # Shape: (batch_size, 32)
+
+        # Concatenate GRU output, position features, action, and future features
+        if future_features is not None:
+            x = torch.cat([x, position_out, action, future_features], dim=-1)  # Shape: (batch_size, fusion_fc_input_dim)
+        else:
+            x = torch.cat([x, position_out, action], dim=-1)  # Shape: (batch_size, fusion_fc_input_dim - future_features)
+
+        # Pass through fusion layer
+        x = self.fusion_fc(x)  # Shape: (batch_size, hidden_dim)
+
+        # Output Q-values
+        q_values = self.q_values(x)  # Shape: (batch_size, num_quantiles)
+
         if taus is None:
             taus = torch.rand(batch_size, self.num_quantiles, device=device)
-        
-        return (q_values, taus) if return_taus else q_values
 
+        return (q_values, taus) if return_taus else q_values
 
 def quantile_huber_loss(pred, target, taus_pred, taus_target, kappa=1.0):
     """
@@ -975,6 +1021,9 @@ if final_checkpoint_path.exists():
     policy.critic_optim.load_state_dict(saved_model['critic_optim_state_dict'])
     start_epoch = saved_model.get('epoch', 0)
     print(f"Resumed from epoch {start_epoch}")
+    new_alpha_value = 2.0  
+    policy.alpha.data = torch.tensor([new_alpha_value], dtype=torch.float32, device=device)
+    print(f"Alpha value updated to: {policy.alpha.item()}")
 else:
     print(f"Could not find model {final_checkpoint_path}")
     
