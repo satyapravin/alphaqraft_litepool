@@ -279,8 +279,8 @@ class CustomSACPolicy(SACPolicy):
             taus_target = torch.rand(B, N, device=device)
 
             # ----- Critic forward -----
-            current_q1, _ = self.critic(batch.obs, act_pred, state_h=state_h1)
-            current_q2, _ = self.critic(batch.obs, act_pred, state_h=state_h2)
+            current_q1, _ = self.critic(batch.obs, act_pred, taus=taus_pred, state_h=state_h1)
+            current_q2, _ = self.critic(batch.obs, act_pred, taus=taus_pred, state_h=state_h2)
 
             # ----- Target Q computation -----
             with torch.no_grad():
@@ -291,8 +291,8 @@ class CustomSACPolicy(SACPolicy):
                 next_log_prob = next_dist.log_prob(next_act)
                 next_log_prob = next_log_prob - torch.sum(torch.log(1 - next_act.pow(2) + 1e-6), dim=-1)
 
-                target_q1, _ = self.critic_target(batch.obs_next, next_act, state_h=state_h1)
-                target_q2, _ = self.critic_target(batch.obs_next, next_act, state_h=state_h2)
+                target_q1, _ = self.critic_target(batch.obs_next, next_act, taus=taus_target, state_h=state_h1)
+                target_q2, _ = self.critic_target(batch.obs_next, next_act, taus=taus_target, state_h=state_h2)
 
                 target_q = torch.min(target_q1, target_q2)
                 target_q = target_q - (self.get_alpha.detach() * next_log_prob.unsqueeze(1))
@@ -490,9 +490,19 @@ class RecurrentActor(nn.Module):
         return loc, scale, new_state.detach().transpose(0, 1), predicted_reward
 
 class IQNCritic(nn.Module):
-    def __init__(self, state_dim=2420, action_dim=3, hidden_dim=128, num_quantiles=64, gru_hidden_dim=128, num_layers=2):
+    def __init__(
+        self, 
+        state_dim=2420, 
+        action_dim=3, 
+        hidden_dim=128, 
+        num_quantiles=64, 
+        quantile_embedding_dim=128,
+        gru_hidden_dim=128, 
+        num_layers=2
+    ):
         super().__init__()
         self.num_quantiles = num_quantiles
+        self.quantile_embedding_dim = quantile_embedding_dim
         self.num_layers = num_layers
         self.gru_hidden_dim = gru_hidden_dim
         self.feature_dim = 242
@@ -518,8 +528,11 @@ class IQNCritic(nn.Module):
         # GRU for temporal feature extraction
         self.gru = nn.GRU(64, gru_hidden_dim, num_layers=num_layers, batch_first=True)
 
-        # Fusion layer: input size includes GRU output, position features, and actions
-        fusion_fc_input_dim = gru_hidden_dim + 32 + action_dim
+        # Quantile embedding (cosine projection)
+        self.cosine_layer = nn.Linear(quantile_embedding_dim, hidden_dim)
+
+        # Fusion layer
+        fusion_fc_input_dim = gru_hidden_dim + 32 + action_dim + hidden_dim  # 163 + 128
         self.fusion_fc = nn.Sequential(
             nn.Linear(fusion_fc_input_dim, hidden_dim * 2),
             nn.BatchNorm1d(hidden_dim * 2),
@@ -532,11 +545,11 @@ class IQNCritic(nn.Module):
 
         # Q-value output
         self.q_values = nn.Sequential(
-            nn.Linear(hidden_dim, num_quantiles),
-            nn.LayerNorm(num_quantiles)
+            nn.Linear(hidden_dim, 1),
+            nn.LayerNorm(1)
         )
 
-        # Initialize weights
+        # Weight initialization
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.orthogonal_(m.weight, gain=0.1)
@@ -552,8 +565,8 @@ class IQNCritic(nn.Module):
             action = torch.from_numpy(action).to(device)
 
         state = torch.as_tensor(state, dtype=torch.float32, device=device)
-
         batch_size = state.shape[0]
+
         if action.shape[0] != batch_size:
             action = action.expand(batch_size, -1)
 
@@ -566,37 +579,42 @@ class IQNCritic(nn.Module):
         position_state = state[:, :, self.market_dim:self.market_dim + self.position_dim]
         trade_state = state[:, :, self.market_dim + self.position_dim:]
 
-        position_out = self.position_fc(position_state)
-        trade_out = self.trade_fc(trade_state)
-        market_out = self.market_fc(market_state)
+        position_out = self.position_fc(position_state)   # [B, T, 32]
+        trade_out = self.trade_fc(trade_state)           # [B, T, 32]
+        market_out = self.market_fc(market_state)        # [B, T, 32]
 
-        # Concatenate trade and market features
-        x = torch.cat([trade_out, market_out], dim=-1)
+        x = torch.cat([trade_out, market_out], dim=-1)   # [B, T, 64]
 
-        # Initialize GRU state if not provided
         if state_h is None:
             state_h = torch.zeros(self.num_layers, batch_size, self.gru_hidden_dim, device=device)
 
-        # GRU forward pass
-        x, new_state_h = self.gru(x, state_h)
+        x, new_state_h = self.gru(x, state_h)  # [B, T, H]
+        x = x[:, -1, :]                        # [B, H]
 
-        # Take the last timestep output
-        x = x[:, -1, :]
+        position_out = position_out[:, -1, :]  # [B, 32]
+        x = torch.cat([x, position_out, action], dim=-1)  # [B, 163]
 
-        # Extract the last timestep of position features
-        position_out = position_out[:, -1, :]
+        # -------- Quantile Embedding --------
+        if taus is None:
+            taus = torch.rand(batch_size, self.num_quantiles, device=device)
 
-        # Concatenate GRU output, position features, and action
-        x = torch.cat([x, position_out, action], dim=-1)
+        i_pi = torch.arange(1, self.quantile_embedding_dim + 1, device=device).float() * np.pi
+        cos = torch.cos(taus.unsqueeze(-1) * i_pi)         # [B, N, D]
+        quantile_embedding = F.relu(self.cosine_layer(cos))  # [B, N, hidden_dim]
 
-        # Pass through fusion layer
-        x = self.fusion_fc(x)
+        # Expand x for each quantile
+        x = x.unsqueeze(1).expand(-1, self.num_quantiles, -1)  # [B, N, 163]
 
-        # Output Q-values
-        q_values = self.q_values(x)
+        # Concatenate quantile embedding
+        x = torch.cat([x, quantile_embedding], dim=-1)  # [B, N, 163 + hidden_dim]
+
+        # Flatten for FC
+        x = x.view(-1, x.shape[-1])        # [B*N, D]
+        x = self.fusion_fc(x)              # [B*N, hidden_dim]
+        q_values = self.q_values(x)        # [B*N, 1]
+        q_values = q_values.view(batch_size, self.num_quantiles)  # [B, N]
 
         return q_values, new_state_h
-
 
 def process_critic_output(critic_output):
     """Helper function to process critic output consistently"""
