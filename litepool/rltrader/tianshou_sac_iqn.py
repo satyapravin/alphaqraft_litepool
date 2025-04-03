@@ -488,9 +488,8 @@ class RecurrentActor(nn.Module):
 
         return loc, scale, new_state.detach().transpose(0, 1)
 
-
 class IQNCritic(nn.Module):
-    def __init__(self, state_dim=2420, action_dim=3, hidden_dim=128, num_quantiles=64, gru_hidden_dim=128, num_layers=2, predict_steps=10):
+    def __init__(self, state_dim=2420, action_dim=3, hidden_dim=128, num_quantiles=64, gru_hidden_dim=128, num_layers=2):
         super().__init__()
         self.num_quantiles = num_quantiles
         self.num_layers = num_layers
@@ -500,7 +499,6 @@ class IQNCritic(nn.Module):
         self.position_dim = 18
         self.trade_dim = 6
         self.market_dim = 218
-        self.predict_steps = predict_steps
 
         # Feature extractors
         self.position_fc = nn.Sequential(
@@ -519,8 +517,8 @@ class IQNCritic(nn.Module):
         # GRU for temporal feature extraction
         self.gru = nn.GRU(64, gru_hidden_dim, num_layers=num_layers, batch_first=True)
 
-        # Fusion layer: input size includes GRU output, position features, actions, and future predictions
-        fusion_fc_input_dim = gru_hidden_dim + self.position_dim + action_dim + (predict_steps * self.feature_dim)
+        # Fusion layer: input size includes GRU output, position features, and actions
+        fusion_fc_input_dim = gru_hidden_dim + 32 + action_dim
         self.fusion_fc = nn.Sequential(
             nn.Linear(fusion_fc_input_dim, hidden_dim * 2),
             nn.BatchNorm1d(hidden_dim * 2),
@@ -544,7 +542,7 @@ class IQNCritic(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
 
-    def forward(self, state, action, future_features=None, taus=None, return_taus=False):
+    def forward(self, state, action, taus=None, return_taus=False):
         device = next(self.parameters()).device
 
         if isinstance(state, np.ndarray):
@@ -583,18 +581,11 @@ class IQNCritic(nn.Module):
         # Take the last timestep output
         x = x[:, -1, :]  # Shape: (batch_size, gru_hidden_dim)
 
-        # Flatten future features
-        if future_features is not None:
-            future_features = future_features.view(batch_size, -1)  # Shape: (batch_size, predict_steps * feature_dim)
-
         # Extract the last timestep of position features
         position_out = position_out[:, -1, :]  # Shape: (batch_size, 32)
 
-        # Concatenate GRU output, position features, action, and future features
-        if future_features is not None:
-            x = torch.cat([x, position_out, action, future_features], dim=-1)  # Shape: (batch_size, fusion_fc_input_dim)
-        else:
-            x = torch.cat([x, position_out, action], dim=-1)  # Shape: (batch_size, fusion_fc_input_dim - future_features)
+        # Concatenate GRU output, position features, and action
+        x = torch.cat([x, position_out, action], dim=-1)  # Shape: (batch_size, fusion_fc_input_dim)
 
         # Pass through fusion layer
         x = self.fusion_fc(x)  # Shape: (batch_size, hidden_dim)
@@ -606,6 +597,7 @@ class IQNCritic(nn.Module):
             taus = torch.rand(batch_size, self.num_quantiles, device=device)
 
         return (q_values, taus) if return_taus else q_values
+
 
 def quantile_huber_loss(pred, target, taus_pred, taus_target, kappa=1.0):
     """
