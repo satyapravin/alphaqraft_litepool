@@ -34,7 +34,7 @@ env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
     num_threads=num_of_envs, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
-    maker_fee=-0.000, taker_fee=0.0005, foldername="./train_files/",
+    maker_fee=-0.0001, taker_fee=0.0005, foldername="./train_files/",
     balance=1.0, start=3601*10, max=64000*10
 )
 
@@ -308,45 +308,60 @@ class CustomSACPolicy(SACPolicy):
             critic_loss2 = quantile_huber_loss(current_q2, target_q, taus_pred, taus_target)
             critic_loss = critic_loss1 + critic_loss2
 
-            self.critic_optim.zero_grad()
-            self.scaler.scale(critic_loss).backward()
-            self.scaler.unscale_(self.critic_optim)
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
-            self.scaler.step(self.critic_optim)
-            self.scaler.update()
-
             # ----- Actor Loss -----
             q_min = torch.min(current_q1.detach(), current_q2.detach()).mean(dim=-1)
             actor_loss = (self.get_alpha * log_prob - q_min).mean()
 
             reward_loss = F.mse_loss(predicted_reward.detach().squeeze(-1), batch.rew)
-            total_loss = actor_loss + 0.1 * reward_loss
+            total_loss = actor_loss + 0.1 * reward_loss + critic_loss  # Combine into one loss
 
-            self.actor_optim.zero_grad()
-            self.scaler.scale(total_loss).backward()
-            self.scaler.unscale_(self.actor_optim)
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
-            self.scaler.step(self.actor_optim)
-            self.scaler.update()
+            # ----- Alpha Loss -----
+            alpha_loss = -(self.alpha * (log_prob + self.target_entropy).detach()).mean()
 
-            # ----- Debug prints -----
-            print("\nDetailed Training Stats:")
-            print(f"Actor Loss: {actor_loss.item():.6f}")
-            print(f"Reward Prediction Loss: {reward_loss.item():.6f}")
-            print(f"Critic Loss: {critic_loss.item():.6f}")
-            print(f"Total Loss: {total_loss.item():.6f}")
-            print(f"Mean Q1: {current_q1.mean().item():.6f}")
-            print(f"Mean Q2: {current_q2.mean().item():.6f}")
-            print(f"Mean Target Q: {target_q.mean().item():.6f}")
-            print(f"Mean Reward: {batch.rew.mean().item():.6f}")
-            print(f"Log Prob Mean: {log_prob.mean().item():.6f}")
-            print("-" * 50)
+        # ----- Backward Pass -----
+        self.critic_optim.zero_grad()
+        self.actor_optim.zero_grad()
+        self.alpha_optim.zero_grad()
+
+        self.scaler.scale(total_loss).backward()
+        self.scaler.scale(alpha_loss).backward()  # Backprop for alpha loss
+        self.scaler.unscale_(self.critic_optim)
+        self.scaler.unscale_(self.actor_optim)
+        self.scaler.unscale_(self.alpha_optim)
+
+        # Gradient Clipping
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
+
+        # Optimizer Steps
+        self.scaler.step(self.critic_optim)
+        self.scaler.step(self.actor_optim)
+        self.scaler.step(self.alpha_optim)
+        self.scaler.update()
+
+        # Scheduler Step
+        self.alpha_scheduler.step()
+
+        # ----- Debug prints -----
+        print("\nDetailed Training Stats:")
+        print(f"Actor Loss: {actor_loss.item():.6f}")
+        print(f"Reward Prediction Loss: {reward_loss.item():.6f}")
+        print(f"Critic Loss: {critic_loss.item():.6f}")
+        print(f"Alpha Loss: {alpha_loss.item():.6f}")
+        print(f"Alpha: {self.get_alpha.item():.6f}")
+        print(f"Total Loss: {total_loss.item():.6f}")
+        print(f"Mean Q1: {current_q1.mean().item():.6f}")
+        print(f"Mean Q2: {current_q2.mean().item():.6f}")
+        print(f"Mean Target Q: {target_q.mean().item():.6f}")
+        print(f"Mean Reward: {batch.rew.mean().item():.6f}")
+        print(f"Log Prob Mean: {log_prob.mean().item():.6f}")
+        print("-" * 50)
 
         return SACSummary(
             loss=total_loss.item(),
             loss_actor=actor_loss.item(),
             loss_critic=critic_loss.item(),
-            loss_alpha=0,
+            loss_alpha=alpha_loss.item(),
             alpha=self.get_alpha.item(),
             train_time=time.time() - start_time
         )
@@ -1052,7 +1067,7 @@ policy = CustomSACPolicy(
     critic=critic,
     actor_optim=Adam(actor.parameters(), lr=1e-3),
     critic_optim=critic_optim,
-    tau=0.005, gamma=0.995, alpha=5.0,
+    tau=0.01, gamma=0.995, alpha=50.0,
     action_space=env_action_space
 )
 
@@ -1097,7 +1112,7 @@ collector.logger = logger
 trainer = OffpolicyTrainer(
     policy=policy,
     train_collector=collector,
-    max_epoch=5,
+    max_epoch=25,
     step_per_epoch=40,
     step_per_collect=64*10,
     update_per_step=0.1,
