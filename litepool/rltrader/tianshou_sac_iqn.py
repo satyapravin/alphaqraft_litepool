@@ -258,14 +258,12 @@ class CustomSACPolicy(SACPolicy):
             if isinstance(getattr(batch, key), np.ndarray):
                 setattr(batch, key, torch.as_tensor(getattr(batch, key), dtype=torch.float32).to(device))
 
-        # Scale rewards (if necessary)
-        reward_scale = 10.0  # Adjust this based on your environment
-        batch.rew *= reward_scale
+        batch.rew *= 10.0  # Reward scaling
 
         self.training = True
 
         with autocast(device_type="cuda"):
-            # Actor forward pass (predict actions and log probabilities)
+            # Actor forward pass
             loc, scale, _, predicted_reward = self.actor(batch.obs)
             dist = Independent(Normal(loc, scale), 1)
             act_pred = dist.rsample()
@@ -274,8 +272,12 @@ class CustomSACPolicy(SACPolicy):
             log_prob = log_prob - torch.sum(torch.log(1 - act_pred.pow(2) + 1e-6), dim=-1)
 
             # Critic forward pass (current Q-values)
-            current_q1, _ = self.critic(batch.obs, act_pred)
-            current_q2, _ = self.critic(batch.obs, act_pred)
+            current_q1_out = self.critic(batch.obs, act_pred)
+            current_q2_out = self.critic(batch.obs, act_pred)
+            
+            # Extract Q-values from critic outputs
+            current_q1 = process_critic_output(current_q1_out)
+            current_q2 = process_critic_output(current_q2_out)
 
             with torch.no_grad():
                 next_loc, next_scale, _, _ = self.actor(batch.obs_next)
@@ -287,18 +289,22 @@ class CustomSACPolicy(SACPolicy):
 
                 # Sample new taus for target Q computation
                 taus_target = torch.rand(batch.obs.shape[0], self.critic.num_quantiles, device=device)
-                target_q1, _ = self.critic_target(batch.obs_next, next_act, taus=taus_target)
-                target_q2, _ = self.critic_target(batch.obs_next, next_act, taus=taus_target)
+                target_q1_out = self.critic_target(batch.obs_next, next_act)
+                target_q2_out = self.critic_target(batch.obs_next, next_act)
+                
+                # Extract Q-values from target critic outputs
+                target_q1 = process_critic_output(target_q1_out)
+                target_q2 = process_critic_output(target_q2_out)
 
-                # Use only the first element of the tuple (q_values) for torch.min
-                target_q = torch.min(target_q1, target_q2)  # Fix: Extract q_values
+                # Use min of target Q-values
+                target_q = torch.min(target_q1, target_q2)
                 target_q = target_q - (self.get_alpha.detach() * next_log_prob.unsqueeze(1))
 
-                # Bellman backup: compute the target Q-values
+                # Bellman backup
                 target_q = batch.rew.unsqueeze(1) + self.gamma * (1 - batch.done.unsqueeze(1)) * target_q
-                target_q = torch.clamp(target_q, -10.0, 10.0)  # Optional clamping for stability
-            
-            # Debug prints for Q-values
+                target_q = torch.clamp(target_q, -10.0, 10.0)
+
+            # Debug prints
             print(f"Critic Output Q1: {current_q1.mean().item():.6f}")
             print(f"Critic Output Q2: {current_q2.mean().item():.6f}")
             print(f"Target Q: {target_q.mean().item():.6f}")
@@ -338,8 +344,8 @@ class CustomSACPolicy(SACPolicy):
         return SACSummary(
             loss=total_loss.item(),
             loss_actor=actor_loss.item(),
-            loss_critic=0,  # Update this if critic loss is used
-            loss_alpha=0,  # Update this if alpha_loss is used
+            loss_critic=0,
+            loss_alpha=0,
             alpha=self.get_alpha.item(),
             train_time=time.time() - start_time
         )
@@ -551,40 +557,43 @@ class IQNCritic(nn.Module):
         position_state = state[:, :, self.market_dim:self.market_dim + self.position_dim]
         trade_state = state[:, :, self.market_dim + self.position_dim:]
 
-        position_out = self.position_fc(position_state)  # Shape: (batch_size, time_steps, 32)
-        trade_out = self.trade_fc(trade_state)  # Shape: (batch_size, time_steps, 32)
-        market_out = self.market_fc(market_state)  # Shape: (batch_size, time_steps, 32)
+        position_out = self.position_fc(position_state)
+        trade_out = self.trade_fc(trade_state)
+        market_out = self.market_fc(market_state)
 
         # Concatenate trade and market features
-        x = torch.cat([trade_out, market_out], dim=-1)  # Shape: (batch_size, time_steps, 64)
+        x = torch.cat([trade_out, market_out], dim=-1)
 
         # Initialize GRU state if not provided
         if state_h is None:
             state_h = torch.zeros(self.num_layers, batch_size, self.gru_hidden_dim, device=device)
 
         # GRU forward pass
-        x, new_state_h = self.gru(x, state_h)  # x: (batch_size, time_steps, gru_hidden_dim)
+        x, new_state_h = self.gru(x, state_h)
 
         # Take the last timestep output
-        x = x[:, -1, :]  # Shape: (batch_size, gru_hidden_dim)
+        x = x[:, -1, :]
 
         # Extract the last timestep of position features
-        position_out = position_out[:, -1, :]  # Shape: (batch_size, 32)
+        position_out = position_out[:, -1, :]
 
         # Concatenate GRU output, position features, and action
-        x = torch.cat([x, position_out, action], dim=-1)  # Shape: (batch_size, fusion_fc_input_dim)
+        x = torch.cat([x, position_out, action], dim=-1)
 
         # Pass through fusion layer
-        x = self.fusion_fc(x)  # Shape: (batch_size, hidden_dim)
+        x = self.fusion_fc(x)
 
         # Output Q-values
-        q_values = self.q_values(x)  # Shape: (batch_size, num_quantiles)
-
-        if taus is None:
-            taus = torch.rand(batch_size, self.num_quantiles, device=device)
+        q_values = self.q_values(x)
 
         return q_values, new_state_h
 
+
+def process_critic_output(critic_output):
+    """Helper function to process critic output consistently"""
+    if isinstance(critic_output, tuple):
+        return critic_output[0]  # Return just the Q-values
+    return critic_output
 
 def quantile_huber_loss(pred, target, taus_pred, taus_target, kappa=1.0):
     """
