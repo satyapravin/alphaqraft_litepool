@@ -1,4 +1,5 @@
 #pragma once
+#include <deque>
 #include "strategy.h"
 #include "base_exchange.h"
 #include "market_signal_builder.h"
@@ -26,6 +27,7 @@ private:;
     double max_realized_pnl = 0;
     double drawdown = 0;
     long num_trades = 0;
+    std::deque<double> mid_price_deque;
     std::unique_ptr<MarketSignalBuilder> market_builder;
     std::unique_ptr<PositionSignalBuilder> position_builder;
     std::unique_ptr<TradeSignalBuilder> trade_builder;

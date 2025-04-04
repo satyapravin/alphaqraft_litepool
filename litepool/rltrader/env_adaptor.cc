@@ -56,6 +56,7 @@ void EnvAdaptor::reset() {
     trade_builder = std::move(trade_ptr);
     this->strategy.reset();
     std::fill_n(state.begin(), 242*10, 0);
+    mid_price_deque.clear();
 }
 
 
@@ -74,7 +75,12 @@ void EnvAdaptor::computeInfo(OrderBook &book) {
     double latest_dd = std::min(posInfo.inventoryPnL - max_unrealized_pnl, 0.0) + std::min(posInfo.tradingPnL - max_realized_pnl, 0.0);
     if (drawdown > latest_dd) drawdown = latest_dd;
     info.clear();
-    info["mid_price"] = (bid_price + ask_price) * 0.5;
+    auto mid = (bid_price + ask_price) * 0.5;
+    info["mid_price"] = mid;
+    mid_price_deque.push_back(mid);
+    mid -= mid_price_deque.front(); 
+    if (mid_price_deque.size() > 30) { mid_price_deque.pop_front(); }
+    info["mid_diff"] = mid;
     info["balance"] = posInfo.balance;
     info["unrealized_pnl"] = posInfo.inventoryPnL;
     info["realized_pnl"] = posInfo.tradingPnL;

@@ -39,8 +39,8 @@ void Strategy::quote(const double& bid_spread,
         auto initBalance = position.getInitialBalance();
 	auto mid_price = (bid_prices[0] + ask_prices[0]) * 0.5;
 	auto q_target = (target_q - leverage);
-        auto bid_price = mid_price * (1 - 0.01 * (bid_spread + 1.0));
-        auto ask_price = mid_price * (1 + 0.01 * (ask_spread + 1.0));
+        auto bid_price = mid_price * (1 - 0.0010 * (bid_spread + 1.0));
+        auto ask_price = mid_price * (1 + 0.0010 * (ask_spread + 1.0));
 
         bid_price = std::floor(bid_price / tick_size) * tick_size;
 	ask_price = std::ceil(ask_price / tick_size) * tick_size;

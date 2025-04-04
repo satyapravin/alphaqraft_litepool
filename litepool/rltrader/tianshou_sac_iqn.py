@@ -257,7 +257,7 @@ class CustomSACPolicy(SACPolicy):
             if isinstance(getattr(batch, key), np.ndarray):
                 setattr(batch, key, torch.as_tensor(getattr(batch, key), dtype=torch.float32).to(device))
 
-        batch.rew *= 10.0  # reward scaling
+        batch.rew *= 100.0  # reward scaling
 
         self.training = True
 
@@ -311,9 +311,10 @@ class CustomSACPolicy(SACPolicy):
             # ----- Actor Loss -----
             q_min = torch.min(current_q1.detach(), current_q2.detach()).mean(dim=-1)
             actor_loss = (self.get_alpha * log_prob - q_min).mean()
-
-            reward_loss = F.mse_loss(predicted_reward.detach().squeeze(-1), batch.rew)
-            total_loss = actor_loss + 0.1 * reward_loss + critic_loss  # Combine into one loss
+            mid_dev = torch.as_tensor(batch.info["mid_diff"], dtype=torch.float32, device=device)
+            binary_mid_dev = (mid_dev > 0).float()
+            reward_loss = F.binary_cross_entropy_with_logits(predicted_reward.squeeze(-1), binary_mid_dev)
+            total_loss = actor_loss + reward_loss + critic_loss
 
             # ----- Alpha Loss -----
             alpha_loss = -(self.alpha * (log_prob + self.target_entropy).detach()).mean()
@@ -1067,7 +1068,7 @@ policy = CustomSACPolicy(
     critic=critic,
     actor_optim=Adam(actor.parameters(), lr=1e-3),
     critic_optim=critic_optim,
-    tau=0.01, gamma=0.995, alpha=50.0,
+    tau=0.01, gamma=0.999, alpha=50.0,
     action_space=env_action_space
 )
 
@@ -1087,9 +1088,9 @@ if final_checkpoint_path.exists():
     policy.critic_optim.load_state_dict(saved_model['critic_optim_state_dict'])
     start_epoch = saved_model.get('epoch', 0)
     print(f"Resumed from epoch {start_epoch}")
-    new_alpha_value = 2.0  
-    policy.alpha.data = torch.tensor([new_alpha_value], dtype=torch.float32, device=device)
-    print(f"Alpha value updated to: {policy.alpha.item()}")
+    #new_alpha_value = 20.0  
+    #policy.alpha.data = torch.tensor([new_alpha_value], dtype=torch.float32, device=device)
+    #print(f"Alpha value updated to: {policy.alpha.item()}")
 else:
     print(f"Could not find model {final_checkpoint_path}")
     
@@ -1112,7 +1113,7 @@ collector.logger = logger
 trainer = OffpolicyTrainer(
     policy=policy,
     train_collector=collector,
-    max_epoch=25,
+    max_epoch=2,
     step_per_epoch=40,
     step_per_collect=64*10,
     update_per_step=0.1,
