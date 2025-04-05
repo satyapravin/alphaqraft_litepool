@@ -257,8 +257,6 @@ class CustomSACPolicy(SACPolicy):
             if isinstance(getattr(batch, key), np.ndarray):
                 setattr(batch, key, torch.as_tensor(getattr(batch, key), dtype=torch.float32).to(device))
 
-        batch.rew *= 100.0  # reward scaling
-
         self.training = True
 
         B = batch.obs.shape[0]
@@ -314,7 +312,7 @@ class CustomSACPolicy(SACPolicy):
             mid_dev = torch.as_tensor(batch.info["mid_diff"], dtype=torch.float32, device=device)
             binary_mid_dev = (mid_dev > 0).float()
             reward_loss = F.binary_cross_entropy_with_logits(predicted_reward.squeeze(-1), binary_mid_dev)
-            total_loss = actor_loss + reward_loss + critic_loss
+            total_loss = actor_loss + 0.1 * reward_loss + critic_loss
 
             # ----- Alpha Loss -----
             alpha_loss = -(self.alpha * (log_prob + self.target_entropy).detach()).mean()
@@ -490,13 +488,13 @@ class RecurrentActor(nn.Module):
         future_features = future_features.view(batch_size, -1)  # Flatten to (batch_size, predict_steps * feature_dim)
 
         # Predict cumulative reward
-        predicted_reward = self.reward_predictor(x_last)  # Shape: (batch_size, 1)
+        predicted_reward = self.reward_predictor(new_state[-1])  # Shape: (batch_size, 1)
 
         # Extract the last timestep of position features
         position_out = position_out[:, -1, :]  # Shape: (batch_size, 32)
 
         # Concatenate GRU output, future features, and position features
-        x = torch.cat([x_last, future_features, position_out], dim=-1)  # Shape: (batch_size, fusion_fc_input_dim)
+        x = torch.cat([new_state[-1], future_features, position_out], dim=-1)  # Shape: (batch_size, fusion_fc_input_dim)
 
         # Fuse features
         x = self.fusion_fc(x)  # Shape: (batch_size, hidden_dim)
@@ -1061,12 +1059,12 @@ results_dir.mkdir(exist_ok=True)
 # Initialize models and optimizers
 actor = RecurrentActor().to(device)
 critic = IQNCritic().to(device)
-critic_optim = Adam(critic.parameters(), lr=1e-3)
+critic_optim = Adam(critic.parameters(), lr=1e-4)
 
 policy = CustomSACPolicy(
     actor=actor,
     critic=critic,
-    actor_optim=Adam(actor.parameters(), lr=1e-3),
+    actor_optim=Adam(actor.parameters(), lr=1e-4),
     critic_optim=critic_optim,
     tau=0.01, gamma=0.999, alpha=50.0,
     action_space=env_action_space
@@ -1088,9 +1086,9 @@ if final_checkpoint_path.exists():
     policy.critic_optim.load_state_dict(saved_model['critic_optim_state_dict'])
     start_epoch = saved_model.get('epoch', 0)
     print(f"Resumed from epoch {start_epoch}")
-    #new_alpha_value = 20.0  
-    #policy.alpha.data = torch.tensor([new_alpha_value], dtype=torch.float32, device=device)
-    #print(f"Alpha value updated to: {policy.alpha.item()}")
+    new_alpha_value = 50.0  
+    policy.alpha.data = torch.tensor([new_alpha_value], dtype=torch.float32, device=device)
+    print(f"Alpha value updated to: {policy.alpha.item()}")
 else:
     print(f"Could not find model {final_checkpoint_path}")
     
@@ -1113,10 +1111,10 @@ collector.logger = logger
 trainer = OffpolicyTrainer(
     policy=policy,
     train_collector=collector,
-    max_epoch=2,
+    max_epoch=5,
     step_per_epoch=40,
     step_per_collect=64*10,
-    update_per_step=0.1,
+    update_per_step=1,
     episode_per_test=0,
     batch_size=num_of_envs,
     test_in_train=False,
