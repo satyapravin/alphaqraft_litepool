@@ -29,6 +29,7 @@ device = torch.device("cuda")
 # Make environment
 #------------------------------------
 num_of_envs=64
+stack_num=60
 
 env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
@@ -194,7 +195,7 @@ class SACSummary:
 import copy
 
 
-def compute_10_step_return(batch, gamma, critic, device):
+def compute_n_step_return(batch, gamma, critic, device):
     """
     Compute 10-step returns for a batch of transitions.
 
@@ -207,23 +208,21 @@ def compute_10_step_return(batch, gamma, critic, device):
     Returns:
         10-step returns as a tensor.
     """
-    rewards = batch.rew  # Rewards tensor: [batch_size, 10]
-    dones = batch.done  # Done flags: [batch_size, 10]
-    next_states = batch.obs_next[-1]  # Next state after 10 steps
+    rewards = batch.rew  # Rewards tensor: [batch_size, stack_num]
+    dones = batch.done  # Done flags: [batch_size, stack_num]
+    next_states = batch.obs_next.view(batch.rew.shape[0], -1, rewards.shape[1])[:, -1, :]  # Last next state
     batch_size = rewards.shape[0]
 
-    # Compute cumulative discounted reward for 10 steps
     discounted_rewards = torch.zeros(batch_size, device=device)
-    for i in range(10):
+    for i in range(rewards.shape[1]):  # Iterate over time steps (stack_num=10)
         discounted_rewards += (gamma ** i) * rewards[:, i]
 
     # Add the bootstrapped value (Q-value at s_{t+10})
     with torch.no_grad():
         next_q_values = critic(next_states).mean(dim=1)  # Average over quantiles
-        discounted_rewards += (gamma ** 10) * next_q_values * (1 - dones[:, -1])
+        discounted_rewards += (gamma ** rewards.shape[1]) * next_q_values * (1 - dones[:, -1])
 
     return discounted_rewards
-
 
 class CustomSACPolicy(SACPolicy):
     def __init__(
@@ -289,12 +288,20 @@ class CustomSACPolicy(SACPolicy):
                 setattr(batch, key, torch.as_tensor(getattr(batch, key), dtype=torch.float32).to(device))
 
         self.training = True
-        B = batch.obs.shape[0]
-        N = self.critic.num_quantiles  # Number of quantiles to sample
+        batch_size = batch.obs.shape[0]
+        original_feature_dim = 2420  # Original feature dimension
+
+        # Reshape stacked observations into [batch_size, stack_num, original_feature_dim]
+        batch.obs = batch.obs.view(batch_size, stack_num, original_feature_dim)
+        batch.obs_next = batch.obs_next.view(batch_size, stack_num, original_feature_dim)
+
+        # Reshape rewards and done flags
+        batch.rew = batch.rew.view(batch_size, stack_num)  # [batch_size, stack_num]
+        batch.done = batch.done.view(batch_size, stack_num)  # [batch_size, stack_num]
 
         with autocast(device_type="cuda"):
             # ----- Actor forward -----
-            loc, scale, _, predicted_move, predicted_pnl = self.actor(batch.obs)
+            loc, scale, _, predicted_move, predicted_pnl = self.actor(batch.obs[:, -1, :])  # Use only the last observation
             dist = Independent(Normal(loc, scale), 1)
             act_pred = dist.rsample()
             log_prob = dist.log_prob(act_pred)
@@ -302,11 +309,17 @@ class CustomSACPolicy(SACPolicy):
             log_prob = log_prob - torch.sum(torch.log(1 - act_pred.pow(2) + 1e-6), dim=-1)
 
             # ----- Critic forward -----
-            current_q1, _ = self.critic(batch.obs, batch.act, taus=torch.rand(B, N, device=device))
-            current_q2, _ = self.critic(batch.obs, batch.act, taus=torch.rand(B, N, device=device))
+            current_q1, _ = self.critic(batch.obs, batch.act, taus=torch.rand(batch_size, self.critic.num_quantiles, device=device))
+            current_q2, _ = self.critic(batch.obs, batch.act, taus=torch.rand(batch_size, self.critic.num_quantiles, device=device))
 
-            # ----- Compute 10-Step Returns -----
-            n_step_return = compute_10_step_return(batch, gamma=self.gamma, critic=self.critic_target, device=device)
+            # ----- Target Q computation -----
+            with torch.no_grad():
+                target_q1, _ = self.critic_target(batch.obs_next, act_pred, taus=torch.rand(batch_size, self.critic.num_quantiles, device=device))
+                target_q2, _ = self.critic_target(batch.obs_next, act_pred, taus=torch.rand(batch_size, self.critic.num_quantiles, device=device))
+                target_q = torch.min(target_q1, target_q2)
+
+            # Compute 10-step returns
+            n_step_return = compute_n_step_return(batch, gamma=self.gamma, critic=self.critic_target, device=device)
 
             # ----- Critic Loss -----
             critic_loss1 = F.mse_loss(current_q1.mean(dim=1), n_step_return)
@@ -470,7 +483,6 @@ class RecurrentActor(nn.Module):
 
         obs = torch.as_tensor(obs, dtype=torch.float32, device=next(self.parameters()).device)
         batch_size = obs.shape[0]
-
         # Reshape to (batch_size, time_steps, feature_dim)
         obs = obs.view(batch_size, self.time_steps, -1)
 
@@ -589,8 +601,12 @@ class IQNCritic(nn.Module):
             action = torch.from_numpy(action).to(device)
 
         state = torch.as_tensor(state, dtype=torch.float32, device=device)
-        batch_size = state.shape[0]
+        state_shape = state.shape
 
+        if len(state_shape) > 2:
+            state = state[:, -1, :]
+
+        batch_size = state.shape[0]
         if action.shape[0] != batch_size:
             action = action.expand(batch_size, -1)
 
@@ -1105,7 +1121,7 @@ else:
         total_size=100000,
         buffer_num=num_of_envs,
         device=device,
-        stack_num=10
+        stack_num=stack_num
     )
 
 logger = MetricLogger(print_interval=1000)
