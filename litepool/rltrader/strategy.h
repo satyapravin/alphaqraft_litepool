@@ -15,6 +15,7 @@ namespace RLTrader {
 
 		void quote(const double& bid_spread,
 			   const double& ask_spread,
+			   const double& quote_range,
 			   const double& target_q,
 		           FixedVector<double, 20>& bid_prices, 
 			   FixedVector<double, 20>& ask_prices);

@@ -277,7 +277,7 @@ class TradingRecurrentNet(nn.Module):
 from tianshou.data import ReplayBuffer, Batch
 
 class CustomCollector(Collector):
-    def __init__(self, policy, env, buffer_size=20000, **kwargs):
+    def __init__(self, policy, env, buffer_size=100, **kwargs):
         super().__init__(policy, env, **kwargs)
         self.hidden_state = None
         self.buffer = ReplayBuffer(size=buffer_size)
@@ -363,6 +363,7 @@ class CustomCollector(Collector):
 class TradingRecPPO(PPOPolicy):
     def __init__(
         self,
+        *,
         actor: TradingRecurrentNet,
         critic: TradingRecurrentNet,
         optim: torch.optim.Optimizer,
@@ -371,7 +372,14 @@ class TradingRecPPO(PPOPolicy):
         aux_coef: float = 0.1,
         **kwargs
     ) -> None:
-        super().__init__(actor, critic, optim, dist_fn=dist_fn, eps_clip=eps_clip, **kwargs)
+        super().__init__(
+            actor=actor,
+            critic=critic,
+            optim=optim,
+            dist_fn=dist_fn,
+            eps_clip=eps_clip,
+            **kwargs
+        )
         self.aux_coef = aux_coef
 
     def forward(self, batch, state=None, **kwargs):
@@ -481,8 +489,8 @@ if __name__ == "__main__":
         gamma=0.99
     )
 
-def build_dist_fn(mean, log_std):
-    return Independent(Normal(mean, log_std.exp()), 1)
+    def build_dist_fn(mean, log_std):
+        return Independent(Normal(mean, log_std.exp()), 1)
 
     # Initialize network and policy
     net = TradingRecurrentNet().to(device)
@@ -498,7 +506,7 @@ def build_dist_fn(mean, log_std):
         ent_coef=0.01,
         gae_lambda=0.95,
         max_batchsize=64,
-        action_space=action_space,
+        action_space=env_action_space,
         deterministic_eval=True,
         advantage_normalization=True,
         aux_coef=0.1
@@ -531,7 +539,7 @@ def build_dist_fn(mean, log_std):
     collector = CustomCollector(
         policy, env,
         exploration_noise=True,
-        buffer_size=2000
+        buffer_size=100
     )
     
     if final_checkpoint_path.exists():
@@ -544,13 +552,13 @@ def build_dist_fn(mean, log_std):
     trainer = OnpolicyTrainer(
         policy=policy,
         train_collector=collector,
-        max_epoch=100,
-        step_per_epoch=1000,
+        max_epoch=10,
+        step_per_epoch=100,
         repeat_per_collect=10,
         episode_per_collect=16,
         episode_per_test=0,
         batch_size=64,
-        step_per_collect=2000,
+        step_per_collect=100,
         resume_from_log=True,
     )
 
