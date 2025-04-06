@@ -29,13 +29,13 @@ device = torch.device("cuda")
 # Make environment
 #------------------------------------
 num_of_envs=64
-stack_num=60
+stack_num=10
 
 env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
     num_threads=num_of_envs, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
-    maker_fee=-0.000, taker_fee=0.0005, foldername="./train_files/",
+    maker_fee=-0.0001, taker_fee=0.0005, foldername="./train_files/",
     balance=1.0, start=3601*20, max=3600*10
 )
 
@@ -195,31 +195,43 @@ class SACSummary:
 import copy
 
 
-def compute_n_step_return(batch, gamma, critic, device):
+def compute_n_step_return(batch, gamma, critic, device, actor=None):
     """
-    Compute 10-step returns for a batch of transitions.
+    Compute n-step returns for a batch of transitions.
 
     Args:
         batch: Batch of transitions sampled from the replay buffer.
         gamma: Discount factor.
         critic: Critic network to estimate Q-values.
         device: Device to perform computations on (e.g., "cuda").
+        actor: Actor network to predict actions for the next states.
 
     Returns:
-        10-step returns as a tensor.
+        n-step returns as a tensor.
     """
     rewards = batch.rew  # Rewards tensor: [batch_size, stack_num]
     dones = batch.done  # Done flags: [batch_size, stack_num]
-    next_states = batch.obs_next.view(batch.rew.shape[0], -1, rewards.shape[1])[:, -1, :]  # Last next state
+    next_states = batch.obs_next[:, 0, :]  # Use only the last next state
     batch_size = rewards.shape[0]
 
     discounted_rewards = torch.zeros(batch_size, device=device)
-    for i in range(rewards.shape[1]):  # Iterate over time steps (stack_num=10)
+    for i in range(rewards.shape[1]):  # Iterate over time steps (stack_num)
         discounted_rewards += (gamma ** i) * rewards[:, i]
 
-    # Add the bootstrapped value (Q-value at s_{t+10})
+    # Add the bootstrapped value (Q-value at s_{t+stack_num})
     with torch.no_grad():
-        next_q_values = critic(next_states).mean(dim=1)  # Average over quantiles
+        # Use the actor to predict the next action
+        if actor is not None:
+            next_loc, next_scale, *_ = actor(next_states)
+            next_dist = Independent(Normal(next_loc, next_scale), 1)
+            next_actions = torch.tanh(next_dist.rsample())  # Sample next actions
+        else:
+            raise ValueError("Actor network is required to compute next actions.")
+
+        # Pass the next state and predicted action to the critic
+        next_q_values, _ = critic(next_states, next_actions)
+        next_q_values = next_q_values.mean(dim=1)  # Average over quantiles
+
         discounted_rewards += (gamma ** rewards.shape[1]) * next_q_values * (1 - dones[:, -1])
 
     return discounted_rewards
@@ -295,13 +307,28 @@ class CustomSACPolicy(SACPolicy):
         batch.obs = batch.obs.view(batch_size, stack_num, original_feature_dim)
         batch.obs_next = batch.obs_next.view(batch_size, stack_num, original_feature_dim)
 
-        # Reshape rewards and done flags
-        batch.rew = batch.rew.view(batch_size, stack_num)  # [batch_size, stack_num]
-        batch.done = batch.done.view(batch_size, stack_num)  # [batch_size, stack_num]
+        # Manually stack rewards and done flags
+        buffer = kwargs.get("buffer")  # Pass the replay buffer as a keyword argument
+        if buffer is not None:
+            indices = kwargs.get("indices", None)
+            if indices is not None:
+                # Convert rewards and done flags to PyTorch tensors before stacking
+                batch.rew = torch.stack(
+                    [torch.tensor(buffer.rew[indices - i], dtype=torch.float32, device=device) for i in range(stack_num)],
+                    dim=1
+                )
+                batch.done = torch.stack(
+                    [torch.tensor(buffer.done[indices - i], dtype=torch.float32, device=device) for i in range(stack_num)],
+                    dim=1
+                )
+            else:
+                raise ValueError("Replay buffer indices are required to stack rewards and done flags.")
+        else:
+            raise ValueError("Replay buffer is required to manually stack rewards and done flags.")
 
         with autocast(device_type="cuda"):
             # ----- Actor forward -----
-            loc, scale, _, predicted_move, predicted_pnl = self.actor(batch.obs[:, -1, :])  # Use only the last observation
+            loc, scale, _, predicted_move, predicted_pnl = self.actor(batch.obs[:, 0, :])  # Use only the first observation
             dist = Independent(Normal(loc, scale), 1)
             act_pred = dist.rsample()
             log_prob = dist.log_prob(act_pred)
@@ -309,17 +336,33 @@ class CustomSACPolicy(SACPolicy):
             log_prob = log_prob - torch.sum(torch.log(1 - act_pred.pow(2) + 1e-6), dim=-1)
 
             # ----- Critic forward -----
-            current_q1, _ = self.critic(batch.obs, batch.act, taus=torch.rand(batch_size, self.critic.num_quantiles, device=device))
-            current_q2, _ = self.critic(batch.obs, batch.act, taus=torch.rand(batch_size, self.critic.num_quantiles, device=device))
+            current_q1, _ = self.critic(
+                batch.obs,
+                batch.act,
+                taus=torch.rand(batch_size, self.critic.num_quantiles, device=device)
+            )
+            current_q2, _ = self.critic(
+                batch.obs,
+                batch.act,
+                taus=torch.rand(batch_size, self.critic.num_quantiles, device=device)
+            )
 
             # ----- Target Q computation -----
             with torch.no_grad():
-                target_q1, _ = self.critic_target(batch.obs_next, act_pred, taus=torch.rand(batch_size, self.critic.num_quantiles, device=device))
-                target_q2, _ = self.critic_target(batch.obs_next, act_pred, taus=torch.rand(batch_size, self.critic.num_quantiles, device=device))
+                target_q1, _ = self.critic_target(
+                    batch.obs_next,
+                    act_pred,
+                    taus=torch.rand(batch_size, self.critic.num_quantiles, device=device)
+                )
+                target_q2, _ = self.critic_target(
+                    batch.obs_next,
+                    act_pred,
+                    taus=torch.rand(batch_size, self.critic.num_quantiles, device=device)
+                )
                 target_q = torch.min(target_q1, target_q2)
 
-            # Compute 10-step returns
-            n_step_return = compute_n_step_return(batch, gamma=self.gamma, critic=self.critic_target, device=device)
+            # Compute n-step returns
+            n_step_return = compute_n_step_return(batch, gamma=self.gamma, critic=self.critic_target, device=device, actor=self.actor)
 
             # ----- Critic Loss -----
             critic_loss1 = F.mse_loss(current_q1.mean(dim=1), n_step_return)
@@ -333,13 +376,29 @@ class CustomSACPolicy(SACPolicy):
             # ----- Auxiliary Losses -----
             mid_dev = torch.as_tensor(batch.info["mid_diff"], dtype=torch.float32, device=device)
             binary_mid_dev = (mid_dev >= 0).float()
-            move_loss = F.binary_cross_entropy_with_logits(predicted_move.squeeze(-1), binary_mid_dev)
+            move_loss = F.binary_cross_entropy_with_logits(predicted_move.squeeze(-1), binary_mid_dev[:, -1])
             pnl = torch.as_tensor(batch.rew.detach(), dtype=torch.float32, device=device)
-            pnl_loss = F.mse_loss(predicted_pnl.squeeze(-1), pnl)
+            pnl_loss = F.mse_loss(predicted_pnl.squeeze(-1), pnl[:, -1])
             total_loss = actor_loss + 0.1 * move_loss + 0.1 * pnl_loss + critic_loss
 
             # ----- Alpha Loss -----
             alpha_loss = -(self.alpha * (log_prob + self.target_entropy).detach()).mean()
+
+        # ----- Debug Prints -----
+        print("\nDetailed Training Stats:")
+        print(f"Actor Loss: {actor_loss.item():.6f}")
+        print(f"Move Prediction Loss: {move_loss.item():.6f}")
+        print(f"P/L Prediction Loss: {pnl_loss.item():.6f}")
+        print(f"Critic Loss: {critic_loss.item():.6f}")
+        print(f"Alpha Loss: {alpha_loss.item():.6f}")
+        print(f"Alpha: {self.get_alpha.item():.6f}")
+        print(f"Total Loss: {total_loss.item():.6f}")
+        print(f"Mean Q1: {current_q1.mean().item():.6f}")
+        print(f"Mean Q2: {current_q2.mean().item():.6f}")
+        print(f"Mean Target Q: {n_step_return.mean().item():.6f}")
+        print(f"Mean Reward: {batch.rew.mean().item():.6f}")
+        print(f"Log Prob Mean: {log_prob.mean().item():.6f}")
+        print("-" * 50)
 
         # ----- Backward Pass -----
         self.critic_optim.zero_grad()
@@ -365,22 +424,6 @@ class CustomSACPolicy(SACPolicy):
         # Scheduler Step
         self.alpha_scheduler.step()
 
-        # ----- Debug prints -----
-        print("\nDetailed Training Stats:")
-        print(f"Actor Loss: {actor_loss.item():.6f}")
-        print(f"Move Prediction Loss: {move_loss.item():.6f}")
-        print(f"P/L Prediction Loss: {pnl_loss.item():.6f}")
-        print(f"Critic Loss: {critic_loss.item():.6f}")
-        print(f"Alpha Loss: {alpha_loss.item():.6f}")
-        print(f"Alpha: {self.get_alpha.item():.6f}")
-        print(f"Total Loss: {total_loss.item():.6f}")
-        print(f"Mean Q1: {current_q1.mean().item():.6f}")
-        print(f"Mean Q2: {current_q2.mean().item():.6f}")
-        print(f"Mean Target Q: {n_step_return.mean().item():.6f}")
-        print(f"Mean Reward: {batch.rew.mean().item():.6f}")
-        print(f"Log Prob Mean: {log_prob.mean().item():.6f}")
-        print("-" * 50)
-
         return SACSummary(
             loss=total_loss.item(),
             loss_actor=actor_loss.item(),
@@ -400,7 +443,7 @@ class CustomSACPolicy(SACPolicy):
         if state_h2 is not None:
             state_h2 = state_h2.to(device)
 
-        result = self.learn(batch=batch, state_h1=state_h1, state_h2=state_h2)
+        result = self.learn(batch=batch, state_h1=state_h1, state_h2=state_h2, buffer=buffer, indices=indices)
         return result
 
     def update_hidden_states(self, obs, act, state_h1, state_h2):
@@ -1085,7 +1128,7 @@ policy = CustomSACPolicy(
     critic=critic,
     actor_optim=Adam(actor.parameters(), lr=1e-4),
     critic_optim=critic_optim,
-    tau=0.01, gamma=0.999, alpha=50.0,
+    tau=0.01, gamma=0.99, alpha=5.0,
     action_space=env_action_space
 )
 
@@ -1105,7 +1148,7 @@ if final_checkpoint_path.exists():
     policy.critic_optim.load_state_dict(saved_model['critic_optim_state_dict'])
     start_epoch = saved_model.get('epoch', 0)
     print(f"Resumed from epoch {start_epoch}")
-    new_alpha_value = 50.0  
+    new_alpha_value = 10.0  
     policy.alpha.data = torch.tensor([new_alpha_value], dtype=torch.float32, device=device)
     print(f"Alpha value updated to: {policy.alpha.item()}")
 else:
@@ -1117,11 +1160,22 @@ if final_buffer_path.exists():
     print(f"Buffer loaded with {len(buffer)} transitions")
 else:
     print(f"Could not find buffer {final_buffer_path}")
+    def preprocess_fn(**kwargs):
+        if "buffer" in kwargs:
+            buf: ReplayBuffer = kwargs["buffer"]
+            indices = kwargs["indices"]
+            # Stack rewards and done flags over stack_num time steps
+            batch = buf[indices]
+            batch.rew = buf.rew[indices - torch.arange(stack_num).view(1, -1).to(indices.device)]
+            batch.done = buf.done[indices - torch.arange(stack_num).view(1, -1).to(indices.device)]
+            return batch
+        return kwargs
     buffer = VectorReplayBuffer(
         total_size=100000,
         buffer_num=num_of_envs,
         device=device,
-        stack_num=stack_num
+        stack_num=stack_num,
+        preprocess_fn=preprocess_fn
     )
 
 logger = MetricLogger(print_interval=1000)
@@ -1133,8 +1187,8 @@ trainer = OffpolicyTrainer(
     train_collector=collector,
     max_epoch=5,
     step_per_epoch=40,
-    step_per_collect=64*10,
-    update_per_step=1,
+    step_per_collect=64*5,
+    update_per_step=0.1,
     episode_per_test=0,
     batch_size=num_of_envs,
     test_in_train=False,
