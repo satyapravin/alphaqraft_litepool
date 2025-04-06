@@ -194,6 +194,37 @@ class SACSummary:
 import copy
 
 
+def compute_10_step_return(batch, gamma, critic, device):
+    """
+    Compute 10-step returns for a batch of transitions.
+
+    Args:
+        batch: Batch of transitions sampled from the replay buffer.
+        gamma: Discount factor.
+        critic: Critic network to estimate Q-values.
+        device: Device to perform computations on (e.g., "cuda").
+
+    Returns:
+        10-step returns as a tensor.
+    """
+    rewards = batch.rew  # Rewards tensor: [batch_size, 10]
+    dones = batch.done  # Done flags: [batch_size, 10]
+    next_states = batch.obs_next[-1]  # Next state after 10 steps
+    batch_size = rewards.shape[0]
+
+    # Compute cumulative discounted reward for 10 steps
+    discounted_rewards = torch.zeros(batch_size, device=device)
+    for i in range(10):
+        discounted_rewards += (gamma ** i) * rewards[:, i]
+
+    # Add the bootstrapped value (Q-value at s_{t+10})
+    with torch.no_grad():
+        next_q_values = critic(next_states).mean(dim=1)  # Average over quantiles
+        discounted_rewards += (gamma ** 10) * next_q_values * (1 - dones[:, -1])
+
+    return discounted_rewards
+
+
 class CustomSACPolicy(SACPolicy):
     def __init__(
         self,
@@ -258,7 +289,6 @@ class CustomSACPolicy(SACPolicy):
                 setattr(batch, key, torch.as_tensor(getattr(batch, key), dtype=torch.float32).to(device))
 
         self.training = True
-
         B = batch.obs.shape[0]
         N = self.critic.num_quantiles  # Number of quantiles to sample
 
@@ -271,44 +301,23 @@ class CustomSACPolicy(SACPolicy):
             act_pred = torch.tanh(act_pred)
             log_prob = log_prob - torch.sum(torch.log(1 - act_pred.pow(2) + 1e-6), dim=-1)
 
-            # ----- Sample quantile fractions -----
-            taus_pred = torch.rand(B, N, device=device)
-            taus_target = torch.rand(B, N, device=device)
-
-            state_h1_detached = state_h1.detach() if state_h1 is not None else None
-            state_h2_detached = state_h2.detach() if state_h2 is not None else None
-            
             # ----- Critic forward -----
-            current_q1, _ = self.critic(batch.obs, act_pred, taus=taus_pred, state_h=state_h1_detached)
-            current_q2, _ = self.critic(batch.obs, act_pred, taus=taus_pred, state_h=state_h2_detached)
+            current_q1, _ = self.critic(batch.obs, batch.act, taus=torch.rand(B, N, device=device))
+            current_q2, _ = self.critic(batch.obs, batch.act, taus=torch.rand(B, N, device=device))
 
-            # ----- Target Q computation -----
-            with torch.no_grad():
-                next_loc, next_scale, _, _, _ = self.actor(batch.obs_next)
-                next_dist = Independent(Normal(next_loc, next_scale), 1)
-                next_act = next_dist.rsample()
-                next_act = torch.tanh(next_act)
-                next_log_prob = next_dist.log_prob(next_act)
-                next_log_prob = next_log_prob - torch.sum(torch.log(1 - next_act.pow(2) + 1e-6), dim=-1)
-                target_q1, _ = self.critic_target(batch.obs_next, next_act, taus=taus_target, state_h=state_h1_detached)
-                target_q2, _ = self.critic_target(batch.obs_next, next_act, taus=taus_target, state_h=state_h2_detached)
+            # ----- Compute 10-Step Returns -----
+            n_step_return = compute_10_step_return(batch, gamma=self.gamma, critic=self.critic_target, device=device)
 
-                target_q1 = target_q1.detach()
-                target_q2 = target_q2.detach()
-
-                target_q = torch.min(target_q1, target_q2)
-                target_q = target_q - (self.get_alpha.detach() * next_log_prob.unsqueeze(1))
-                target_q = batch.rew.unsqueeze(1) + self.gamma * (1 - batch.done.unsqueeze(1)) * target_q
-                target_q = torch.clamp(target_q, -10.0, 10.0)
-
-            # ----- Quantile Huber Loss -----
-            critic_loss1 = quantile_huber_loss(current_q1, target_q, taus_pred, taus_target)
-            critic_loss2 = quantile_huber_loss(current_q2, target_q, taus_pred, taus_target)
+            # ----- Critic Loss -----
+            critic_loss1 = F.mse_loss(current_q1.mean(dim=1), n_step_return)
+            critic_loss2 = F.mse_loss(current_q2.mean(dim=1), n_step_return)
             critic_loss = critic_loss1 + critic_loss2
 
             # ----- Actor Loss -----
             q_min = torch.min(current_q1.detach(), current_q2.detach()).mean(dim=-1)
             actor_loss = (self.get_alpha * log_prob - q_min).mean()
+
+            # ----- Auxiliary Losses -----
             mid_dev = torch.as_tensor(batch.info["mid_diff"], dtype=torch.float32, device=device)
             binary_mid_dev = (mid_dev >= 0).float()
             move_loss = F.binary_cross_entropy_with_logits(predicted_move.squeeze(-1), binary_mid_dev)
@@ -354,7 +363,7 @@ class CustomSACPolicy(SACPolicy):
         print(f"Total Loss: {total_loss.item():.6f}")
         print(f"Mean Q1: {current_q1.mean().item():.6f}")
         print(f"Mean Q2: {current_q2.mean().item():.6f}")
-        print(f"Mean Target Q: {target_q.mean().item():.6f}")
+        print(f"Mean Target Q: {n_step_return.mean().item():.6f}")
         print(f"Mean Reward: {batch.rew.mean().item():.6f}")
         print(f"Log Prob Mean: {log_prob.mean().item():.6f}")
         print("-" * 50)
@@ -394,7 +403,7 @@ class CustomSACPolicy(SACPolicy):
 # ---------------------------
 
 class RecurrentActor(nn.Module):
-    def __init__(self, state_dim=2420, action_dim=3, hidden_dim=64, gru_hidden_dim=128, num_layers=2, predict_steps=10):
+    def __init__(self, state_dim=2420, action_dim=4, hidden_dim=64, gru_hidden_dim=128, num_layers=2, predict_steps=10):
         super().__init__()
         self.gru_hidden_dim = gru_hidden_dim
         self.num_layers = num_layers
@@ -508,7 +517,7 @@ class IQNCritic(nn.Module):
     def __init__(
         self, 
         state_dim=2420, 
-        action_dim=3, 
+        action_dim=4, 
         hidden_dim=128, 
         num_quantiles=64, 
         quantile_embedding_dim=128,
@@ -1095,7 +1104,8 @@ else:
     buffer = VectorReplayBuffer(
         total_size=100000,
         buffer_num=num_of_envs,
-        device=device
+        device=device,
+        stack_num=10
     )
 
 logger = MetricLogger(print_interval=1000)
