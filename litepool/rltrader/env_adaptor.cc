@@ -79,7 +79,7 @@ void EnvAdaptor::computeInfo(OrderBook &book) {
     info["mid_price"] = mid;
     mid_price_deque.push_back(mid);
     mid -= mid_price_deque.front(); 
-    if (mid_price_deque.size() > 30) { mid_price_deque.pop_front(); }
+    if (mid_price_deque.size() > 1) { mid_price_deque.pop_front(); }
     info["mid_diff"] = mid;
     info["balance"] = posInfo.balance;
     info["unrealized_pnl"] = posInfo.inventoryPnL;

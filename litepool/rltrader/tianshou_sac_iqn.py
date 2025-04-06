@@ -34,8 +34,8 @@ env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
     num_threads=num_of_envs, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
-    maker_fee=-0.0001, taker_fee=0.0005, foldername="./train_files/",
-    balance=1.0, start=3601*10, max=64000*10
+    maker_fee=-0.000, taker_fee=0.0005, foldername="./train_files/",
+    balance=1.0, start=3601*20, max=3600*10
 )
 
 env.spec.id = 'RlTrader-v0'
@@ -240,7 +240,7 @@ class CustomSACPolicy(SACPolicy):
 
     def forward(self, batch: Batch, state=None, **kwargs):
         obs = batch.obs
-        loc, scale, h, _ = self.actor(obs, state=state)
+        loc, scale, h, _, _ = self.actor(obs, state=state)
         dist = Independent(Normal(loc, scale), 1)
         act = dist.rsample()
         log_prob = dist.log_prob(act)
@@ -264,7 +264,7 @@ class CustomSACPolicy(SACPolicy):
 
         with autocast(device_type="cuda"):
             # ----- Actor forward -----
-            loc, scale, _, predicted_reward = self.actor(batch.obs)
+            loc, scale, _, predicted_move, predicted_pnl = self.actor(batch.obs)
             dist = Independent(Normal(loc, scale), 1)
             act_pred = dist.rsample()
             log_prob = dist.log_prob(act_pred)
@@ -284,7 +284,7 @@ class CustomSACPolicy(SACPolicy):
 
             # ----- Target Q computation -----
             with torch.no_grad():
-                next_loc, next_scale, _, _ = self.actor(batch.obs_next)
+                next_loc, next_scale, _, _, _ = self.actor(batch.obs_next)
                 next_dist = Independent(Normal(next_loc, next_scale), 1)
                 next_act = next_dist.rsample()
                 next_act = torch.tanh(next_act)
@@ -310,9 +310,11 @@ class CustomSACPolicy(SACPolicy):
             q_min = torch.min(current_q1.detach(), current_q2.detach()).mean(dim=-1)
             actor_loss = (self.get_alpha * log_prob - q_min).mean()
             mid_dev = torch.as_tensor(batch.info["mid_diff"], dtype=torch.float32, device=device)
-            binary_mid_dev = (mid_dev > 0).float()
-            reward_loss = F.binary_cross_entropy_with_logits(predicted_reward.squeeze(-1), binary_mid_dev)
-            total_loss = actor_loss + 0.1 * reward_loss + critic_loss
+            binary_mid_dev = (mid_dev >= 0).float()
+            move_loss = F.binary_cross_entropy_with_logits(predicted_move.squeeze(-1), binary_mid_dev)
+            pnl = torch.as_tensor(batch.rew.detach(), dtype=torch.float32, device=device)
+            pnl_loss = F.mse_loss(predicted_pnl.squeeze(-1), pnl)
+            total_loss = actor_loss + 0.1 * move_loss + 0.1 * pnl_loss + critic_loss
 
             # ----- Alpha Loss -----
             alpha_loss = -(self.alpha * (log_prob + self.target_entropy).detach()).mean()
@@ -344,7 +346,8 @@ class CustomSACPolicy(SACPolicy):
         # ----- Debug prints -----
         print("\nDetailed Training Stats:")
         print(f"Actor Loss: {actor_loss.item():.6f}")
-        print(f"Reward Prediction Loss: {reward_loss.item():.6f}")
+        print(f"Move Prediction Loss: {move_loss.item():.6f}")
+        print(f"P/L Prediction Loss: {pnl_loss.item():.6f}")
         print(f"Critic Loss: {critic_loss.item():.6f}")
         print(f"Alpha Loss: {alpha_loss.item():.6f}")
         print(f"Alpha: {self.get_alpha.item():.6f}")
@@ -418,26 +421,30 @@ class RecurrentActor(nn.Module):
             nn.Linear(128, 32), nn.ReLU()
         )
 
-        # GRU for temporal feature extraction
-        self.gru = nn.GRU(64, gru_hidden_dim, num_layers=num_layers, batch_first=True)
-
-        # Future prediction network
-        self.future_predictor = nn.Sequential(
-            nn.Linear(gru_hidden_dim, gru_hidden_dim), nn.ReLU(),
-            nn.Linear(gru_hidden_dim, self.feature_dim * self.predict_steps)
+        self.position_fc = nn.Sequential(
+            nn.Linear(self.position_dim, 64), nn.ReLU(), nn.LayerNorm(64),
+            nn.Linear(64, 32), nn.ReLU()
         )
 
+        # GRU for temporal feature extraction
+        self.gru = nn.GRU(96, gru_hidden_dim, num_layers=num_layers, batch_first=True)
+
         # Fusion layer
-        fusion_fc_input_dim = gru_hidden_dim + (self.predict_steps * self.feature_dim) + 32
         self.fusion_fc = nn.Sequential(
-            nn.Linear(fusion_fc_input_dim, hidden_dim * 2), nn.ReLU(),
+            nn.Linear(gru_hidden_dim * 2, hidden_dim * 2), nn.ReLU(),
             nn.LayerNorm(hidden_dim * 2), nn.Linear(hidden_dim * 2, hidden_dim), nn.ReLU()
         )
 
-        # Reward prediction head
-        self.reward_predictor = nn.Sequential(
-            nn.Linear(gru_hidden_dim, 64), nn.ReLU(),  # Intermediate hidden layer
-            nn.Linear(64, 1)  # Predicts a single scalar (cumulative reward)
+        # move prediction head
+        self.move_predictor = nn.Sequential(
+            nn.Linear(gru_hidden_dim * 2, 64), nn.ReLU(),  # Intermediate hidden layer
+            nn.Linear(64, 1)  # Predicts a single scalar (logits)
+        )
+
+        # pnl prediction head 
+        self.pnl_predictor = nn.Sequential(
+            nn.Linear(gru_hidden_dim * 2, 64), nn.ReLU(),  # Intermediate hidden layer
+            nn.Linear(64, 1)  # Predicts a single scalar (pnl_diff)
         )
 
         # Output layers for action distribution
@@ -469,7 +476,7 @@ class RecurrentActor(nn.Module):
         market_out = self.market_fc(market_state)  # Shape: (batch_size, time_steps, 32)
 
         # Concatenate trade and market features
-        x = torch.cat([trade_out, market_out], dim=-1)  # Shape: (batch_size, time_steps, 64)
+        x = torch.cat([trade_out, market_out, position_out], dim=-1)  # Shape: (batch_size, time_steps, 96)
 
         # Initialize GRU state if not provided
         if state is None:
@@ -480,26 +487,14 @@ class RecurrentActor(nn.Module):
         # GRU forward pass
         x, new_state = self.gru(x, state)  # x: (batch_size, time_steps, gru_hidden_dim)
 
-        # Take the last timestep output
         x_last = x[:, -1, :]  # Shape: (batch_size, gru_hidden_dim)
+        
+        predictor_input = torch.cat([new_state[-1], x_last], dim=-1)
 
-        # Predict future features
-        future_features = self.future_predictor(x_last)  # Shape: (batch_size, feature_dim * predict_steps)
-        future_features = future_features.view(batch_size, -1)  # Flatten to (batch_size, predict_steps * feature_dim)
+        predicted_move = self.move_predictor(predictor_input)  # Shape: (batch_size, 1)
+        predicted_pnl = self.pnl_predictor(predictor_input)  # Shape: (batch_size, 1)
+        x = self.fusion_fc(predictor_input)  # Shape: (batch_size, hidden_dim)
 
-        # Predict cumulative reward
-        predicted_reward = self.reward_predictor(new_state[-1])  # Shape: (batch_size, 1)
-
-        # Extract the last timestep of position features
-        position_out = position_out[:, -1, :]  # Shape: (batch_size, 32)
-
-        # Concatenate GRU output, future features, and position features
-        x = torch.cat([new_state[-1], future_features, position_out], dim=-1)  # Shape: (batch_size, fusion_fc_input_dim)
-
-        # Fuse features
-        x = self.fusion_fc(x)  # Shape: (batch_size, hidden_dim)
-
-        # Output mean and std for action distribution
         mean = self.mean(x)  # Shape: (batch_size, action_dim)
         log_std = self.log_std(x).clamp(-10, 2)  # Shape: (batch_size, action_dim)
         std = log_std.exp() + 1e-6
@@ -507,7 +502,7 @@ class RecurrentActor(nn.Module):
         loc = mean
         scale = std
 
-        return loc, scale, new_state.detach().transpose(0, 1), predicted_reward
+        return loc, scale, new_state.detach().transpose(0, 1), predicted_move, predicted_pnl
 
 class IQNCritic(nn.Module):
     def __init__(
@@ -546,13 +541,13 @@ class IQNCritic(nn.Module):
         )
 
         # GRU for temporal feature extraction
-        self.gru = nn.GRU(64, gru_hidden_dim, num_layers=num_layers, batch_first=True)
+        self.gru = nn.GRU(96, gru_hidden_dim, num_layers=num_layers, batch_first=True)
 
         # Quantile embedding (cosine projection)
         self.cosine_layer = nn.Linear(quantile_embedding_dim, hidden_dim)
 
         # Fusion layer
-        fusion_fc_input_dim = gru_hidden_dim + 32 + action_dim + hidden_dim  # 163 + 128
+        fusion_fc_input_dim = gru_hidden_dim * 2 + action_dim + hidden_dim  
         self.fusion_fc = nn.Sequential(
             nn.Linear(fusion_fc_input_dim, hidden_dim * 2),
             nn.BatchNorm1d(hidden_dim * 2),
@@ -603,7 +598,7 @@ class IQNCritic(nn.Module):
         trade_out = self.trade_fc(trade_state)           # [B, T, 32]
         market_out = self.market_fc(market_state)        # [B, T, 32]
 
-        x = torch.cat([trade_out, market_out], dim=-1)   # [B, T, 64]
+        x = torch.cat([trade_out, market_out, position_out], dim=-1)   # [B, T, 96]
 
         if state_h is None:
             state_h = torch.zeros(self.num_layers, batch_size, self.gru_hidden_dim, device=device)
@@ -611,8 +606,7 @@ class IQNCritic(nn.Module):
         x, new_state_h = self.gru(x, state_h)  # [B, T, H]
         x = x[:, -1, :]                        # [B, H]
 
-        position_out = position_out[:, -1, :]  # [B, 32]
-        x = torch.cat([x, position_out, action], dim=-1)  # [B, 163]
+        x = torch.cat([x, new_state_h[-1], action], dim=-1) 
 
         # -------- Quantile Embedding --------
         if taus is None:
@@ -623,10 +617,10 @@ class IQNCritic(nn.Module):
         quantile_embedding = F.relu(self.cosine_layer(cos))  # [B, N, hidden_dim]
 
         # Expand x for each quantile
-        x = x.unsqueeze(1).expand(-1, self.num_quantiles, -1)  # [B, N, 163]
+        x = x.unsqueeze(1).expand(-1, self.num_quantiles, -1)  # [B, N, ]
 
         # Concatenate quantile embedding
-        x = torch.cat([x, quantile_embedding], dim=-1)  # [B, N, 163 + hidden_dim]
+        x = torch.cat([x, quantile_embedding], dim=-1)  # [B, N,  + hidden_dim]
 
         # Flatten for FC
         x = x.view(-1, x.shape[-1])        # [B*N, D]
