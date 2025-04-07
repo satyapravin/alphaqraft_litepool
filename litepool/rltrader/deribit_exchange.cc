@@ -1,5 +1,6 @@
 #include "deribit_exchange.h"
-
+#include <thread>
+#include <chrono>
 #include <iostream>
 
 using namespace RLTrader;
@@ -8,11 +9,6 @@ using namespace RLTrader;
 DeribitExchange::DeribitExchange(const std::string& symbol, const std::string& api_key, const std::string& api_secret)
     :db_client(api_key, api_secret, symbol), symbol(symbol), orders_count(0), RESTApi(api_key, api_secret)
 {
-    this->bid.state = OrderState::CANCELLED;
-    this->ask.state = OrderState::CANCELLED;
-    this->bid.side = OrderSide::BUY;
-    this->ask.side = OrderSide::SELL;
-
 }
 
 void DeribitExchange::toBook(const std::unordered_map<std::string, double>& lob, OrderBook& book)  {
@@ -81,18 +77,6 @@ void DeribitExchange::handle_order_updates (const json& data) {
         const std::string& order_id = data["order_id"];
         OrderState order_state = (data["order_state"] == "open"
                                  || data["order_state"] == "untriggered") ? OrderState::NEW_ACK : OrderState::CANCELLED;
-
-        std::lock_guard<std::mutex> order_guard(this->order_mutex);
-
-        if (side == OrderSide::BUY) {
-            bid.price = price;
-            bid.state = order_state;
-            bid.orderId = order_id;
-        } else {
-            ask.price = price;
-            ask.state = order_state;
-            ask.orderId = order_id;
-        }
     }
 }
 
@@ -128,20 +112,8 @@ bool is_close(const double& a, const double& b) {
 
 void DeribitExchange::quote(std::string order_id, OrderSide side, const double& price, const double& amount) {
     std::string sidestr = side == OrderSide::BUY ? "buy" : "sell";
-    {
-        std::lock_guard<std::mutex> order_guard(this->order_mutex);
-        if (side == OrderSide::BUY) {
-            if (this->bid.state == OrderState::NEW_ACK && is_close(price, this->bid.price)) {
-		return;
-	    }
-        } else {
-            if (this->ask.state == OrderState::NEW_ACK && is_close(price, this->ask.price)) {
-	        return;
-	    }
-        }
-    }
-
-    this->db_client.cancel_all_by_label(sidestr);
+    //this->db_client.cancel_all_by_label(sidestr);
+    //std::this_thread::sleep_for(std::chrono::milliseconds(100));
     this->db_client.place_order(sidestr, price, amount, sidestr, "limit");
 }
 

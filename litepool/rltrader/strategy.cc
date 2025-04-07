@@ -6,6 +6,8 @@
 #include "orderbook.h"
 #include "position_signal_builder.h"
 #include <iostream>
+#include <thread>
+#include <chrono>
 
 using namespace RLTrader;
 
@@ -42,32 +44,38 @@ void Strategy::quote(const double& bid_spread,
 	auto posInfo = position.getPositionInfo(bid_prices[0], ask_prices[0]);
 	auto leverage = posInfo.leverage;
         auto initBalance = position.getInitialBalance();
-	auto mid_price = (bid_prices[0] + ask_prices[0]) * 0.5;
+	auto mid_price = (bid_prices[1] + ask_prices[1]) * 0.5;
 	auto q_target = (target_q - leverage);
-	auto q_range = (quote_range + 1) / 5000;
+	auto q_range = (quote_range + 1) / 20000;
         auto bid_price = mid_price * (1 - q_range * (bid_spread + 1.0));
         auto ask_price = mid_price * (1 + q_range * (ask_spread + 1.0));
 
-        bid_price = std::floor(bid_price / tick_size) * tick_size;
-	ask_price = std::ceil(ask_price / tick_size) * tick_size;
+        auto bid_price_0 = std::floor(bid_price / tick_size) * tick_size;
+	auto ask_price_0 = std::ceil(ask_price / tick_size) * tick_size;
 
 	if (bid_price > bid_prices[0]) bid_price = bid_prices[0];
 	if (ask_price < ask_prices[0]) ask_price = ask_prices[0];
 
-        auto bid_size = 0.05 * initBalance;
-        auto ask_size = 0.05 * initBalance;
+        auto bid_size_0 = 0.01 * initBalance;
+        auto ask_size_0 = 0.01 * initBalance;
 
-	if (q_target > 0) bid_size *= 1.5;
-	if (q_target < 0) ask_size *= 1.5;
+	if (q_target > 0) bid_size_0 *= 1.5;
+	if (q_target < 0) ask_size_0 *= 1.5;
 	
-	bid_size = instrument.getTradeAmount(bid_size, bid_price);
-	ask_size = instrument.getTradeAmount(ask_size, ask_price);
-	if (exchange.isDummy()) exchange.cancelOrders();
-
+	// if (exchange.isDummy()) exchange.cancelOrders();
+        exchange.cancelOrders();
+	//std::this_thread::sleep_for(std::chrono::milliseconds(10));
         //std::cout << bid_price << "\t" << ask_price << "\t" << bid_size << "\t" << ask_size << std::endl;
 
-	this->exchange.quote(std::to_string(++order_id), OrderSide::BUY, bid_price, bid_size);
-        this->exchange.quote(std::to_string(++order_id), OrderSide::SELL, ask_price, ask_size);
+
+	for (int ii=0; ii < 8; ++ii) {
+	    bid_price = bid_price_0 - 5 * tick_size * ii;
+	    ask_price = ask_price_0 + 5 * tick_size * ii;
+	    auto bid_size = instrument.getTradeAmount(bid_size_0 * (1 + 0.2 * ii), bid_price_0);
+	    auto ask_size = instrument.getTradeAmount(ask_size_0 * (1 + 0.2 * ii), ask_price_0);
+	    this->exchange.quote(std::to_string(++order_id), OrderSide::BUY, bid_price, bid_size);
+            this->exchange.quote(std::to_string(++order_id), OrderSide::SELL, ask_price, ask_size);
+	}
 }
 
 void Strategy::next() {

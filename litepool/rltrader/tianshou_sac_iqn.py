@@ -29,13 +29,13 @@ device = torch.device("cuda")
 # Make environment
 #------------------------------------
 num_of_envs=64
-stack_num=10
+stack_num=60
 
 env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
     num_threads=num_of_envs, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
-    maker_fee=-0.0001, taker_fee=0.0005, foldername="./train_files/",
+    maker_fee=-0.0000, taker_fee=0.0005, foldername="./train_files/",
     balance=1.0, start=3601*20, max=3600*10
 )
 
@@ -133,7 +133,7 @@ class VecNormalize:
         return getattr(self.env, name)
 
 class RunningMeanStd:
-    def __init__(self, shape=(), epsilon=1e-4):
+    def __init__(self, shape=(), epsilon=1e-5):
         self.mean = torch.zeros(shape, dtype=torch.float32, device=device)
         self.var = torch.ones(shape, dtype=torch.float32, device=device)
         self.count = torch.tensor(epsilon, dtype=torch.float32, device=device)
@@ -266,11 +266,11 @@ class CustomSACPolicy(SACPolicy):
         self.target_entropy = -np.prod(action_space.shape).item()
 
         # Optimizer for alpha (no log transformation)
-        self.alpha_optim = torch.optim.Adam([self.alpha], lr=1e-3)
+        self.alpha_optim = torch.optim.Adam([self.alpha], lr=1e-5)
 
         # Learning rate scheduler for alpha
         self.alpha_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.alpha_optim, T_max=1000000, eta_min=1e-3
+            self.alpha_optim, T_max=1000000, eta_min=1e-5
         )
 
         self.critic_target = copy.deepcopy(critic)
@@ -328,7 +328,7 @@ class CustomSACPolicy(SACPolicy):
 
         with autocast(device_type="cuda"):
             # ----- Actor forward -----
-            loc, scale, _, predicted_move, predicted_pnl = self.actor(batch.obs[:, 0, :])  # Use only the first observation
+            loc, scale, _, predicted_move, predicted_pnl = self.actor(batch.obs[:, -1, :])  # Use only the last observation
             dist = Independent(Normal(loc, scale), 1)
             act_pred = dist.rsample()
             log_prob = dist.log_prob(act_pred)
@@ -1121,12 +1121,12 @@ results_dir.mkdir(exist_ok=True)
 # Initialize models and optimizers
 actor = RecurrentActor().to(device)
 critic = IQNCritic().to(device)
-critic_optim = Adam(critic.parameters(), lr=1e-4)
+critic_optim = Adam(critic.parameters(), lr=1e-5)
 
 policy = CustomSACPolicy(
     actor=actor,
     critic=critic,
-    actor_optim=Adam(actor.parameters(), lr=1e-4),
+    actor_optim=Adam(actor.parameters(), lr=1e-5),
     critic_optim=critic_optim,
     tau=0.01, gamma=0.99, alpha=5.0,
     action_space=env_action_space
@@ -1148,7 +1148,7 @@ if final_checkpoint_path.exists():
     policy.critic_optim.load_state_dict(saved_model['critic_optim_state_dict'])
     start_epoch = saved_model.get('epoch', 0)
     print(f"Resumed from epoch {start_epoch}")
-    new_alpha_value = 10.0  
+    new_alpha_value = 2.0  
     policy.alpha.data = torch.tensor([new_alpha_value], dtype=torch.float32, device=device)
     print(f"Alpha value updated to: {policy.alpha.item()}")
 else:
@@ -1185,7 +1185,7 @@ collector.logger = logger
 trainer = OffpolicyTrainer(
     policy=policy,
     train_collector=collector,
-    max_epoch=5,
+    max_epoch=15,
     step_per_epoch=40,
     step_per_collect=64*5,
     update_per_step=0.1,
