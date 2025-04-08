@@ -33,7 +33,6 @@ void Strategy::reset() {
 void Strategy::quote(const double& bid_spread,
                      const double& ask_spread,
                      const double& quote_range,
-                     const double& target_q,
                      FixedVector<double, 20>& bid_prices,
                      FixedVector<double, 20>& ask_prices) {
 	assert(bid_spread >= -1.0001 && bid_spread <= 1.001);
@@ -45,7 +44,6 @@ void Strategy::quote(const double& bid_spread,
 	auto leverage = posInfo.leverage;
         auto initBalance = position.getInitialBalance();
 	auto mid_price = (bid_prices[1] + ask_prices[1]) * 0.5;
-	auto q_target = (target_q - leverage);
 	auto q_range = (quote_range + 1) / 20000;
         auto bid_price = mid_price * (1 - q_range * (bid_spread + 1.0));
         auto ask_price = mid_price * (1 + q_range * (ask_spread + 1.0));
@@ -59,8 +57,8 @@ void Strategy::quote(const double& bid_spread,
         auto bid_size_0 = 0.01 * initBalance;
         auto ask_size_0 = 0.01 * initBalance;
 
-	if (q_target > 0) bid_size_0 *= 1.5;
-	if (q_target < 0) ask_size_0 *= 1.5;
+	if (leverage > 0.5) bid_size_0 = 0;
+	if (leverage < -0.5) ask_size_0 = 0;
 	
 	// if (exchange.isDummy()) exchange.cancelOrders();
         exchange.cancelOrders();
@@ -68,13 +66,15 @@ void Strategy::quote(const double& bid_spread,
         //std::cout << bid_price << "\t" << ask_price << "\t" << bid_size << "\t" << ask_size << std::endl;
 
 
-	for (int ii=0; ii < 8; ++ii) {
-	    bid_price = bid_price_0 - 5 * tick_size * ii;
-	    ask_price = ask_price_0 + 5 * tick_size * ii;
+	for (int ii=0; ii < 5; ++ii) {
+	    bid_price = bid_price_0 - 8 * tick_size * ii;
+	    ask_price = ask_price_0 + 8 * tick_size * ii;
 	    auto bid_size = instrument.getTradeAmount(bid_size_0 * (1 + 0.2 * ii), bid_price_0);
 	    auto ask_size = instrument.getTradeAmount(ask_size_0 * (1 + 0.2 * ii), ask_price_0);
-	    this->exchange.quote(std::to_string(++order_id), OrderSide::BUY, bid_price, bid_size);
-            this->exchange.quote(std::to_string(++order_id), OrderSide::SELL, ask_price, ask_size);
+	    if bid_size > 0:
+	        this->exchange.quote(std::to_string(++order_id), OrderSide::BUY, bid_price, bid_size);
+	    if ask_size > 0:
+                this->exchange.quote(std::to_string(++order_id), OrderSide::SELL, ask_price, ask_size);
 	}
 }
 
