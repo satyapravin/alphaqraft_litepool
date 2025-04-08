@@ -38,7 +38,6 @@ void Strategy::quote(const double& bid_spread,
 	assert(bid_spread >= -1.0001 && bid_spread <= 1.001);
 	assert(ask_spread >= -1.0001 && ask_spread <= 1.001);
 	assert(quote_range >= -1.0001 && quote_range <= 1.001);
-	assert(target_q >= -1.0001 && target_q <= 1.001);
 	auto tick_size = instrument.getTickSize();
 	auto posInfo = position.getPositionInfo(bid_prices[0], ask_prices[0]);
 	auto leverage = posInfo.leverage;
@@ -71,9 +70,9 @@ void Strategy::quote(const double& bid_spread,
 	    ask_price = ask_price_0 + 8 * tick_size * ii;
 	    auto bid_size = instrument.getTradeAmount(bid_size_0 * (1 + 0.2 * ii), bid_price_0);
 	    auto ask_size = instrument.getTradeAmount(ask_size_0 * (1 + 0.2 * ii), ask_price_0);
-	    if bid_size > 0:
+	    if (bid_size > 0)
 	        this->exchange.quote(std::to_string(++order_id), OrderSide::BUY, bid_price, bid_size);
-	    if ask_size > 0:
+	    if (ask_size > 0)
                 this->exchange.quote(std::to_string(++order_id), OrderSide::SELL, ask_price, ask_size);
 	}
 }

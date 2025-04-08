@@ -35,7 +35,7 @@ env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
     num_threads=num_of_envs, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
-    maker_fee=-0.0000, taker_fee=0.0005, foldername="./train_files/",
+    maker_fee=-0.0001, taker_fee=0.0005, foldername="./train_files/",
     balance=1.0, start=3601*20, max=3600*10
 )
 
@@ -133,7 +133,7 @@ class VecNormalize:
         return getattr(self.env, name)
 
 class RunningMeanStd:
-    def __init__(self, shape=(), epsilon=1e-5):
+    def __init__(self, shape=(), epsilon=3e-4):
         self.mean = torch.zeros(shape, dtype=torch.float32, device=device)
         self.var = torch.ones(shape, dtype=torch.float32, device=device)
         self.count = torch.tensor(epsilon, dtype=torch.float32, device=device)
@@ -266,11 +266,11 @@ class CustomSACPolicy(SACPolicy):
         self.target_entropy = -np.prod(action_space.shape).item()
 
         # Optimizer for alpha (no log transformation)
-        self.alpha_optim = torch.optim.Adam([self.alpha], lr=1e-5)
+        self.alpha_optim = torch.optim.Adam([self.alpha], lr=3e-4)
 
         # Learning rate scheduler for alpha
         self.alpha_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.alpha_optim, T_max=1000000, eta_min=1e-5
+            self.alpha_optim, T_max=1000000, eta_min=3e-4
         )
 
         self.critic_target = copy.deepcopy(critic)
@@ -278,11 +278,14 @@ class CustomSACPolicy(SACPolicy):
 
     @property
     def get_alpha(self):
-        return self.alpha.clamp_min(1e-5)  
+        return self.alpha.clamp_min(1e-2)  
 
     def forward(self, batch: Batch, state=None, **kwargs):
-        obs = batch.obs
-        loc, scale, h, _, _ = self.actor(obs, state=state)
+        if hasattr(batch, 'obs'):
+            obs = batch.obs
+        else:
+            obs = batch
+        loc, scale, h, _ = self.actor(obs, state=state)
         dist = Independent(Normal(loc, scale), 1)
         act = dist.rsample()
         log_prob = dist.log_prob(act)
@@ -294,100 +297,130 @@ class CustomSACPolicy(SACPolicy):
 
     def learn(self, batch: Batch, state_h1=None, state_h2=None, **kwargs):
         start_time = time.time()
-
+        
+        # Ensure all inputs are on the correct device and have proper dtype
         for key in ['obs', 'act', 'rew', 'done', 'obs_next']:
             if isinstance(getattr(batch, key), np.ndarray):
                 setattr(batch, key, torch.as_tensor(getattr(batch, key), dtype=torch.float32).to(device))
 
-        self.training = True
         batch_size = batch.obs.shape[0]
-        original_feature_dim = 2420  # Original feature dimension
-
-        # Reshape stacked observations into [batch_size, stack_num, original_feature_dim]
-        batch.obs = batch.obs.view(batch_size, stack_num, original_feature_dim)
-        batch.obs_next = batch.obs_next.view(batch_size, stack_num, original_feature_dim)
-
-        # Manually stack rewards and done flags
-        buffer = kwargs.get("buffer")  # Pass the replay buffer as a keyword argument
-        if buffer is not None:
-            indices = kwargs.get("indices", None)
-            if indices is not None:
-                # Convert rewards and done flags to PyTorch tensors before stacking
-                batch.rew = torch.stack(
-                    [torch.tensor(buffer.rew[indices - i], dtype=torch.float32, device=device) for i in range(stack_num)],
-                    dim=1
-                )
-                batch.done = torch.stack(
-                    [torch.tensor(buffer.done[indices - i], dtype=torch.float32, device=device) for i in range(stack_num)],
-                    dim=1
-                )
-            else:
-                raise ValueError("Replay buffer indices are required to stack rewards and done flags.")
-        else:
-            raise ValueError("Replay buffer is required to manually stack rewards and done flags.")
-
-        with autocast(device_type="cuda"):
-            # ----- Actor forward -----
-            loc, scale, _, predicted_move, predicted_pnl = self.actor(batch.obs[:, -1, :])  # Use only the last observation
+        
+        with autocast(device_type='cuda'):
+            # Actor forward pass
+            loc, scale, _, predicted_pnl = self.actor(batch.obs)
             dist = Independent(Normal(loc, scale), 1)
-            act_pred = dist.rsample()
-            log_prob = dist.log_prob(act_pred)
-            act_pred = torch.tanh(act_pred)
-            log_prob = log_prob - torch.sum(torch.log(1 - act_pred.pow(2) + 1e-6), dim=-1)
-
-            # ----- Critic forward -----
-            current_q1, _ = self.critic(
-                batch.obs,
-                batch.act,
-                taus=torch.rand(batch_size, self.critic.num_quantiles, device=device)
-            )
-            current_q2, _ = self.critic(
-                batch.obs,
-                batch.act,
-                taus=torch.rand(batch_size, self.critic.num_quantiles, device=device)
-            )
-
-            # ----- Target Q computation -----
-            with torch.no_grad():
-                target_q1, _ = self.critic_target(
-                    batch.obs_next,
-                    act_pred,
-                    taus=torch.rand(batch_size, self.critic.num_quantiles, device=device)
-                )
-                target_q2, _ = self.critic_target(
-                    batch.obs_next,
-                    act_pred,
-                    taus=torch.rand(batch_size, self.critic.num_quantiles, device=device)
-                )
-                target_q = torch.min(target_q1, target_q2)
-
-            # Compute n-step returns
-            n_step_return = compute_n_step_return(batch, gamma=self.gamma, critic=self.critic_target, device=device, actor=self.actor)
-
-            # ----- Critic Loss -----
-            critic_loss1 = F.mse_loss(current_q1.mean(dim=1), n_step_return)
-            critic_loss2 = F.mse_loss(current_q2.mean(dim=1), n_step_return)
-            critic_loss = critic_loss1 + critic_loss2
-
-            # ----- Actor Loss -----
-            q_min = torch.min(current_q1.detach(), current_q2.detach()).mean(dim=-1)
-            actor_loss = (self.get_alpha * log_prob - q_min).mean()
-
-            # ----- Auxiliary Losses -----
-            mid_dev = torch.as_tensor(batch.info["mid_diff"], dtype=torch.float32, device=device)
-            binary_mid_dev = (mid_dev >= 0).float()
-            move_loss = F.binary_cross_entropy_with_logits(predicted_move.squeeze(-1), binary_mid_dev[:, -1])
-            pnl = torch.as_tensor(batch.rew.detach(), dtype=torch.float32, device=device)
-            pnl_loss = F.mse_loss(predicted_pnl.squeeze(-1), pnl[:, -1])
-            total_loss = actor_loss + 0.1 * move_loss + 0.1 * pnl_loss + critic_loss
-
-            # ----- Alpha Loss -----
+            act = dist.rsample()
+            log_prob = dist.log_prob(act)
+            act_tanh = torch.tanh(act)
+            log_prob = log_prob - torch.sum(torch.log(1 - act_tanh.pow(2) + 1e-6), dim=-1)
+            
+            # Calculate alpha loss
             alpha_loss = -(self.alpha * (log_prob + self.target_entropy).detach()).mean()
+            
+            # Current critic values
+            current_q1, _ = self.critic(batch.obs, batch.act)
+            current_q2, _ = self.critic(batch.obs, batch.act)
+            
+            # Target Q-values computation
+            with torch.no_grad():
+                next_actions, next_log_prob = self.forward(batch.obs_next).act, self.forward(batch.obs_next).log_prob
+                
+                # Target critics
+                target_q1, _ = self.critic_target(batch.obs_next, next_actions)
+                target_q2, _ = self.critic_target(batch.obs_next, next_actions)
+                min_next_q = torch.min(target_q1, target_q2)
+                
+                # Calculate rewards considering stacked frames
+                if isinstance(batch.rew, torch.Tensor) and len(batch.rew.shape) > 1:
+                    rewards = batch.rew.sum(dim=1)  # Sum rewards across stacked frames
+                else:
+                    rewards = batch.rew
 
-        # ----- Debug Prints -----
+                # Handle done flags for stacked frames
+                if isinstance(batch.done, torch.Tensor) and len(batch.done.shape) > 1:
+                    # Episode is considered done if any frame in the stack is done
+                    dones = batch.done.any(dim=1).float()
+                else:
+                    dones = batch.done.float()
+
+                # Calculate target Q-value
+                target_q = rewards + (1 - dones) * (
+                    self.gamma * min_next_q.mean(dim=1) - self.get_alpha.detach() * next_log_prob
+                )
+                target_q = target_q.unsqueeze(1).expand(-1, self.critic.num_quantiles)
+            
+            # Critic loss computation using quantile regression
+            tau = torch.linspace(0, 1, self.critic.num_quantiles, device=device).unsqueeze(0)
+            tau = tau.expand(batch_size, -1)
+            
+            # TD errors
+            td_error1 = target_q - current_q1
+            td_error2 = target_q - current_q2
+            
+            # Huber loss with kappa=1
+            k = 1.0
+            huber_loss1 = torch.where(
+                td_error1.abs() <= k,
+                0.5 * td_error1.pow(2),
+                k * td_error1.abs() - 0.5 * k**2
+            )
+            huber_loss2 = torch.where(
+                td_error2.abs() <= k,
+                0.5 * td_error2.pow(2),
+                k * td_error2.abs() - 0.5 * k**2
+            )
+            
+            # Quantile weights
+            quantile_weight = torch.abs(tau - (td_error1 < 0).float().detach())
+            
+            # Final critic loss
+            critic_loss = (quantile_weight * huber_loss1).mean() + (quantile_weight * huber_loss2).mean()
+            
+            # Actor loss computation
+            new_actions = act_tanh
+            q1_new_actions, _ = self.critic(batch.obs, new_actions)
+            q2_new_actions, _ = self.critic(batch.obs, new_actions)
+            q_new_actions = torch.min(q1_new_actions, q2_new_actions).mean(dim=1)
+            actor_loss = (self.get_alpha.detach() * log_prob - q_new_actions).mean()
+            
+            if isinstance(rewards, torch.Tensor):
+                pnl_target = rewards if rewards.dim() == 1 else rewards[:, -1]
+                pnl_loss = F.mse_loss(predicted_pnl.squeeze(-1), pnl_target)
+            else:
+                pnl_loss = torch.tensor(0.0, device=device)
+            
+            # Combine losses
+            total_loss = actor_loss + critic_loss + 0.1 * pnl_loss
+
+        # Optimization steps
+        self.critic_optim.zero_grad()
+        self.actor_optim.zero_grad()
+        self.alpha_optim.zero_grad()
+        
+        # Backward passes with gradient scaling
+        self.scaler.scale(critic_loss).backward(retain_graph=True)
+        self.scaler.scale(actor_loss +  0.1 * pnl_loss).backward(retain_graph=True)
+        self.scaler.scale(alpha_loss).backward()
+        
+        # Gradient clipping
+        self.scaler.unscale_(self.critic_optim)
+        self.scaler.unscale_(self.actor_optim)
+        self.scaler.unscale_(self.alpha_optim)
+        
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=10.0)
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=10.0)
+        
+        # Optimizer steps
+        self.scaler.step(self.critic_optim)
+        self.scaler.step(self.actor_optim)
+        self.scaler.step(self.alpha_optim)
+        self.scaler.update()
+        
+        # Update target networks
+        self.sync_weight()
+        
         print("\nDetailed Training Stats:")
         print(f"Actor Loss: {actor_loss.item():.6f}")
-        print(f"Move Prediction Loss: {move_loss.item():.6f}")
         print(f"P/L Prediction Loss: {pnl_loss.item():.6f}")
         print(f"Critic Loss: {critic_loss.item():.6f}")
         print(f"Alpha Loss: {alpha_loss.item():.6f}")
@@ -395,34 +428,10 @@ class CustomSACPolicy(SACPolicy):
         print(f"Total Loss: {total_loss.item():.6f}")
         print(f"Mean Q1: {current_q1.mean().item():.6f}")
         print(f"Mean Q2: {current_q2.mean().item():.6f}")
-        print(f"Mean Target Q: {n_step_return.mean().item():.6f}")
+        print(f"Mean Target Q: {target_q.mean().item():.6f}")
         print(f"Mean Reward: {batch.rew.mean().item():.6f}")
         print(f"Log Prob Mean: {log_prob.mean().item():.6f}")
         print("-" * 50)
-
-        # ----- Backward Pass -----
-        self.critic_optim.zero_grad()
-        self.actor_optim.zero_grad()
-        self.alpha_optim.zero_grad()
-
-        self.scaler.scale(total_loss).backward()
-        self.scaler.scale(alpha_loss).backward()  # Backprop for alpha loss
-        self.scaler.unscale_(self.critic_optim)
-        self.scaler.unscale_(self.actor_optim)
-        self.scaler.unscale_(self.alpha_optim)
-
-        # Gradient Clipping
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
-
-        # Optimizer Steps
-        self.scaler.step(self.critic_optim)
-        self.scaler.step(self.actor_optim)
-        self.scaler.step(self.alpha_optim)
-        self.scaler.update()
-
-        # Scheduler Step
-        self.alpha_scheduler.step()
 
         return SACSummary(
             loss=total_loss.item(),
@@ -459,7 +468,7 @@ class CustomSACPolicy(SACPolicy):
 # ---------------------------
 
 class RecurrentActor(nn.Module):
-    def __init__(self, state_dim=2420, action_dim=4, hidden_dim=64, gru_hidden_dim=128, num_layers=2, predict_steps=10):
+    def __init__(self, state_dim=2420, action_dim=3, hidden_dim=64, gru_hidden_dim=128, num_layers=2, predict_steps=10):
         super().__init__()
         self.gru_hidden_dim = gru_hidden_dim
         self.num_layers = num_layers
@@ -498,12 +507,6 @@ class RecurrentActor(nn.Module):
         self.fusion_fc = nn.Sequential(
             nn.Linear(gru_hidden_dim * 2, hidden_dim * 2), nn.ReLU(),
             nn.LayerNorm(hidden_dim * 2), nn.Linear(hidden_dim * 2, hidden_dim), nn.ReLU()
-        )
-
-        # move prediction head
-        self.move_predictor = nn.Sequential(
-            nn.Linear(gru_hidden_dim * 2, 64), nn.ReLU(),  # Intermediate hidden layer
-            nn.Linear(64, 1)  # Predicts a single scalar (logits)
         )
 
         # pnl prediction head 
@@ -555,7 +558,6 @@ class RecurrentActor(nn.Module):
         
         predictor_input = torch.cat([new_state[-1], x_last], dim=-1)
 
-        predicted_move = self.move_predictor(predictor_input)  # Shape: (batch_size, 1)
         predicted_pnl = self.pnl_predictor(predictor_input)  # Shape: (batch_size, 1)
         x = self.fusion_fc(predictor_input)  # Shape: (batch_size, hidden_dim)
 
@@ -566,13 +568,13 @@ class RecurrentActor(nn.Module):
         loc = mean
         scale = std
 
-        return loc, scale, new_state.detach().transpose(0, 1), predicted_move, predicted_pnl
+        return loc, scale, new_state.detach().transpose(0, 1), predicted_pnl
 
 class IQNCritic(nn.Module):
     def __init__(
         self, 
         state_dim=2420, 
-        action_dim=4, 
+        action_dim=3, 
         hidden_dim=128, 
         num_quantiles=64, 
         quantile_embedding_dim=128,
@@ -1121,12 +1123,12 @@ results_dir.mkdir(exist_ok=True)
 # Initialize models and optimizers
 actor = RecurrentActor().to(device)
 critic = IQNCritic().to(device)
-critic_optim = Adam(critic.parameters(), lr=1e-5)
+critic_optim = Adam(critic.parameters(), lr=3e-4)
 
 policy = CustomSACPolicy(
     actor=actor,
     critic=critic,
-    actor_optim=Adam(actor.parameters(), lr=1e-5),
+    actor_optim=Adam(actor.parameters(), lr=3e-4),
     critic_optim=critic_optim,
     tau=0.01, gamma=0.99, alpha=5.0,
     action_space=env_action_space
@@ -1148,8 +1150,8 @@ if final_checkpoint_path.exists():
     policy.critic_optim.load_state_dict(saved_model['critic_optim_state_dict'])
     start_epoch = saved_model.get('epoch', 0)
     print(f"Resumed from epoch {start_epoch}")
-    new_alpha_value = 2.0  
-    policy.alpha.data = torch.tensor([new_alpha_value], dtype=torch.float32, device=device)
+    #new_alpha_value = 2.0  
+    #policy.alpha.data = torch.tensor([new_alpha_value], dtype=torch.float32, device=device)
     print(f"Alpha value updated to: {policy.alpha.item()}")
 else:
     print(f"Could not find model {final_checkpoint_path}")
