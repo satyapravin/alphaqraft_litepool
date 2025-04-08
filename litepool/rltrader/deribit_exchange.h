@@ -1,5 +1,6 @@
 #pragma once
 #include <mutex>
+#include <unordered_set>
 #include "base_exchange.h"
 #include "deribit_client.h"
 #include "deribit_rest.h"
@@ -65,6 +66,7 @@ namespace RLTrader {
         LockFreeOrderBookBuffer book_buffer;
         std::string symbol;
         std::mutex fill_mutex;
+	std::unordered_set<std::string> processed_trades;
         std::atomic<long> orders_count;
     };
 

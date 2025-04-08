@@ -42,7 +42,11 @@ void DeribitExchange::handle_private_trade_updates (const json& json_array) {
         order.orderId = data["order_id"];
         order.microSecond = data["timestamp"];
         std::lock_guard<std::mutex> lock(this->fill_mutex);
-        this->executions.push_back(order);
+	if (processed_trades.find(order.orderId) == processed_trades.end()) {
+	    std::cout << order.amount << std::endl;
+	    processed_trades.insert(order.orderId);
+            this->executions.push_back(order);
+	}
     }
 }
 
