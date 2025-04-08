@@ -9,7 +9,7 @@ class IQNCritic(nn.Module):
         self,
         action_dim=3,
         hidden_dim=128,
-        num_quantiles=64,
+        num_quantiles=32,  # Match custom_sac_policy.py
         quantile_embedding_dim=128,
         gru_hidden_dim=128,
         num_layers=2
@@ -123,10 +123,9 @@ class IQNCritic(nn.Module):
         # Quantile processing
         if taus is None:
             taus = torch.rand(original_batch_size, self.num_quantiles, device=device)
-        elif taus.dim() == 1:  # Handle flattened taus
-            taus = taus.view(original_batch_size, self.num_quantiles)
-        elif taus.size(0) == original_batch_size * self.num_quantiles:
-            taus = taus.view(original_batch_size, self.num_quantiles)
+        elif taus.dim() == 2 and taus.size(0) != original_batch_size:
+            # If taus is [64, 32] but batch_size is 2048, expand it
+            taus = taus.repeat(original_batch_size // taus.size(0), 1)
 
         # Generate quantile embeddings
         i_pi = torch.arange(1, self.quantile_embedding_dim + 1, device=device).float() * np.pi
@@ -136,16 +135,11 @@ class IQNCritic(nn.Module):
         # Expand state features for all quantiles
         x = x.unsqueeze(1).expand(-1, self.num_quantiles, -1)  # [batch_size, num_quantiles, feature_dim]
         
-        # Reshape for parallel processing
-        x = x.reshape(-1, x.size(-1))  # [batch_size * num_quantiles, feature_dim]
-        quantile_embedding = quantile_embedding.reshape(-1, quantile_embedding.size(-1))  # [batch_size * num_quantiles, hidden_dim]
-
-        print(x.shape)
-        print(quantile_embedding.shape)
         # Concatenate features and quantile embeddings
-        x = torch.cat([x, quantile_embedding], dim=-1)  # [batch_size * num_quantiles, feature_dim + hidden_dim]
+        x = torch.cat([x, quantile_embedding], dim=-1)  # [batch_size, num_quantiles, feature_dim + hidden_dim]
 
-        # Process through FC layers
+        # Reshape for parallel processing
+        x = x.reshape(-1, x.size(-1))  # [batch_size * num_quantiles, feature_dim + hidden_dim]
         x = self.fusion_fc(x)
         q_values = self.q_values(x).view(original_batch_size, self.num_quantiles)  # [batch_size, num_quantiles]
 

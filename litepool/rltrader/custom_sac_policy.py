@@ -72,35 +72,24 @@ def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, 
         discounted_rewards += mask * (gamma ** t) * rewards[:, t]
 
     with torch.no_grad():
-        print(f"obs_next shape: {obs_next.shape}")
         next_state = obs_next[:, -1, -1, :]  # [batch_size, obs_dim], e.g., [64, 2420]
-        print(f"next_state shape after indexing: {next_state.shape}")
-        
         next_loc, next_scale, *_ = actor(next_state)  # [64, action_dim]
         next_loc = next_loc.unsqueeze(1).expand(-1, num_quantiles, -1)  # [64, 32, action_dim]
         next_scale = next_scale.unsqueeze(1).expand(-1, num_quantiles, -1)  # [64, 32, action_dim]
         next_dist = Independent(Normal(next_loc, next_scale), 1)  # batch_shape=[64, 32], event_shape=[action_dim]
 
         next_actions = torch.tanh(next_dist.rsample())  # [64, 32, action_dim]
-        print(f"next_actions shape: {next_actions.shape}")
-
         next_log_prob = next_dist.log_prob(next_actions)  # [64, 32]
         next_log_prob = next_log_prob - torch.sum(torch.log(1 - next_actions.pow(2) + 1e-6), dim=-1)  # [64, 32]
 
         next_state_flat = next_state.unsqueeze(1).expand(-1, num_quantiles, -1)  # [64, 32, 2420]
         next_state_flat = next_state_flat.reshape(batch_size * num_quantiles, -1)  # [64*32, 2420]
         next_actions_flat = next_actions.reshape(batch_size * num_quantiles, -1)  # [64*32, 3]
-        print(f"next_state_flat shape: {next_state_flat.shape}")
-        print(f"next_actions_flat shape: {next_actions_flat.shape}")
 
         next_q1, _ = critic1(next_state_flat, next_actions_flat)  # [2048, 32]
         next_q2, _ = critic2(next_state_flat, next_actions_flat)  # [2048, 32]
-        print(f"next_q1 raw shape: {next_q1.shape}")
-        print(f"next_q2 raw shape: {next_q2.shape}")
         next_q1 = next_q1.view(batch_size, num_quantiles, -1).mean(dim=-1)  # [64, 32, 32] -> [64, 32]
         next_q2 = next_q2.view(batch_size, num_quantiles, -1).mean(dim=-1)  # [64, 32, 32] -> [64, 32]
-        print(f"next_q1 shape: {next_q1.shape}")
-        print(f"next_q2 shape: {next_q2.shape}")
 
         next_q = torch.min(next_q1, next_q2)
         target_q = next_q - alpha * next_log_prob
@@ -205,10 +194,6 @@ class CustomSACPolicy(SACPolicy):
     def learn(self, batch: Batch, state_h1=None, state_h2=None, **kwargs):
         start_time = time.time()
 
-        print(f"learn: batch.rew shape: {batch.rew.shape}, sample rewards: {batch.rew[0, :5]}")
-        print(f"batch.obs shape: {batch.obs.shape}")
-        print(f"batch.act shape: {batch.act.shape}")
-
         batch_size = batch.obs.shape[0]
 
         with autocast(device_type='cuda'):
@@ -225,25 +210,19 @@ class CustomSACPolicy(SACPolicy):
             taus2 = torch.rand(batch_size, 32, device=self.device)
             taus_target = torch.rand(batch_size, 32, device=self.device)
 
-            # Flatten for critic, using last timestep actions
-            obs_flat = batch.obs[:, -1, -1, :].unsqueeze(1).expand(-1, 32, -1).reshape(batch_size * 32, -1)  # [64*32, 2420]
-            act_flat = batch.act[:, -1, :].unsqueeze(1).expand(-1, 32, -1).reshape(batch_size * 32, -1)  # [64, 3] -> [64*32, 3]
-            print(f"obs_flat shape: {obs_flat.shape}")
-            print(f"act_flat shape: {act_flat.shape}")
+            obs_flat = batch.obs[:, -1, -1, :].unsqueeze(1).expand(-1, 32, -1).reshape(batch_size * 32, -1)
+            act_flat = batch.act[:, -1, :].unsqueeze(1).expand(-1, 32, -1).reshape(batch_size * 32, -1)
 
-            current_q1, _ = self.critic1(obs_flat, act_flat, taus1)  # Pass [2048, 32]
-            current_q2, _ = self.critic2(obs_flat, act_flat, taus2)  # Pass [2048, 32]
-            current_q1 = current_q1.view(batch_size, 32)  # [2048, 32] -> [64, 32]
-            current_q2 = current_q2.view(batch_size, 32)  # [2048, 32] -> [64, 32]
-            print(f"current_q1 shape: {current_q1.shape}")
-            print(f"current_q2 shape: {current_q2.shape}")
+            current_q1, _ = self.critic1(obs_flat, act_flat, taus1)
+            current_q2, _ = self.critic2(obs_flat, act_flat, taus2)
 
-            target_q = batch.q_target
-            print(f"target_q shape: {target_q.shape}")
+            target_q = batch.q_target  # [64, 32]
+            # Expand target_q to match current_q1/current_q2
+            target_q_expanded = target_q.unsqueeze(1).expand(-1, 32, -1).reshape(batch_size * 32, 32)
 
             critic_loss = (
-                quantile_huber_loss(current_q1, target_q, taus1, taus_target, kappa=5.0) +
-                quantile_huber_loss(current_q2, target_q, taus2, taus_target, kappa=5.0)
+                quantile_huber_loss(current_q1, target_q_expanded, taus1.repeat(32, 1), taus_target.repeat(32, 1), kappa=5.0) +
+                quantile_huber_loss(current_q2, target_q_expanded, taus2.repeat(32, 1), taus_target.repeat(32, 1), kappa=5.0)
             )
 
             q1_new, _ = self.critic1(batch.obs[:, -1, -1, :], act_tanh)

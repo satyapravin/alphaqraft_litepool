@@ -197,11 +197,11 @@ trainer = OffpolicyTrainer(
     train_collector=collector,
     test_collector=None,  # No test env for now; add if needed
     max_epoch=50,  # Number of epochs to train
-    step_per_epoch=64*100,  # Steps per epoch (adjust based on your needs)
-    step_per_collect=64,  # Collect 64 steps (1 step per env) per iteration
+    step_per_epoch=10,  # Steps per epoch (adjust based on your needs)
+    step_per_collect=64*10,  # Collect 64 steps (1 step per env) per iteration
     episode_per_test=0,  # No test episodes; set if you add a test env
     batch_size=64,  # Match num_of_envs for efficient sampling
-    update_per_step=1,  # Update policy once per collected step
+    update_per_step=0.1,  # Update policy once per collected step
     train_fn=lambda epoch, env_step: None,  # Optional training hooks
     test_fn=None,  # No testing for now
     stop_fn=lambda mean_rewards: mean_rewards >= 1000,  # Stop if mean reward exceeds threshold
