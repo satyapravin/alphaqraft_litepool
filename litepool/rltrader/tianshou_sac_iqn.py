@@ -1072,14 +1072,16 @@ def save_checkpoint_fn(epoch, env_step, gradient_step):
             'env_step': env_step,
             'gradient_step': gradient_step,
             'policy_state_dict': policy.state_dict(),
-            'alpha_optim_state_dict': policy.alpha_optim.state_dict(),
+
+            # Save all optimizer states separately
             'actor_optim_state_dict': policy.actor_optim.state_dict(),
-            'critic_optim_state_dict': policy.critic_optim.state_dict(),
-            'alpha_optim_state_dict': policy.alpha_optim.state_dict()
+            'critic1_optim_state_dict': policy.critic1_optim.state_dict(),
+            'critic2_optim_state_dict': policy.critic2_optim.state_dict(),
+            'alpha_optim_state_dict': policy.alpha_optim.state_dict(),
         }, checkpoint_path)
 
-        # Save buffer at epoch intervals
-        if env_step % (6401*num_of_envs) == 0:  # Save every epoch
+        # Save replay buffer
+        if env_step % (6401 * num_of_envs) == 0:
             buffer_path = checkpoint_dir / f"buffer_epoch_{epoch}_step_{env_step}.h5"
             buffer.save_hdf5(buffer_path)
 
@@ -1089,7 +1091,6 @@ def save_checkpoint_fn(epoch, env_step, gradient_step):
     except Exception as e:
         print(f"Error saving checkpoint: {e}")
         return False
-
 
 # ---------------------------
 # Training Setup
@@ -1126,17 +1127,22 @@ start_epoch = 0
 if final_checkpoint_path.exists():
     print(f"Loading model from {final_checkpoint_path}")
     saved_model = torch.load(final_checkpoint_path)
+
     policy.load_state_dict(saved_model['policy_state_dict'])
-    policy.alpha_optim.load_state_dict(saved_model['alpha_optim_state_dict'])
     policy.actor_optim.load_state_dict(saved_model['actor_optim_state_dict'])
-    policy.critic_optim.load_state_dict(saved_model['critic_optim_state_dict'])
+
+    # Load both critic optimizers
+    policy.critic1_optim.load_state_dict(saved_model['critic1_optim_state_dict'])
+    policy.critic2_optim.load_state_dict(saved_model['critic2_optim_state_dict'])
+
+    policy.alpha_optim.load_state_dict(saved_model['alpha_optim_state_dict'])
+
     start_epoch = saved_model.get('epoch', 0)
     print(f"Resumed from epoch {start_epoch}")
-    #new_alpha_value = 2.0  
-    #policy.alpha.data = torch.tensor([new_alpha_value], dtype=torch.float32, device=device)
-    print(f"Alpha value updated to: {policy.alpha.item()}")
+    print(f"Alpha value: {policy.get_alpha.item():.6f}")
+
 else:
-    print(f"Could not find model {final_checkpoint_path}")
+    print(f"Could not find model checkpoint at {final_checkpoint_path}")
     
 if final_buffer_path.exists():
     print(f"Loading buffer from {final_buffer_path}")
