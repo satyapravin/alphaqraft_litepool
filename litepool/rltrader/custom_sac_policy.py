@@ -16,24 +16,24 @@ torch.backends.cudnn.allow_tf32 = True
 
 
 def quantile_huber_loss(prediction, target, taus_predicted, taus_target, kappa=1.0):
-    B, N = prediction.shape
-    _, M = target.shape
+    B, N = prediction.shape  # [batch_size, num_quantiles], e.g., [64, 32]
+    _, M = target.shape      # [batch_size, num_quantiles], e.g., [64, 32]
 
     prediction = prediction.unsqueeze(2)  # [B, N, 1]
-    target = target.unsqueeze(1)  # [B, 1, M]
-    td_error = target - prediction  # [B, N, M]
+    target = target.unsqueeze(1)          # [B, 1, M]
+    td_error = target - prediction        # [B, N, M]
 
-    huber = F.smooth_l1_loss(prediction.expand(-1, -1, M),
-                             target.expand(-1, N, -1),
-                             beta=kappa,
-                             reduction="none")  # [B, N, M]
+    huber = F.smooth_l1_loss(prediction.expand(-1, -1, M), 
+                            target.expand(-1, N, -1), 
+                            beta=kappa, 
+                            reduction="none")  # [B, N, M]
 
     taus_predicted = taus_predicted.unsqueeze(2)  # [B, N, 1]
-    taus_target = taus_target.unsqueeze(1)  # [B, 1, M]
-
-    weight_prediction = torch.abs(taus_predicted - (td_error.detach() < 0).float())  # [B, N, M]
-    weight_target = torch.abs(taus_target - (td_error.detach() < 0).float())  # [B, N, M]
-    weight = (weight_prediction + weight_target) / 2  # [B, N, M]
+    taus_target = taus_target.unsqueeze(1)        # [B, 1, M]
+    
+    weight_pred = torch.abs(taus_predicted - (td_error.detach() < 0).float())  # [B, N, M]
+    weight_target = torch.abs(taus_target - (td_error.detach() < 0).float())   # [B, N, M]
+    weight = (weight_pred + weight_target) / 2  # [B, N, M]
 
     quantile_loss = weight * huber  # [B, N, M]
     return quantile_loss.mean()
@@ -59,14 +59,15 @@ class SACSummary:
 
 
 def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, n_step=60, num_quantiles=32):
-    rewards = batch.rew  # [batch_size, n_step], e.g., [64, 60]
-    dones = batch.done  # [batch_size, n_step]
-    obs_next = batch.obs_next  # [batch_size, n_step, obs_dim], e.g., [64, 60, 2420]
+    rewards = batch.rew  # Shape: [batch_size, n_step], e.g., [64, 60]
+    dones = batch.done   # Shape: [batch_size, n_step]
+    obs_next = batch.obs_next  # Shape: [batch_size, n_step, obs_dim], e.g., [64, 60, 2420]
     batch_size = rewards.shape[0]
 
     assert rewards.dim() == 2 and rewards.shape[1] >= n_step, \
         f"Expected 2D rewards with at least {n_step} steps, got {rewards.shape}"
 
+    # Compute discounted rewards over n steps
     discounted_rewards = torch.zeros(batch_size, device=device)
     for t in range(n_step):
         mask = 1 - dones[:, :t].any(dim=1).float()  # [batch_size]
@@ -84,14 +85,15 @@ def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, 
         next_log_prob = next_log_prob - torch.sum(torch.log(1 - next_actions.pow(2) + 1e-6), dim=-1)
 
         next_q1, _ = critic1(next_state.unsqueeze(1).expand(-1, num_quantiles, -1),
-                             next_actions)  # [batch_size, num_quantiles]
+                            next_actions)  # [batch_size, num_quantiles]
         next_q2, _ = critic2(next_state.unsqueeze(1).expand(-1, num_quantiles, -1),
-                             next_actions)  # [batch_size, num_quantiles]
+                            next_actions)  # [batch_size, num_quantiles]
         next_q = torch.min(next_q1, next_q2)  # [batch_size, num_quantiles]
         target_q = next_q - alpha * next_log_prob  # [batch_size, num_quantiles]
 
         not_done = 1 - dones[:, :n_step].any(dim=1).float()  # [batch_size]
-        target_q = discounted_rewards.unsqueeze(1) + not_done.unsqueeze(1) * (gamma ** n_step) * target_q
+        target_q = discounted_rewards.unsqueeze(1) + \
+                  not_done.unsqueeze(1) * (gamma ** n_step) * target_q  # [batch_size, num_quantiles]
 
     return target_q  # [batch_size, num_quantiles]
 
@@ -213,8 +215,8 @@ class CustomSACPolicy(SACPolicy):
 
             # Critic loss with quantiles
             critic_loss = (
-                    quantile_huber_loss(current_q1, target_q, taus1, taus_target, kappa=5.0) +
-                    quantile_huber_loss(current_q2, target_q, taus2, taus_target, kappa=5.0)
+                quantile_huber_loss(current_q1, target_q, taus1, taus_target, kappa=5.0) +
+                quantile_huber_loss(current_q2, target_q, taus2, taus_target, kappa=5.0)
             )
 
             # Actor loss
@@ -280,3 +282,4 @@ class CustomSACPolicy(SACPolicy):
             alpha=self.get_alpha.item(),
             train_time=time.time() - start_time
         )
+
