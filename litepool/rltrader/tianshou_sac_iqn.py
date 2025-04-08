@@ -619,76 +619,77 @@ class StackedVectorReplayBuffer(VectorReplayBuffer):
         super().__init__(total_size=total_size, buffer_num=buffer_num, stack_num=stack_num, **kwargs)
         self.stack_num = stack_num
         self.device = device
+        self.env_segment_size = total_size // buffer_num  # Size per environment
         print(f"Buffer initialized with total_size={total_size}, buffer_num={buffer_num}, stack_num={stack_num}")
 
     def sample(self, batch_size):
         batch_size = int(batch_size)
         print(f"sample: batch_size type: {type(batch_size)}, value: {batch_size}")
         
-        batch, indices = super().sample(batch_size)
-        print(f"sample: indices type: {type(indices)}, shape: {indices.shape}")
+        # Sample indices from each environment
+        indices_per_env = batch_size // self.buffer_num
+        if indices_per_env < 1:
+            indices_per_env = 1
         
-        if isinstance(indices, np.ndarray):
-            indices = torch.from_numpy(indices).to(self.device)
+        all_indices = []
+        for env_idx in range(self.buffer_num):
+            # Get valid start indices for this environment (avoid going before start of segment)
+            start = env_idx * self.env_segment_size
+            end = start + self.env_segment_size - self.stack_num
+            
+            # Sample indices within this environment's segment
+            env_indices = np.random.randint(start, end, size=indices_per_env)
+            all_indices.extend(env_indices)
         
-        offsets = torch.arange(self.stack_num, device=self.device).view(1, -1)
-        stacked_indices = indices.view(-1, 1) - offsets
-        stacked_indices = torch.clamp(stacked_indices, min=0, max=len(self) - 1)
-        print(f"sample: stacked_indices shape: {stacked_indices.shape}")
+        # Convert to numpy array and ensure we have exactly batch_size indices
+        indices = np.array(all_indices[:batch_size])
+        print(f"sample: indices shape: {indices.shape}")
         
-        if 'rew' in self._meta:
-            print(f"sample: self._meta.rew type: {type(self._meta.rew)}, "
-                  f"device: {self._meta.rew.device}, shape: {self._meta.rew.shape}")
+        # Get the stacked indices for each sampled index
+        offsets = np.arange(self.stack_num)
+        stacked_indices = indices[:, None] - offsets  # Shape: [batch_size, stack_num]
         
-        # Explicit tensor conversion
-        rew_tensor = self._meta.rew[stacked_indices]
-        print(f"sample: rew_tensor type: {type(rew_tensor)}, device: {rew_tensor.device}, shape: {rew_tensor.shape}")
-        rew_tensor = rew_tensor.detach().to('cpu')
-        batch.rew = rew_tensor.numpy()
+        # Get the batch data
+        batch = super().__getitem__(stacked_indices.reshape(-1))
         
-        done_tensor = self._meta.done[stacked_indices]
-        print(f"sample: done_tensor type: {type(done_tensor)}, device: {done_tensor.device}, shape: {done_tensor.shape}")
-        done_tensor = done_tensor.detach().to('cpu')
-        batch.done = done_tensor.numpy()
+        # Reshape the data to maintain the stack structure
+        for key in ['obs', 'act', 'rew', 'done', 'obs_next']:
+            if hasattr(batch, key):
+                val = getattr(batch, key)
+                if isinstance(val, np.ndarray):
+                    setattr(batch, key, val.reshape(batch_size, self.stack_num, *val.shape[1:]))
+                elif isinstance(val, torch.Tensor):
+                    setattr(batch, key, val.view(batch_size, self.stack_num, *val.shape[1:]))
         
-        print(f"StackedVectorReplayBuffer.sample: batch.rew shape: {batch.rew.shape}, "
-              f"sample rewards: {batch.rew[0, :5]}")
-        
+        print(f"sample: batch.rew shape: {batch.rew.shape}")
         return batch, indices
 
     def __getitem__(self, index):
-        print(f"__getitem__: index type: {type(index)}")
+        if isinstance(index, (int, np.integer)):
+            # Handle single index
+            index = np.array([index])
         
-        batch = super().__getitem__(index)
+        if isinstance(index, (np.ndarray, torch.Tensor)):
+            if isinstance(index, torch.Tensor):
+                index = index.cpu().numpy()
+            
+            # Get the data for all indices
+            batch = super().__getitem__(index)
+            
+            # If the indices were stacked (2D array), reshape the data
+            if index.ndim == 2:
+                batch_size, stack_num = index.shape
+                for key in ['obs', 'act', 'rew', 'done', 'obs_next']:
+                    if hasattr(batch, key):
+                        val = getattr(batch, key)
+                        if isinstance(val, np.ndarray):
+                            setattr(batch, key, val.reshape(batch_size, stack_num, *val.shape[1:]))
+                        elif isinstance(val, torch.Tensor):
+                            setattr(batch, key, val.view(batch_size, stack_num, *val.shape[1:]))
+            
+            return batch
         
-        if isinstance(index, (int, slice, torch.Tensor, np.ndarray)):
-            if isinstance(index, int):
-                indices = torch.tensor([index], device=self.device)
-            elif isinstance(index, torch.Tensor):
-                indices = index.to(self.device)
-            elif isinstance(index, np.ndarray):
-                indices = torch.from_numpy(index).to(self.device)
-            else:  # slice
-                indices = torch.arange(index.start or 0, index.stop or len(self), 
-                                      index.step or 1, device=self.device)
-            
-            offsets = torch.arange(self.stack_num, device=self.device).view(1, -1)
-            stacked_indices = indices.view(-1, 1) - offsets
-            stacked_indices = torch.clamp(stacked_indices, min=0, max=len(self) - 1)
-            print(f"__getitem__: stacked_indices shape: {stacked_indices.shape}")
-            
-            # Explicit tensor conversion
-            rew_tensor = self._meta.rew[stacked_indices]
-            print(f"__getitem__: rew_tensor type: {type(rew_tensor)}, device: {rew_tensor.device}, shape: {rew_tensor.shape}")
-            rew_tensor = rew_tensor.detach().to('cpu')
-            batch.rew = rew_tensor.numpy()
-            
-            done_tensor = self._meta.done[stacked_indices]
-            print(f"__getitem__: done_tensor type: {type(done_tensor)}, device: {done_tensor.device}, shape: {done_tensor.shape}")
-            done_tensor = done_tensor.detach().to('cpu')
-            batch.done = done_tensor.numpy()
-        
-        return batch
+        return super().__getitem__(index)
 
 # ---------------------------
 # Collector and Logger
@@ -1015,6 +1016,7 @@ def save_checkpoint_fn(epoch, env_step, gradient_step):
         checkpoint_dir = results_dir / "checkpoints"
         checkpoint_dir.mkdir(exist_ok=True, parents=True)
 
+        # Save model checkpoint
         checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch}_step_{env_step}.pth"
         torch.save({
             'epoch': epoch,
@@ -1025,23 +1027,33 @@ def save_checkpoint_fn(epoch, env_step, gradient_step):
             'critic1_optim_state_dict': policy.critic1_optim.state_dict(),
             'critic2_optim_state_dict': policy.critic2_optim.state_dict(),
             'alpha_optim_state_dict': policy.alpha_optim.state_dict(),
+            'buffer_config': {  # NEW: Save buffer configuration
+                'total_size': buffer.total_size,
+                'buffer_num': buffer.buffer_num,
+                'stack_num': buffer.stack_num,
+                'env_segment_size': buffer.env_segment_size
+            }
         }, checkpoint_path)
 
         if env_step % (6401 * num_of_envs) == 0:
             buffer_path = checkpoint_dir / f"buffer_epoch_{epoch}_step_{env_step}.h5"
-            buffer.save_hdf5(buffer_path)
+            # Save using the parent class's save_hdf5 to avoid custom stacking logic
+            super(StackedVectorReplayBuffer, buffer).save_hdf5(buffer_path)
+
             metadata = {
                 'buffer_type': 'StackedVectorReplayBuffer',
-                'total_size': 100000,
-                'buffer_num': num_of_envs,
-                'stack_num': 60,
+                'config': {
+                    'total_size': buffer.total_size,
+                    'buffer_num': buffer.buffer_num,
+                    'stack_num': buffer.stack_num,
+                    'env_segment_size': buffer.env_segment_size
+                },
                 'device': str(device)
             }
             torch.save(metadata, checkpoint_dir / f"buffer_metadata_{epoch}_{env_step}.pt")
 
         print(f"Saved checkpoint at epoch {epoch}, step {env_step}")
         return True
-
     except Exception as e:
         print(f"Error saving checkpoint: {e}")
         return False
@@ -1094,27 +1106,41 @@ else:
 
 if final_buffer_path.exists():
     print(f"Loading buffer from {final_buffer_path}")
-    temp_buffer = VectorReplayBuffer.load_hdf5(final_buffer_path, device=device)
-    
+
+    # Load metadata first
     if metadata_path.exists():
         metadata = torch.load(metadata_path)
-        assert metadata['buffer_type'] == 'StackedVectorReplayBuffer', "Buffer type mismatch"
-        total_size = metadata['total_size']
-        buffer_num = metadata['buffer_num']
-        stack_num = metadata['stack_num']
-        device = torch.device(metadata['device'])
+        buffer_config = metadata['config']
+        print(f"Loaded buffer config: {buffer_config}")
     else:
-        total_size, buffer_num, stack_num = 100000, num_of_envs, 60
-    
+        buffer_config = {
+            'total_size': 100000,
+            'buffer_num': num_of_envs,
+            'stack_num': 60,
+            'env_segment_size': 100000 // num_of_envs
+        }
+
+    # Initialize buffer with correct config
     buffer = StackedVectorReplayBuffer(
-        total_size=total_size,
-        buffer_num=buffer_num,
-        stack_num=stack_num,
+        total_size=buffer_config['total_size'],
+        buffer_num=buffer_config['buffer_num'],
+        stack_num=buffer_config['stack_num'],
         device=device
     )
+
+    # Load data using parent class method
+    temp_buffer = VectorReplayBuffer.load_hdf5(final_buffer_path)
     buffer._meta = temp_buffer._meta
     buffer._index = temp_buffer._index
     buffer._size = temp_buffer._size
+
+    # Verify segment size matches
+    if hasattr(buffer, 'env_segment_size'):
+        expected_segment = buffer_config['total_size'] // buffer_config['buffer_num']
+        if buffer.env_segment_size != expected_segment:
+            print(f"Warning: Adjusting env_segment_size from {buffer.env_segment_size} to {expected_segment}")
+            buffer.env_segment_size = expected_segment
+
     print(f"Buffer loaded with {len(buffer)} transitions")
 else:
     print(f"No buffer found at {final_buffer_path}, creating new buffer")
@@ -1125,43 +1151,4 @@ else:
         device=device
     )
 
-logger = MetricLogger(print_interval=1000)
-collector = GPUCollector(policy, env, buffer, device=device, exploration_noise=True)
-collector.logger = logger
-
-trainer = OffpolicyTrainer(
-    policy=policy,
-    train_collector=collector,
-    max_epoch=15,
-    step_per_epoch=40,
-    step_per_collect=64*5,
-    update_per_step=0.1,
-    episode_per_test=0,
-    batch_size=num_of_envs,
-    test_in_train=False,
-    verbose=True,
-    save_checkpoint_fn=save_checkpoint_fn,
-    resume_from_log=True
-)
-
-trainer.run()
-
-torch.save({
-    'policy_state_dict': policy.state_dict(),
-    'actor_optim_state_dict': policy.actor_optim.state_dict(),
-    'critic1_optim_state_dict': policy.critic1_optim.state_dict(),
-    'critic2_optim_state_dict': policy.critic2_optim.state_dict(),
-    'alpha_optim_state_dict': policy.alpha_optim.state_dict()
-}, final_checkpoint_path)
-
-buffer.save_hdf5(final_buffer_path)
-torch.save({
-    'buffer_type': 'StackedVectorReplayBuffer',
-    'total_size': 100000,
-    'buffer_num': num_of_envs,
-    'stack_num': 60,
-    'device': str(device)
-}, metadata_path)
-
-print(f"Final model saved to {final_checkpoint_path}")
 print(f"Final buffer saved to {final_buffer_path}")
