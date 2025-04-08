@@ -18,20 +18,28 @@ from torch.amp import autocast, GradScaler
 from dataclasses import dataclass
 
 
-def quantile_huber_loss(pred, target, taus_pred, taus_target, kappa=1.0):
-    B, N = pred.shape
-    _, M = target.shape
+def quantile_huber_loss(prediction, target, taus_predicted, taus_target, kappa=1.0):
+    B, N = prediction.shape  # [batch_size, num_quantiles], e.g., [64, 32]
+    _, M = target.shape      # [batch_size, num_quantiles], e.g., [64, 32]
 
-    pred = pred.unsqueeze(2)
-    target = target.unsqueeze(1)
-    td_error = target - pred
+    prediction = prediction.unsqueeze(2)  # [B, N, 1]
+    target = target.unsqueeze(1)          # [B, 1, M]
+    td_error = target - prediction        # [B, N, M]
 
-    huber = F.smooth_l1_loss(pred.expand(-1, -1, M), target.expand(-1, N, -1), reduction="none")
+    huber = F.smooth_l1_loss(prediction.expand(-1, -1, M), 
+                            target.expand(-1, N, -1), 
+                            beta=kappa, 
+                            reduction="none")  # [B, N, M]
 
-    taus_pred = taus_pred.unsqueeze(2)
-    weight = torch.abs(taus_pred - (td_error.detach() < 0).float())
+    taus_predicted = taus_predicted.unsqueeze(2)  # [B, N, 1]
+    taus_target = taus_target.unsqueeze(1)        # [B, 1, M]
+    
+    # Asymmetric quantile weight
+    weight_pred = torch.abs(taus_predicted - (td_error.detach() < 0).float())  # [B, N, M]
+    weight_target = torch.abs(taus_target - (td_error.detach() < 0).float())   # [B, N, M]
+    weight = (weight_pred + weight_target) / 2  # Average for symmetry
 
-    quantile_loss = weight * huber
+    quantile_loss = weight * huber  # [B, N, M]
     return quantile_loss.mean()
 
 
@@ -52,37 +60,48 @@ class SACSummary:
             "alpha": self.alpha
         }
 
-def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, n_step=60):
-    rewards = batch.rew
-    dones = batch.done
-    obs_next = batch.obs_next
+def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, n_step=60, num_quantiles=32):
+    rewards = batch.rew  # Shape: [batch_size, n_step], e.g., [64, 60]
+    dones = batch.done   # Shape: [batch_size, n_step]
+    obs_next = batch.obs_next  # Shape: [batch_size, n_step, obs_dim], e.g., [64, 60, 2420]
     batch_size = rewards.shape[0]
-    
-    assert rewards.dim() == 2 and rewards.shape[1] >= n_step, \
-        f"Expected 2D rewards with at least {n_step} steps, got {rewards.shape}"
-    
+
+    assert rewards.dim() == 2 and rewards.shape[1] >= n_step
+
+    # Cumulative discounted rewards over n steps
     discounted_rewards = torch.zeros(batch_size, device=device)
     for t in range(n_step):
-        mask = 1 - dones[:, :t].any(dim=1).float()
-        discounted_rewards += mask * (gamma ** t) * rewards[:, t]
-    
+        mask = 1 - dones[:, :t].any(dim=1).float()  # [batch_size]
+        discounted_rewards += mask * (gamma ** t) * rewards[:, t]  # [batch_size]
+
+    # Compute quantile targets for the next state
     with torch.no_grad():
-        next_state = obs_next[:, -1, :]
-        next_loc, next_scale, *_ = actor(next_state)
+        next_state = obs_next[:, -1, :]  # Last state: [batch_size, obs_dim]
+        next_loc, next_scale, *_ = actor(next_state)  # [batch_size, action_dim]
         next_dist = Independent(Normal(next_loc, next_scale), 1)
-        next_actions = torch.tanh(next_dist.rsample())
-        next_log_prob = next_dist.log_prob(next_actions)
+        
+        # Sample multiple actions for quantile estimation
+        next_actions = torch.tanh(next_dist.rsample((num_quantiles,)))  # [num_quantiles, batch_size, action_dim]
+        next_actions = next_actions.transpose(0, 1)  # [batch_size, num_quantiles, action_dim]
+        
+        # Compute log probabilities
+        next_log_prob = next_dist.log_prob(next_actions)  # [batch_size, num_quantiles]
         next_log_prob = next_log_prob - torch.sum(torch.log(1 - next_actions.pow(2) + 1e-6), dim=-1)
-        
-        next_q1, _ = critic1(next_state, next_actions)
-        next_q2, _ = critic2(next_state, next_actions)
-        next_q = torch.min(next_q1, next_q2).mean(dim=1)
-        target_q = next_q - alpha * next_log_prob
-        
-        not_done = 1 - dones[:, :n_step].any(dim=1).float()
-        discounted_rewards += not_done * (gamma ** n_step) * target_q
-    
-    return discounted_rewards
+
+        # Predict quantiles for next state-action pairs
+        next_q1, _ = critic1(next_state.unsqueeze(1).expand(-1, num_quantiles, -1), 
+                            next_actions)  # [batch_size, num_quantiles]
+        next_q2, _ = critic2(next_state.unsqueeze(1).expand(-1, num_quantiles, -1), 
+                            next_actions)  # [batch_size, num_quantiles]
+        next_q = torch.min(next_q1, next_q2)  # [batch_size, num_quantiles]
+        target_q = next_q - alpha * next_log_prob  # [batch_size, num_quantiles]
+
+        # Add bootstrapped quantile value
+        not_done = 1 - dones[:, :n_step].any(dim=1).float()  # [batch_size]
+        target_q = discounted_rewards.unsqueeze(1) + \
+                  not_done.unsqueeze(1) * (gamma ** n_step) * target_q  # [batch_size, num_quantiles]
+
+    return target_q  # [batch_size, num_quantiles]
 
 class CustomSACPolicy(SACPolicy):
     def __init__(
