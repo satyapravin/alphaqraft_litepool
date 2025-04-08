@@ -28,8 +28,8 @@ device = torch.device("cuda")
 #-------------------------------------
 # Make environment
 #------------------------------------
-num_of_envs=64
-stack_num=60
+num_of_envs = 64
+stack_num = 60
 
 env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
@@ -87,7 +87,6 @@ class VecNormalize:
         obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
         batch_size = obs.shape[0]
 
-        # Reshape to [B, T, F]
         obs = obs.view(batch_size, self.time_steps, self.feature_dim)
         flat_obs = obs.view(-1, self.feature_dim)
 
@@ -96,7 +95,7 @@ class VecNormalize:
         normed = torch.clamp(normed, -self.clip_obs, self.clip_obs)
 
         normed = normed.view(batch_size, self.time_steps, self.feature_dim)
-        return normed.view(batch_size, -1)  # Flatten back to [B, 2420]
+        return normed.view(batch_size, -1)
 
     def normalize_reward(self, reward):
         if not self.norm_reward:
@@ -156,7 +155,6 @@ class RunningMeanStd:
         self.var = new_var
         self.count = total_count
 
-# Wrap environment with VecNormalize
 env = VecNormalize(
     env,
     num_envs=num_of_envs,
@@ -173,7 +171,6 @@ env_action_space = env.action_space
 # Custom SAC policy
 #----------------------------
 from dataclasses import dataclass
-from typing import Dict, Any
 
 @dataclass
 class SACSummary:
@@ -192,48 +189,36 @@ class SACSummary:
             "alpha": self.alpha
         }
 
-import copy
-
-
-def compute_n_step_return(batch, gamma, critic, device, actor=None):
-    """
-    Compute n-step returns for a batch of transitions.
-
-    Args:
-        batch: Batch of transitions sampled from the replay buffer.
-        gamma: Discount factor.
-        critic: Critic network to estimate Q-values.
-        device: Device to perform computations on (e.g., "cuda").
-        actor: Actor network to predict actions for the next states.
-
-    Returns:
-        n-step returns as a tensor.
-    """
-    rewards = batch.rew  # Rewards tensor: [batch_size, stack_num]
-    dones = batch.done  # Done flags: [batch_size, stack_num]
-    next_states = batch.obs_next[:, 0, :]  # Use only the last next state
+def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, n_step=60):
+    rewards = batch.rew
+    dones = batch.done
+    obs_next = batch.obs_next
     batch_size = rewards.shape[0]
-
+    
+    assert rewards.dim() == 2 and rewards.shape[1] >= n_step, \
+        f"Expected 2D rewards with at least {n_step} steps, got {rewards.shape}"
+    
     discounted_rewards = torch.zeros(batch_size, device=device)
-    for i in range(rewards.shape[1]):  # Iterate over time steps (stack_num)
-        discounted_rewards += (gamma ** i) * rewards[:, i]
-
-    # Add the bootstrapped value (Q-value at s_{t+stack_num})
+    for t in range(n_step):
+        mask = 1 - dones[:, :t].any(dim=1).float()
+        discounted_rewards += mask * (gamma ** t) * rewards[:, t]
+    
     with torch.no_grad():
-        # Use the actor to predict the next action
-        if actor is not None:
-            next_loc, next_scale, *_ = actor(next_states)
-            next_dist = Independent(Normal(next_loc, next_scale), 1)
-            next_actions = torch.tanh(next_dist.rsample())  # Sample next actions
-        else:
-            raise ValueError("Actor network is required to compute next actions.")
-
-        # Pass the next state and predicted action to the critic
-        next_q_values, _ = critic(next_states, next_actions)
-        next_q_values = next_q_values.mean(dim=1)  # Average over quantiles
-
-        discounted_rewards += (gamma ** rewards.shape[1]) * next_q_values * (1 - dones[:, -1])
-
+        next_state = obs_next[:, -1, :]
+        next_loc, next_scale, *_ = actor(next_state)
+        next_dist = Independent(Normal(next_loc, next_scale), 1)
+        next_actions = torch.tanh(next_dist.rsample())
+        next_log_prob = next_dist.log_prob(next_actions)
+        next_log_prob = next_log_prob - torch.sum(torch.log(1 - next_actions.pow(2) + 1e-6), dim=-1)
+        
+        next_q1, _ = critic1(next_state, next_actions)
+        next_q2, _ = critic2(next_state, next_actions)
+        next_q = torch.min(next_q1, next_q2).mean(dim=1)
+        target_q = next_q - alpha * next_log_prob
+        
+        not_done = 1 - dones[:, :n_step].any(dim=1).float()
+        discounted_rewards += not_done * (gamma ** n_step) * target_q
+    
     return discounted_rewards
 
 class CustomSACPolicy(SACPolicy):
@@ -259,15 +244,13 @@ class CustomSACPolicy(SACPolicy):
             action_space=action_space,
             tau=tau,
             gamma=gamma,
-            alpha=init_alpha,  # Directly passing alpha
+            alpha=init_alpha,
             **kwargs
         )
-
-        # Directly use alpha as a trainable parameter
+        
         self.log_alpha = nn.Parameter(torch.tensor(np.log(init_alpha), dtype=torch.float32, device=device), requires_grad=True)
         self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=3e-4)
-
-        # Dual critic setup
+        
         self.critic1 = critic1
         self.critic2 = critic2
         self.critic1_optim = critic1_optim
@@ -275,14 +258,12 @@ class CustomSACPolicy(SACPolicy):
         self.critic1_target = copy.deepcopy(critic1)
         self.critic2_target = copy.deepcopy(critic2)
         self.target_entropy = -np.prod(action_space.shape).item()
-
+        
         self.scaler = GradScaler()
-
 
     @property
     def get_alpha(self):
         return self.log_alpha.exp().clamp(min=1e-5, max=10.0)
-
 
     def forward(self, batch: Batch, state=None, **kwargs):
         if hasattr(batch, 'obs'):
@@ -293,120 +274,98 @@ class CustomSACPolicy(SACPolicy):
         dist = Independent(Normal(loc, scale), 1)
         act = dist.rsample()
         log_prob = dist.log_prob(act)
-        # Apply tanh squashing
         act = torch.tanh(act)
         log_prob = log_prob - torch.sum(torch.log(1 - act.pow(2) + 1e-6), dim=-1)
-
+        
         return Batch(act=act, state=h, dist=dist, log_prob=log_prob)
+
+    def update_hidden_states(self, obs_next, act, state_h1, state_h2):
+        with torch.no_grad():
+            obs_next = torch.as_tensor(obs_next, dtype=torch.float32, device=device)
+            act = torch.as_tensor(act, dtype=torch.float32, device=device)
+            _, new_state_h1 = self.critic1(obs_next, act, state_h=state_h1)
+            _, new_state_h2 = self.critic2(obs_next, act, state_h=state_h2)
+
+        return new_state_h1, new_state_h2
 
     def learn(self, batch: Batch, state_h1=None, state_h2=None, **kwargs):
         start_time = time.time()
-
-        # Convert batch data to tensors on the correct device
+        
+        # Ensure all batch fields are tensors on the correct device
         for key in ['obs', 'act', 'rew', 'done', 'obs_next']:
-            if isinstance(getattr(batch, key), np.ndarray):
-                setattr(batch, key, torch.as_tensor(getattr(batch, key), dtype=torch.float32).to(device))
-
+            val = getattr(batch, key)
+            if isinstance(val, np.ndarray):
+                setattr(batch, key, torch.as_tensor(val, dtype=torch.float32, device=device))
+            elif isinstance(val, torch.Tensor) and val.device != device:
+                setattr(batch, key, val.to(device))
+        
+        print(f"learn: batch.rew shape: {batch.rew.shape}, sample rewards: {batch.rew[0, :5]}")
+        
         batch_size = batch.obs.shape[0]
-
+        
         with autocast(device_type='cuda'):
-            # --- Actor Forward ---
             loc, scale, _, predicted_pnl = self.actor(batch.obs)
             dist = Independent(Normal(loc, scale), 1)
             act = dist.rsample()
             log_prob = dist.log_prob(act)
             act_tanh = torch.tanh(act)
             log_prob = log_prob - torch.sum(torch.log(1 - act_tanh.pow(2) + 1e-6), dim=-1)
-
-            # --- Alpha Loss ---
+            
             alpha_loss = -(self.get_alpha * (log_prob + self.target_entropy).detach()).mean()
-
-            # --- Critic Forward (with independent quantile samples) ---
-            # Generate different quantile samples for each critic
+            
             taus1 = torch.rand(batch_size, self.critic1.num_quantiles, device=device)
             taus2 = torch.rand(batch_size, self.critic2.num_quantiles, device=device)
-            
             current_q1, _ = self.critic1(batch.obs, batch.act, taus1)
             current_q2, _ = self.critic2(batch.obs, batch.act, taus2)
-
-            # --- Target Q Computation ---
-            with torch.no_grad():
-                next_actions = self.forward(batch.obs_next).act
-                next_log_prob = self.forward(batch.obs_next).log_prob
-
-                # Use same taus for targets to maintain consistency
-                target_q1, _ = self.critic1_target(batch.obs_next, next_actions, taus1)
-                target_q2, _ = self.critic2_target(batch.obs_next, next_actions, taus2)
-                min_next_q = torch.min(target_q1, target_q2)
-
-                # Handle reward and done shapes 
-                if isinstance(batch.rew, torch.Tensor) and batch.rew.dim() > 1:
-                    rewards = compute_n_step_return(batch, 0.9999, self.critic1_target, device, self.actor)
-                else:
-                    rewards = batch.rew
-
-                if isinstance(batch.done, torch.Tensor) and batch.done.dim() > 1:
-                    dones = batch.done.any(dim=1).float()
-                else:
-                    dones = batch.done.float()
-
-                target_q = rewards + (1 - dones) * (
-                    self.gamma * min_next_q.mean(dim=1) - self.get_alpha.detach() * next_log_prob
-                )
-                target_q = target_q.unsqueeze(1).expand(-1, self.critic1.num_quantiles)
-
-            # --- Critic Loss (Quantile Huber) ---
+            
+            target_q = compute_n_step_return(
+                batch, self.gamma, self.critic1_target, self.critic2_target,
+                self.actor, self.get_alpha.detach(), device, n_step=60
+            )
+            target_q = target_q.unsqueeze(1).expand(-1, self.critic1.num_quantiles)
+            
             critic_loss = (
                 quantile_huber_loss(current_q1, target_q, taus1, taus1, kappa=1.0) +
                 quantile_huber_loss(current_q2, target_q, taus2, taus2, kappa=1.0)
             )
-
-            # --- Actor Loss ---
+            
             q1_new, _ = self.critic1(batch.obs, act_tanh)
             q2_new, _ = self.critic2(batch.obs, act_tanh)
             q_new = torch.min(q1_new, q2_new).mean(dim=1)
             actor_loss = (self.get_alpha.detach() * log_prob - q_new).mean()
-
-            # --- PnL Prediction Loss ---
-            if isinstance(rewards, torch.Tensor):
-                pnl_target = rewards if rewards.dim() == 1 else rewards[:, -1]
-                pnl_loss = F.mse_loss(predicted_pnl.squeeze(-1), pnl_target)
-            else:
-                pnl_loss = torch.tensor(0.0, device=device)
-
+            
+            # Since batch.rew is now a tensor, no need for isinstance check
+            pnl_target = batch.rew.sum(dim=1)
+            pnl_loss = F.mse_loss(predicted_pnl.squeeze(-1), pnl_target)
+            
             total_loss = actor_loss + critic_loss + 0.1 * pnl_loss
-
-        # --- Optimization ---
+        
         self.critic1_optim.zero_grad()
         self.critic2_optim.zero_grad()
         self.actor_optim.zero_grad()
         self.alpha_optim.zero_grad()
-
+        
         self.scaler.scale(critic_loss).backward(retain_graph=True)
         self.scaler.scale(actor_loss + 0.1 * pnl_loss).backward(retain_graph=True)
         self.scaler.scale(alpha_loss).backward()
-
-        # Gradient clipping
+        
         self.scaler.unscale_(self.critic1_optim)
         self.scaler.unscale_(self.critic2_optim)
         self.scaler.unscale_(self.actor_optim)
         self.scaler.unscale_(self.alpha_optim)
-
+        
         torch.nn.utils.clip_grad_norm_(self.critic1.parameters(), max_norm=10.0)
         torch.nn.utils.clip_grad_norm_(self.critic2.parameters(), max_norm=10.0)
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=10.0)
-
-        # Step optimizers
+        
         self.scaler.step(self.critic1_optim)
         self.scaler.step(self.critic2_optim)
         self.scaler.step(self.actor_optim)
         self.scaler.step(self.alpha_optim)
         self.scaler.update()
-
-        # Sync target networks
+        
         self.sync_weight()
-
-        # --- Logging ---
+        
         print("\nDetailed Training Stats:")
         print(f"Actor Loss: {actor_loss.item():.6f}")
         print(f"P/L Prediction Loss: {pnl_loss.item():.6f}")
@@ -420,7 +379,7 @@ class CustomSACPolicy(SACPolicy):
         print(f"Mean Reward: {batch.rew.mean().item():.6f}")
         print(f"Log Prob Mean: {log_prob.mean().item():.6f}")
         print("-" * 50)
-
+        
         return SACSummary(
             loss=total_loss.item(),
             loss_actor=actor_loss.item(),
@@ -429,28 +388,6 @@ class CustomSACPolicy(SACPolicy):
             alpha=self.get_alpha.item(),
             train_time=time.time() - start_time
         )
-
-    def update(self, sample_size, buffer, **kwargs):
-        batch, indices = buffer.sample(sample_size)
-
-        state_h1 = getattr(batch, "state_h1", None)
-        state_h2 = getattr(batch, "state_h2", None)
-        if state_h1 is not None:
-            state_h1 = state_h1.to(device)
-        if state_h2 is not None:
-            state_h2 = state_h2.to(device)
-
-        result = self.learn(batch=batch, state_h1=state_h1, state_h2=state_h2, buffer=buffer, indices=indices)
-        return result
-
-    def update_hidden_states(self, obs, act, state_h1, state_h2):
-        """Update critic hidden states for all environments"""
-        with torch.no_grad():
-            _, state_h1 = self.critic(obs, act, state_h=state_h1)
-            _, state_h2 = self.critic(obs, act, state_h=state_h2)
-        return state_h1.detach(), state_h2.detach()
-
-
 # ---------------------------
 # Custom Models for SAC + IQN
 # ---------------------------
@@ -469,7 +406,6 @@ class RecurrentActor(nn.Module):
         self.action_dim = action_dim
         self.predict_steps = predict_steps
 
-        # Feature extractors
         self.trade_fc = nn.Sequential(
             nn.Linear(self.trade_dim, 64), nn.ReLU(), nn.LayerNorm(64),
             nn.Linear(64, 32), nn.ReLU()
@@ -484,26 +420,21 @@ class RecurrentActor(nn.Module):
             nn.Linear(64, 32), nn.ReLU()
         )
 
-        # GRU for temporal feature extraction
         self.gru = nn.GRU(96, gru_hidden_dim, num_layers=num_layers, batch_first=True)
 
-        # Fusion layer
         self.fusion_fc = nn.Sequential(
             nn.Linear(gru_hidden_dim * 2, hidden_dim * 2), nn.ReLU(),
             nn.LayerNorm(hidden_dim * 2), nn.Linear(hidden_dim * 2, hidden_dim), nn.ReLU()
         )
 
-        # pnl prediction head 
         self.pnl_predictor = nn.Sequential(
-            nn.Linear(gru_hidden_dim * 2, 64), nn.ReLU(),  # Intermediate hidden layer
-            nn.Linear(64, 1)  # Predicts a single scalar (pnl_diff)
+            nn.Linear(gru_hidden_dim * 2, 64), nn.ReLU(),
+            nn.Linear(64, 1)
         )
 
-        # Output layers for action distribution
         self.mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Linear(hidden_dim, action_dim)
 
-        # Initialize log_std weights and biases
         self.log_std.weight.data.uniform_(-1, 0)
         self.log_std.bias.data.uniform_(-1, 0)
 
@@ -513,40 +444,32 @@ class RecurrentActor(nn.Module):
 
         obs = torch.as_tensor(obs, dtype=torch.float32, device=next(self.parameters()).device)
         batch_size = obs.shape[0]
-        # Reshape to (batch_size, time_steps, feature_dim)
         obs = obs.view(batch_size, self.time_steps, -1)
 
-        # Split features
         market_state = obs[:, :, :self.market_dim]
         position_state = obs[:, :, self.market_dim:self.market_dim + self.position_dim]
         trade_state = obs[:, :, self.market_dim + self.position_dim:self.market_dim + self.position_dim + self.trade_dim]
 
-        # Feature processing
-        position_out = self.position_fc(position_state)  # Shape: (batch_size, time_steps, 32)
-        trade_out = self.trade_fc(trade_state)  # Shape: (batch_size, time_steps, 32)
-        market_out = self.market_fc(market_state)  # Shape: (batch_size, time_steps, 32)
+        position_out = self.position_fc(position_state)
+        trade_out = self.trade_fc(trade_state)
+        market_out = self.market_fc(market_state)
 
-        # Concatenate trade and market features
-        x = torch.cat([trade_out, market_out, position_out], dim=-1)  # Shape: (batch_size, time_steps, 96)
+        x = torch.cat([trade_out, market_out, position_out], dim=-1)
 
-        # Initialize GRU state if not provided
         if state is None:
             state = torch.zeros(self.num_layers, batch_size, self.gru_hidden_dim, device=obs.device)
         elif state.shape == (batch_size, self.num_layers, self.gru_hidden_dim):
-            state = state.transpose(0, 1).contiguous()  # Fix shape to (num_layers, batch_size, gru_hidden_dim)
+            state = state.transpose(0, 1).contiguous()
 
-        # GRU forward pass
-        x, new_state = self.gru(x, state)  # x: (batch_size, time_steps, gru_hidden_dim)
-
-        x_last = x[:, -1, :]  # Shape: (batch_size, gru_hidden_dim)
+        x, new_state = self.gru(x, state)
+        x_last = x[:, -1, :]
         
         predictor_input = torch.cat([new_state[-1], x_last], dim=-1)
+        predicted_pnl = self.pnl_predictor(predictor_input)
+        x = self.fusion_fc(predictor_input)
 
-        predicted_pnl = self.pnl_predictor(predictor_input)  # Shape: (batch_size, 1)
-        x = self.fusion_fc(predictor_input)  # Shape: (batch_size, hidden_dim)
-
-        mean = self.mean(x)  # Shape: (batch_size, action_dim)
-        log_std = self.log_std(x).clamp(-10, 2)  # Shape: (batch_size, action_dim)
+        mean = self.mean(x)
+        log_std = self.log_std(x).clamp(-10, 2)
         std = log_std.exp() + 1e-6
 
         loc = mean
@@ -576,7 +499,6 @@ class IQNCritic(nn.Module):
         self.trade_dim = 6
         self.market_dim = 218
 
-        # Feature extractors
         self.position_fc = nn.Sequential(
             nn.Linear(self.position_dim, 64), nn.ReLU(), nn.LayerNorm(64),
             nn.Linear(64, 32), nn.ReLU()
@@ -590,13 +512,10 @@ class IQNCritic(nn.Module):
             nn.Linear(128, 32), nn.ReLU()
         )
 
-        # GRU for temporal feature extraction
         self.gru = nn.GRU(96, gru_hidden_dim, num_layers=num_layers, batch_first=True)
 
-        # Quantile embedding (cosine projection)
         self.cosine_layer = nn.Linear(quantile_embedding_dim, hidden_dim)
 
-        # Fusion layer
         fusion_fc_input_dim = gru_hidden_dim * 2 + action_dim + hidden_dim  
         self.fusion_fc = nn.Sequential(
             nn.Linear(fusion_fc_input_dim, hidden_dim * 2),
@@ -608,13 +527,11 @@ class IQNCritic(nn.Module):
             nn.ReLU()
         )
 
-        # Q-value output
         self.q_values = nn.Sequential(
             nn.Linear(hidden_dim, 1),
             nn.LayerNorm(1)
         )
 
-        # Weight initialization
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.orthogonal_(m.weight, gain=0.1)
@@ -643,84 +560,139 @@ class IQNCritic(nn.Module):
         if state.dim() == 2 and state.shape[1] == expected_flat_dim:
             state = state.view(batch_size, self.time_steps, self.feature_dim)
 
-        # Feature extraction
         market_state = state[:, :, :self.market_dim]
         position_state = state[:, :, self.market_dim:self.market_dim + self.position_dim]
         trade_state = state[:, :, self.market_dim + self.position_dim:]
 
-        position_out = self.position_fc(position_state)   # [B, T, 32]
-        trade_out = self.trade_fc(trade_state)           # [B, T, 32]
-        market_out = self.market_fc(market_state)        # [B, T, 32]
+        position_out = self.position_fc(position_state)
+        trade_out = self.trade_fc(trade_state)
+        market_out = self.market_fc(market_state)
 
-        x = torch.cat([trade_out, market_out, position_out], dim=-1)   # [B, T, 96]
+        x = torch.cat([trade_out, market_out, position_out], dim=-1)
 
         if state_h is None:
             state_h = torch.zeros(self.num_layers, batch_size, self.gru_hidden_dim, device=device)
 
-        x, new_state_h = self.gru(x, state_h)  # [B, T, H]
-        x = x[:, -1, :]                        # [B, H]
+        x, new_state_h = self.gru(x, state_h)
+        x = x[:, -1, :]
 
-        x = torch.cat([x, new_state_h[-1], action], dim=-1) 
+        x = torch.cat([x, new_state_h[-1], action], dim=-1)
 
-        # -------- Quantile Embedding --------
         if taus is None:
             taus = torch.rand(batch_size, self.num_quantiles, device=device)
 
         i_pi = torch.arange(1, self.quantile_embedding_dim + 1, device=device).float() * np.pi
-        cos = torch.cos(taus.unsqueeze(-1) * i_pi)         # [B, N, D]
-        quantile_embedding = F.relu(self.cosine_layer(cos))  # [B, N, hidden_dim]
+        cos = torch.cos(taus.unsqueeze(-1) * i_pi)
+        quantile_embedding = F.relu(self.cosine_layer(cos))
 
-        # Expand x for each quantile
-        x = x.unsqueeze(1).expand(-1, self.num_quantiles, -1)  # [B, N, ]
+        x = x.unsqueeze(1).expand(-1, self.num_quantiles, -1)
+        x = torch.cat([x, quantile_embedding], dim=-1)
 
-        # Concatenate quantile embedding
-        x = torch.cat([x, quantile_embedding], dim=-1)  # [B, N,  + hidden_dim]
-
-        # Flatten for FC
-        x = x.view(-1, x.shape[-1])        # [B*N, D]
-        x = self.fusion_fc(x)              # [B*N, hidden_dim]
-        q_values = self.q_values(x)        # [B*N, 1]
-        q_values = q_values.view(batch_size, self.num_quantiles)  # [B, N]
+        x = x.view(-1, x.shape[-1])
+        x = self.fusion_fc(x)
+        q_values = self.q_values(x)
+        q_values = q_values.view(batch_size, self.num_quantiles)
 
         return q_values, new_state_h
 
-def process_critic_output(critic_output):
-    """Helper function to process critic output consistently"""
-    if isinstance(critic_output, tuple):
-        return critic_output[0]  # Return just the Q-values
-    return critic_output
-
 def quantile_huber_loss(pred, target, taus_pred, taus_target, kappa=1.0):
-    """
-    pred: [B, N] - predicted quantile values (critic output)
-    target: [B, M] - target quantile values
-    taus_pred: [B, N] - quantile fractions for predicted quantiles
-    taus_target: [B, M] - quantile fractions for target quantiles
-    """
     B, N = pred.shape
     _, M = target.shape
 
-    # Expand dims for pairwise differences
-    pred = pred.unsqueeze(2)        # [B, N, 1]
-    target = target.unsqueeze(1)    # [B, 1, M]
-    td_error = target - pred        # [B, N, M]
+    pred = pred.unsqueeze(2)
+    target = target.unsqueeze(1)
+    td_error = target - pred
 
-    # Compute Huber loss
     huber = F.smooth_l1_loss(pred.expand(-1, -1, M), target.expand(-1, N, -1), reduction="none")
     
-    # Quantile weighting
-    taus_pred = taus_pred.unsqueeze(2)  # [B, N, 1]
-    weight = torch.abs(taus_pred - (td_error.detach() < 0).float())  # [B, N, M]
+    taus_pred = taus_pred.unsqueeze(2)
+    weight = torch.abs(taus_pred - (td_error.detach() < 0).float())
 
-    quantile_loss = weight * huber  # [B, N, M]
+    quantile_loss = weight * huber
     return quantile_loss.mean()
 
+# ---------------------------
+# Custom Buffer
+# ---------------------------
+class StackedVectorReplayBuffer(VectorReplayBuffer):
+    def __init__(self, total_size, buffer_num, stack_num=60, device='cuda', **kwargs):
+        super().__init__(total_size=total_size, buffer_num=buffer_num, stack_num=stack_num, **kwargs)
+        self.stack_num = stack_num
+        self.device = device
+        print(f"Buffer initialized with total_size={total_size}, buffer_num={buffer_num}, stack_num={stack_num}")
 
+    def sample(self, batch_size):
+        batch_size = int(batch_size)
+        print(f"sample: batch_size type: {type(batch_size)}, value: {batch_size}")
+        
+        batch, indices = super().sample(batch_size)
+        print(f"sample: indices type: {type(indices)}, shape: {indices.shape}")
+        
+        if isinstance(indices, np.ndarray):
+            indices = torch.from_numpy(indices).to(self.device)
+        
+        offsets = torch.arange(self.stack_num, device=self.device).view(1, -1)
+        stacked_indices = indices.view(-1, 1) - offsets
+        stacked_indices = torch.clamp(stacked_indices, min=0, max=len(self) - 1)
+        print(f"sample: stacked_indices shape: {stacked_indices.shape}")
+        
+        if 'rew' in self._meta:
+            print(f"sample: self._meta.rew type: {type(self._meta.rew)}, "
+                  f"device: {self._meta.rew.device}, shape: {self._meta.rew.shape}")
+        
+        # Explicit tensor conversion
+        rew_tensor = self._meta.rew[stacked_indices]
+        print(f"sample: rew_tensor type: {type(rew_tensor)}, device: {rew_tensor.device}, shape: {rew_tensor.shape}")
+        rew_tensor = rew_tensor.detach().to('cpu')
+        batch.rew = rew_tensor.numpy()
+        
+        done_tensor = self._meta.done[stacked_indices]
+        print(f"sample: done_tensor type: {type(done_tensor)}, device: {done_tensor.device}, shape: {done_tensor.shape}")
+        done_tensor = done_tensor.detach().to('cpu')
+        batch.done = done_tensor.numpy()
+        
+        print(f"StackedVectorReplayBuffer.sample: batch.rew shape: {batch.rew.shape}, "
+              f"sample rewards: {batch.rew[0, :5]}")
+        
+        return batch, indices
 
-from tianshou.data import Collector, Batch
-from collections import namedtuple
-import time
-from dataclasses import dataclass
+    def __getitem__(self, index):
+        print(f"__getitem__: index type: {type(index)}")
+        
+        batch = super().__getitem__(index)
+        
+        if isinstance(index, (int, slice, torch.Tensor, np.ndarray)):
+            if isinstance(index, int):
+                indices = torch.tensor([index], device=self.device)
+            elif isinstance(index, torch.Tensor):
+                indices = index.to(self.device)
+            elif isinstance(index, np.ndarray):
+                indices = torch.from_numpy(index).to(self.device)
+            else:  # slice
+                indices = torch.arange(index.start or 0, index.stop or len(self), 
+                                      index.step or 1, device=self.device)
+            
+            offsets = torch.arange(self.stack_num, device=self.device).view(1, -1)
+            stacked_indices = indices.view(-1, 1) - offsets
+            stacked_indices = torch.clamp(stacked_indices, min=0, max=len(self) - 1)
+            print(f"__getitem__: stacked_indices shape: {stacked_indices.shape}")
+            
+            # Explicit tensor conversion
+            rew_tensor = self._meta.rew[stacked_indices]
+            print(f"__getitem__: rew_tensor type: {type(rew_tensor)}, device: {rew_tensor.device}, shape: {rew_tensor.shape}")
+            rew_tensor = rew_tensor.detach().to('cpu')
+            batch.rew = rew_tensor.numpy()
+            
+            done_tensor = self._meta.done[stacked_indices]
+            print(f"__getitem__: done_tensor type: {type(done_tensor)}, device: {done_tensor.device}, shape: {done_tensor.shape}")
+            done_tensor = done_tensor.detach().to('cpu')
+            batch.done = done_tensor.numpy()
+        
+        return batch
+
+# ---------------------------
+# Collector and Logger
+# ---------------------------
 
 class MetricLogger:
     def __init__(self, print_interval=1000):
@@ -735,7 +707,6 @@ class MetricLogger:
             print("Env | Net_PnL   | R_PnL     | UR_PnL    | Fees       | Trades   | Drawdown | Leverage | Reward")
             print("-" * 80)
             
-            # Print one line per environment
             for ii in info['env_id']:
                 net_pnl = info['realized_pnl'][ii] + info['unrealized_pnl'][ii] - info['fees'][ii]
                 print(f"{ii:3d} | {net_pnl:+7.6f} | {info['realized_pnl'][ii]:+6.6f} | "
@@ -771,7 +742,6 @@ class CollectStats:
     lengths: np.ndarray
     continuous_step: int
 
-
 class StatClass:
     def __init__(self, mean_val, std_val):
         self.mean = mean_val
@@ -780,25 +750,22 @@ class StatClass:
         return self._std
 
 class GPUCollector(Collector):
-    def __init__(self, policy, env, buffer=None, preprocess_fn=None, device='cuda', **kwargs):
+    def __init__(self, policy, env, buffer=None, device='cuda', **kwargs):
         super().__init__(policy, env, buffer, **kwargs)
         self.device = device
-        self.preprocess_fn = preprocess_fn
-        self.env_active = False  # Track if environments are already running
+        self.env_active = False
         self.continuous_step_count = 0
         self.data = Batch()
         self.reset_batch_data()
 
-        # Add hidden states for each environment
         self.state_h1 = torch.zeros(
-            policy.critic.num_layers, env.num_envs, policy.critic.gru_hidden_dim, device=device
+            policy.critic1.num_layers, env.num_envs, policy.critic1.gru_hidden_dim, device=device
         )
         self.state_h2 = torch.zeros(
-            policy.critic.num_layers, env.num_envs, policy.critic.gru_hidden_dim, device=device
+            policy.critic2.num_layers, env.num_envs, policy.critic2.gru_hidden_dim, device=device
         )
 
     def reset_batch_data(self):
-        """Reset the internal batch data but maintain environment state"""
         if not self.env_active:
             self.data.obs_next = None
             self.data.obs = None
@@ -812,7 +779,6 @@ class GPUCollector(Collector):
         self.data.state = None
 
     def reset_env(self, gym_reset_kwargs=None):
-        """Reset the environment only if not already active"""
         if not self.env_active:
             gym_reset_kwargs = gym_reset_kwargs if gym_reset_kwargs else {}
             obs = self.env.reset(**gym_reset_kwargs)
@@ -830,14 +796,12 @@ class GPUCollector(Collector):
             self.data.info = info
             self.env_active = True
 
-            # Reset hidden states for all environments
             self.state_h1.zero_()
             self.state_h2.zero_()
 
         return self.data.obs, self.data.info
 
     def _reset_hidden_states(self, indices):
-        """Reset the hidden states for specific environments"""
         self.state_h1[:, indices, :] = 0
         self.state_h2[:, indices, :] = 0
 
@@ -851,8 +815,8 @@ class GPUCollector(Collector):
         episode_count = 0
         episode_rews = []
         episode_lens = []
-        episode_lens_dict = {i: 0 for i in range(self.env.num_envs)}  # Track length per env
-        episode_rews_dict = {i: 0.0 for i in range(self.env.num_envs)}  # Track rewards per env
+        episode_lens_dict = {i: 0 for i in range(self.env.num_envs)}
+        episode_rews_dict = {i: 0.0 for i in range(self.env.num_envs)}
 
         while True:
             if self.data.obs is None:
@@ -860,31 +824,27 @@ class GPUCollector(Collector):
                 self.data.obs = obs
                 self.data.info = info
 
-            # Convert observation to tensor on device and wrap in Batch
             if isinstance(self.data.obs, torch.Tensor):
                 obs_batch = Batch(obs=self.data.obs.to(self.device))
             else:
                 obs_batch = Batch(obs=torch.as_tensor(self.data.obs, device=self.device))
 
             with torch.no_grad():
-                # Use the critic's hidden states for the current environments
                 result = self.policy(obs_batch, state=self.data.state)
 
             self.data.act = result.act
             self.data.state = result.state if hasattr(result, 'state') else None
 
-            # Convert action to numpy array before stepping
             if isinstance(self.data.act, torch.Tensor):
                 action = self.data.act.cpu().numpy()
             else:
                 action = np.array(self.data.act)
 
-            # Step the environment with numpy action
             result = self.env.step(action)
-            if len(result) == 5:  # gymnasium style
+            if len(result) == 5:
                 obs_next, rew, terminated, truncated, info = result
                 done = np.logical_or(terminated, truncated)
-            else:  # old gym style
+            else:
                 obs_next, rew, done, info = result
                 terminated = done
                 truncated = False
@@ -902,7 +862,6 @@ class GPUCollector(Collector):
             else:
                 rew = torch.as_tensor(rew, device=self.device)
 
-            # Update hidden states for all environments
             self.state_h1, self.state_h2 = self.policy.update_hidden_states(
                 obs_next, self.data.act, self.state_h1, self.state_h2
             )
@@ -914,15 +873,6 @@ class GPUCollector(Collector):
             self.data.truncated = truncated
             self.data.info = info
 
-            if self.preprocess_fn:
-                self.data = self.preprocess_fn(self.data)
-
-            # Reset hidden states for environments that are done
-            for idx in range(self.env.num_envs):
-                if done[idx]:
-                    self._reset_hidden_states(idx)
-
-            # Convert tensors to numpy for buffer
             if isinstance(self.data.obs, torch.Tensor):
                 obs = self.data.obs.cpu().numpy()
             else:
@@ -958,35 +908,27 @@ class GPUCollector(Collector):
 
             batch.state_h1 = self.state_h1.clone().detach().cpu()
             batch.state_h2 = self.state_h2.clone().detach().cpu()
-            # Save to buffer
             ptr, ep_rew, ep_len, ep_idx = self.buffer.add(batch)
 
             local_step_count += 1
             self.continuous_step_count += 1
 
-            # Handle episode completion and resets
-            # For each environment
             for idx in range(num_of_envs):
-            # Accumulate rewards and lengths
                 episode_lens_dict[idx] += 1
                 episode_rews_dict[idx] += rew[idx]
 
-                # Check if environment was reset (either through done flag or checking info)
                 env_reset = done[idx] or (isinstance(info, dict) and 
                                           'reset' in info and 
                                           info['reset'][idx])
 
                 if env_reset:
-                    # Record completed episode
                     episode_lens.append(episode_lens_dict[idx])
                     episode_rews.append(episode_rews_dict[idx])
                     episode_count += 1
 
-                    # Reset tracking for this environment
                     episode_lens_dict[idx] = 0
                     episode_rews_dict[idx] = 0.0
 
-                    # Reset this specific environment
                     reset_indices = np.array([idx], dtype=np.int64)
                     single_obs, _ = self.env.reset(indices=reset_indices)
                     if isinstance(self.data.obs_next, torch.Tensor):
@@ -994,7 +936,6 @@ class GPUCollector(Collector):
                     else:
                         self.data.obs_next[idx] = single_obs[0]
 
-            # Check termination conditions
             if n_episode and episode_count >= n_episode:
                 break
             if n_step and local_step_count >= n_step:
@@ -1002,7 +943,6 @@ class GPUCollector(Collector):
 
             self.data.obs = self.data.obs_next
 
-        # Create statistics
         if episode_count > 0:
             rews = np.array(episode_rews)
             lens = np.array(episode_lens)
@@ -1015,7 +955,6 @@ class GPUCollector(Collector):
             rews = lens = empty_arr
             mean_rew = mean_len = std_rew = std_len = 0.0
 
-        # Create stat objects
         return_stat = StatClass(mean_rew, std_rew)
         return_stat.n_ep = episode_count
         return_stat.n_st = local_step_count
@@ -1067,31 +1006,38 @@ class GPUCollector(Collector):
             continuous_step=self.continuous_step_count
         )
 
+# ---------------------------
+# Training Setup
+# ---------------------------
 
 def save_checkpoint_fn(epoch, env_step, gradient_step):
     try:
         checkpoint_dir = results_dir / "checkpoints"
         checkpoint_dir.mkdir(exist_ok=True, parents=True)
 
-        # Save model checkpoint
         checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch}_step_{env_step}.pth"
         torch.save({
             'epoch': epoch,
             'env_step': env_step,
             'gradient_step': gradient_step,
             'policy_state_dict': policy.state_dict(),
-
-            # Save all optimizer states separately
             'actor_optim_state_dict': policy.actor_optim.state_dict(),
             'critic1_optim_state_dict': policy.critic1_optim.state_dict(),
             'critic2_optim_state_dict': policy.critic2_optim.state_dict(),
             'alpha_optim_state_dict': policy.alpha_optim.state_dict(),
         }, checkpoint_path)
 
-        # Save replay buffer
         if env_step % (6401 * num_of_envs) == 0:
             buffer_path = checkpoint_dir / f"buffer_epoch_{epoch}_step_{env_step}.h5"
             buffer.save_hdf5(buffer_path)
+            metadata = {
+                'buffer_type': 'StackedVectorReplayBuffer',
+                'total_size': 100000,
+                'buffer_num': num_of_envs,
+                'stack_num': 60,
+                'device': str(device)
+            }
+            torch.save(metadata, checkpoint_dir / f"buffer_metadata_{epoch}_{env_step}.pt")
 
         print(f"Saved checkpoint at epoch {epoch}, step {env_step}")
         return True
@@ -1100,14 +1046,10 @@ def save_checkpoint_fn(epoch, env_step, gradient_step):
         print(f"Error saving checkpoint: {e}")
         return False
 
-# ---------------------------
-# Training Setup
-# ---------------------------
 results_dir = Path("results")
 results_dir.mkdir(exist_ok=True)
 
 torch.manual_seed(42)
-# Initialize models and optimizers
 actor = RecurrentActor().to(device)
 critic1 = IQNCritic().to(device)
 torch.manual_seed(1221)
@@ -1129,53 +1071,58 @@ policy = CustomSACPolicy(
 
 policy = policy.to(device)
 
-# Load model if exists
 final_checkpoint_path = results_dir / "final_model.pth"
 final_buffer_path = results_dir / "final_buffer.h5"
+metadata_path = results_dir / "final_buffer_metadata.pt"
 start_epoch = 0
 
 if final_checkpoint_path.exists():
     print(f"Loading model from {final_checkpoint_path}")
     saved_model = torch.load(final_checkpoint_path)
-
+    
     policy.load_state_dict(saved_model['policy_state_dict'])
     policy.actor_optim.load_state_dict(saved_model['actor_optim_state_dict'])
-
-    # Load both critic optimizers
     policy.critic1_optim.load_state_dict(saved_model['critic1_optim_state_dict'])
     policy.critic2_optim.load_state_dict(saved_model['critic2_optim_state_dict'])
-
     policy.alpha_optim.load_state_dict(saved_model['alpha_optim_state_dict'])
-
+    
     start_epoch = saved_model.get('epoch', 0)
     print(f"Resumed from epoch {start_epoch}")
     print(f"Alpha value: {policy.get_alpha.item():.6f}")
-
 else:
     print(f"Could not find model checkpoint at {final_checkpoint_path}")
-    
+
 if final_buffer_path.exists():
     print(f"Loading buffer from {final_buffer_path}")
-    buffer = VectorReplayBuffer.load_hdf5(final_buffer_path, device=device)
+    temp_buffer = VectorReplayBuffer.load_hdf5(final_buffer_path, device=device)
+    
+    if metadata_path.exists():
+        metadata = torch.load(metadata_path)
+        assert metadata['buffer_type'] == 'StackedVectorReplayBuffer', "Buffer type mismatch"
+        total_size = metadata['total_size']
+        buffer_num = metadata['buffer_num']
+        stack_num = metadata['stack_num']
+        device = torch.device(metadata['device'])
+    else:
+        total_size, buffer_num, stack_num = 100000, num_of_envs, 60
+    
+    buffer = StackedVectorReplayBuffer(
+        total_size=total_size,
+        buffer_num=buffer_num,
+        stack_num=stack_num,
+        device=device
+    )
+    buffer._meta = temp_buffer._meta
+    buffer._index = temp_buffer._index
+    buffer._size = temp_buffer._size
     print(f"Buffer loaded with {len(buffer)} transitions")
 else:
-    print(f"Could not find buffer {final_buffer_path}")
-    def preprocess_fn(**kwargs):
-        if "buffer" in kwargs:
-            buf: ReplayBuffer = kwargs["buffer"]
-            indices = kwargs["indices"]
-            # Stack rewards and done flags over stack_num time steps
-            batch = buf[indices]
-            batch.rew = buf.rew[indices - torch.arange(stack_num).view(1, -1).to(indices.device)]
-            batch.done = buf.done[indices - torch.arange(stack_num).view(1, -1).to(indices.device)]
-            return batch
-        return kwargs
-    buffer = VectorReplayBuffer(
+    print(f"No buffer found at {final_buffer_path}, creating new buffer")
+    buffer = StackedVectorReplayBuffer(
         total_size=100000,
         buffer_num=num_of_envs,
-        device=device,
-        stack_num=stack_num,
-        preprocess_fn=preprocess_fn
+        stack_num=60,
+        device=device
     )
 
 logger = MetricLogger(print_interval=1000)
@@ -1199,7 +1146,6 @@ trainer = OffpolicyTrainer(
 
 trainer.run()
 
-# Save final results
 torch.save({
     'policy_state_dict': policy.state_dict(),
     'actor_optim_state_dict': policy.actor_optim.state_dict(),
@@ -1209,3 +1155,13 @@ torch.save({
 }, final_checkpoint_path)
 
 buffer.save_hdf5(final_buffer_path)
+torch.save({
+    'buffer_type': 'StackedVectorReplayBuffer',
+    'total_size': 100000,
+    'buffer_num': num_of_envs,
+    'stack_num': 60,
+    'device': str(device)
+}, metadata_path)
+
+print(f"Final model saved to {final_checkpoint_path}")
+print(f"Final buffer saved to {final_buffer_path}")
