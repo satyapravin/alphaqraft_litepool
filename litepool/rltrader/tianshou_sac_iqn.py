@@ -240,20 +240,22 @@ class CustomSACPolicy(SACPolicy):
     def __init__(
         self,
         actor,
-        critic,
+        critic1,
+        critic2,
         actor_optim,
-        critic_optim,
+        critic1_optim,
+        critic2_optim,
         action_space=None,
         tau=0.005,
         gamma=0.99,
-        alpha=2.0,  # Directly using alpha instead of log_alpha
+        init_alpha=2.0,
         **kwargs
     ):
         super().__init__(
             actor=actor,
             actor_optim=actor_optim,
-            critic=critic,
-            critic_optim=critic_optim,
+            critic=critic1,
+            critic_optim=critic_optim1,
             action_space=action_space,
             tau=tau,
             gamma=gamma,
@@ -262,23 +264,25 @@ class CustomSACPolicy(SACPolicy):
         )
 
         # Directly use alpha as a trainable parameter
-        self.alpha = nn.Parameter(torch.tensor([alpha], dtype=torch.float32, device=device), requires_grad=True)
+        self.log_alpha = nn.Parameter(torch.tensor(np.log(init_alpha), dtype=torch.float32, device=device), requires_grad=True)
+        self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=3e-4)
+
+        # Dual critic setup
+        self.critic1 = critic1
+        self.critic2 = critic2
+        self.critic1_optim = critic1_optim
+        self.critic2_optim = critic2_optim
+        self.critic1_target = copy.deepcopy(critic1)
+        self.critic2_target = copy.deepcopy(critic2)
         self.target_entropy = -np.prod(action_space.shape).item()
 
-        # Optimizer for alpha (no log transformation)
-        self.alpha_optim = torch.optim.Adam([self.alpha], lr=3e-4)
-
-        # Learning rate scheduler for alpha
-        self.alpha_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.alpha_optim, T_max=1000000, eta_min=3e-4
-        )
-
-        self.critic_target = copy.deepcopy(critic)
         self.scaler = GradScaler()
+
 
     @property
     def get_alpha(self):
-        return self.alpha.clamp_min(1e-2)  
+        return self.log_alpha.exp().clamp(min=1e-5, max=10.0)
+
 
     def forward(self, batch: Batch, state=None, **kwargs):
         if hasattr(batch, 'obs'):
@@ -297,111 +301,105 @@ class CustomSACPolicy(SACPolicy):
 
     def learn(self, batch: Batch, state_h1=None, state_h2=None, **kwargs):
         start_time = time.time()
-        
-        # Ensure all inputs are on the correct device and have proper dtype
+
         for key in ['obs', 'act', 'rew', 'done', 'obs_next']:
             if isinstance(getattr(batch, key), np.ndarray):
                 setattr(batch, key, torch.as_tensor(getattr(batch, key), dtype=torch.float32).to(device))
 
         batch_size = batch.obs.shape[0]
-        
+
         with autocast(device_type='cuda'):
-            # Actor forward pass
+            # Forward through actor
             loc, scale, _, predicted_pnl = self.actor(batch.obs)
             dist = Independent(Normal(loc, scale), 1)
             act = dist.rsample()
             log_prob = dist.log_prob(act)
             act_tanh = torch.tanh(act)
             log_prob = log_prob - torch.sum(torch.log(1 - act_tanh.pow(2) + 1e-6), dim=-1)
-            
-            # Calculate alpha loss
-            alpha_loss = -(self.alpha * (log_prob + self.target_entropy).detach()).mean()
-            
-            # Current critic values
-            current_q1, _ = self.critic(batch.obs, batch.act)
-            current_q2, _ = self.critic(batch.obs, batch.act)
-            
-            # Target Q-values computation
+
+            # Alpha loss
+            alpha_loss = -(self.get_alpha * (log_prob + self.target_entropy).detach()).mean()
+
+            # Current Q estimates
+            current_q1, _ = self.critic1(batch.obs, batch.act)
+            current_q2, _ = self.critic2(batch.obs, batch.act)
+
+            # Target Q
             with torch.no_grad():
-                next_actions, next_log_prob = self.forward(batch.obs_next).act, self.forward(batch.obs_next).log_prob
-                
-                # Target critics
-                target_q1, _ = self.critic_target(batch.obs_next, next_actions)
-                target_q2, _ = self.critic_target(batch.obs_next, next_actions)
+                next_actions = self.forward(batch.obs_next).act
+                next_log_prob = self.forward(batch.obs_next).log_prob
+
+                target_q1, _ = self.critic1_target(batch.obs_next, next_actions)
+                target_q2, _ = self.critic2_target(batch.obs_next, next_actions)
                 min_next_q = torch.min(target_q1, target_q2)
-                
-                # Calculate rewards considering stacked frames
-                if isinstance(batch.rew, torch.Tensor) and len(batch.rew.shape) > 1:
-                    rewards = batch.rew.sum(dim=1)  # Sum rewards across stacked frames
+
+                # Handle reward and done shapes
+                if isinstance(batch.rew, torch.Tensor) and batch.rew.dim() > 1:
+                    rewards = batch.rew.sum(dim=1)
                 else:
                     rewards = batch.rew
 
-                # Handle done flags for stacked frames
-                if isinstance(batch.done, torch.Tensor) and len(batch.done.shape) > 1:
-                    # Episode is considered done if any frame in the stack is done
+                if isinstance(batch.done, torch.Tensor) and batch.done.dim() > 1:
                     dones = batch.done.any(dim=1).float()
                 else:
                     dones = batch.done.float()
 
-                # Calculate target Q-value
                 target_q = rewards + (1 - dones) * (
                     self.gamma * min_next_q.mean(dim=1) - self.get_alpha.detach() * next_log_prob
                 )
-                target_q = target_q.unsqueeze(1).expand(-1, self.critic.num_quantiles)
-            
-            # Generate tau values for quantile regression
-            tau = torch.linspace(0, 1, self.critic.num_quantiles, device=device).unsqueeze(0)
-            tau = tau.expand(batch_size, -1)
-            
-            # Replace original Huber loss with quantile_huber_loss
+                target_q = target_q.unsqueeze(1).expand(-1, self.critic1.num_quantiles)
+
+            # Tau for quantile regression
+            tau = torch.linspace(0, 1, self.critic1.num_quantiles, device=device).unsqueeze(0).expand(batch_size, -1)
+
+            # Critic loss
             critic_loss = (
                 quantile_huber_loss(current_q1, target_q, tau, tau, kappa=1.0) +
                 quantile_huber_loss(current_q2, target_q, tau, tau, kappa=1.0)
             )
-            
-            # Actor loss computation
-            new_actions = act_tanh
-            q1_new_actions, _ = self.critic(batch.obs, new_actions)
-            q2_new_actions, _ = self.critic(batch.obs, new_actions)
-            q_new_actions = torch.min(q1_new_actions, q2_new_actions).mean(dim=1)
-            actor_loss = (self.get_alpha.detach() * log_prob - q_new_actions).mean()
-            
+
+            # Actor loss
+            q1_new, _ = self.critic1(batch.obs, act_tanh)
+            q2_new, _ = self.critic2(batch.obs, act_tanh)
+            q_new = torch.min(q1_new, q2_new).mean(dim=1)
+            actor_loss = (self.get_alpha.detach() * log_prob - q_new).mean()
+
+            # PnL prediction loss (optional)
             if isinstance(rewards, torch.Tensor):
                 pnl_target = rewards if rewards.dim() == 1 else rewards[:, -1]
                 pnl_loss = F.mse_loss(predicted_pnl.squeeze(-1), pnl_target)
             else:
                 pnl_loss = torch.tensor(0.0, device=device)
-            
-            # Combine losses
+
             total_loss = actor_loss + critic_loss + 0.1 * pnl_loss
 
-        # Optimization steps
-        self.critic_optim.zero_grad()
+        # Optimizer steps
+        self.critic1_optim.zero_grad()
+        self.critic2_optim.zero_grad()
         self.actor_optim.zero_grad()
         self.alpha_optim.zero_grad()
-        
-        # Backward passes with gradient scaling
+
         self.scaler.scale(critic_loss).backward(retain_graph=True)
         self.scaler.scale(actor_loss + 0.1 * pnl_loss).backward(retain_graph=True)
         self.scaler.scale(alpha_loss).backward()
-        
-        # Gradient clipping
-        self.scaler.unscale_(self.critic_optim)
+
+        self.scaler.unscale_(self.critic1_optim)
+        self.scaler.unscale_(self.critic2_optim)
         self.scaler.unscale_(self.actor_optim)
         self.scaler.unscale_(self.alpha_optim)
-        
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=10.0)
+
+        torch.nn.utils.clip_grad_norm_(self.critic1.parameters(), max_norm=10.0)
+        torch.nn.utils.clip_grad_norm_(self.critic2.parameters(), max_norm=10.0)
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=10.0)
-        
-        # Optimizer steps
-        self.scaler.step(self.critic_optim)
+
+        self.scaler.step(self.critic1_optim)
+        self.scaler.step(self.critic2_optim)
         self.scaler.step(self.actor_optim)
         self.scaler.step(self.alpha_optim)
         self.scaler.update()
-        
-        # Update target networks
+
         self.sync_weight()
-        
+
         print("\nDetailed Training Stats:")
         print(f"Actor Loss: {actor_loss.item():.6f}")
         print(f"P/L Prediction Loss: {pnl_loss.item():.6f}")
@@ -424,7 +422,6 @@ class CustomSACPolicy(SACPolicy):
             alpha=self.get_alpha.item(),
             train_time=time.time() - start_time
         )
-
     def update(self, sample_size, buffer, **kwargs):
         batch, indices = buffer.sample(sample_size)
 
@@ -1102,14 +1099,19 @@ results_dir.mkdir(exist_ok=True)
 
 # Initialize models and optimizers
 actor = RecurrentActor().to(device)
-critic = IQNCritic().to(device)
-critic_optim = Adam(critic.parameters(), lr=3e-4)
+critic1 = IQNCritic().to(device)
+critic2 = IQNCritic().to(device)
+
+critic1_optim = Adam(critic1.parameters(), lr=3e-4)
+critic2_optim = Adam(critic2.parameters(), lr=3e-4)
 
 policy = CustomSACPolicy(
     actor=actor,
-    critic=critic,
+    critic1=critic1,
+    critic2=critic2,
     actor_optim=Adam(actor.parameters(), lr=3e-4),
-    critic_optim=critic_optim,
+    critic1_optim=critic1_optim,
+    critic2_optim=critic2_optim,
     tau=0.01, gamma=0.99, alpha=5.0,
     action_space=env_action_space
 )
