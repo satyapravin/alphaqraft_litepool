@@ -339,9 +339,9 @@ class CustomSACPolicy(SACPolicy):
                 target_q2, _ = self.critic2_target(batch.obs_next, next_actions, taus2)
                 min_next_q = torch.min(target_q1, target_q2)
 
-                # Handle reward and done shapes
+                # Handle reward and done shapes 
                 if isinstance(batch.rew, torch.Tensor) and batch.rew.dim() > 1:
-                    rewards = batch.rew.sum(dim=1)
+                    rewards = compute_n_step_return(batch, 0.9999, self.critic1_target, device, self.actor)
                 else:
                     rewards = batch.rew
 
@@ -1203,7 +1203,8 @@ trainer.run()
 torch.save({
     'policy_state_dict': policy.state_dict(),
     'actor_optim_state_dict': policy.actor_optim.state_dict(),
-    'critic_optim_state_dict': policy.critic_optim.state_dict(),
+    'critic1_optim_state_dict': policy.critic1_optim.state_dict(),
+    'critic2_optim_state_dict': policy.critic2_optim.state_dict(),
     'alpha_optim_state_dict': policy.alpha_optim.state_dict()
 }, final_checkpoint_path)
 
