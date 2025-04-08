@@ -35,7 +35,7 @@ env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
     num_threads=num_of_envs, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
-    maker_fee=-0.0001, taker_fee=0.0005, foldername="./train_files/",
+    maker_fee=0.00001, taker_fee=0.0005, foldername="./train_files/",
     balance=1.0, start=3601*20, max=3600*10
 )
 
@@ -302,6 +302,7 @@ class CustomSACPolicy(SACPolicy):
     def learn(self, batch: Batch, state_h1=None, state_h2=None, **kwargs):
         start_time = time.time()
 
+        # Convert batch data to tensors on the correct device
         for key in ['obs', 'act', 'rew', 'done', 'obs_next']:
             if isinstance(getattr(batch, key), np.ndarray):
                 setattr(batch, key, torch.as_tensor(getattr(batch, key), dtype=torch.float32).to(device))
@@ -309,7 +310,7 @@ class CustomSACPolicy(SACPolicy):
         batch_size = batch.obs.shape[0]
 
         with autocast(device_type='cuda'):
-            # Forward through actor
+            # --- Actor Forward ---
             loc, scale, _, predicted_pnl = self.actor(batch.obs)
             dist = Independent(Normal(loc, scale), 1)
             act = dist.rsample()
@@ -317,20 +318,25 @@ class CustomSACPolicy(SACPolicy):
             act_tanh = torch.tanh(act)
             log_prob = log_prob - torch.sum(torch.log(1 - act_tanh.pow(2) + 1e-6), dim=-1)
 
-            # Alpha loss
+            # --- Alpha Loss ---
             alpha_loss = -(self.get_alpha * (log_prob + self.target_entropy).detach()).mean()
 
-            # Current Q estimates
-            current_q1, _ = self.critic1(batch.obs, batch.act)
-            current_q2, _ = self.critic2(batch.obs, batch.act)
+            # --- Critic Forward (with independent quantile samples) ---
+            # Generate different quantile samples for each critic
+            taus1 = torch.rand(batch_size, self.critic1.num_quantiles, device=device)
+            taus2 = torch.rand(batch_size, self.critic2.num_quantiles, device=device)
+            
+            current_q1, _ = self.critic1(batch.obs, batch.act, taus1)
+            current_q2, _ = self.critic2(batch.obs, batch.act, taus2)
 
-            # Target Q
+            # --- Target Q Computation ---
             with torch.no_grad():
                 next_actions = self.forward(batch.obs_next).act
                 next_log_prob = self.forward(batch.obs_next).log_prob
 
-                target_q1, _ = self.critic1_target(batch.obs_next, next_actions)
-                target_q2, _ = self.critic2_target(batch.obs_next, next_actions)
+                # Use same taus for targets to maintain consistency
+                target_q1, _ = self.critic1_target(batch.obs_next, next_actions, taus1)
+                target_q2, _ = self.critic2_target(batch.obs_next, next_actions, taus2)
                 min_next_q = torch.min(target_q1, target_q2)
 
                 # Handle reward and done shapes
@@ -349,22 +355,19 @@ class CustomSACPolicy(SACPolicy):
                 )
                 target_q = target_q.unsqueeze(1).expand(-1, self.critic1.num_quantiles)
 
-            # Tau for quantile regression
-            tau = torch.linspace(0, 1, self.critic1.num_quantiles, device=device).unsqueeze(0).expand(batch_size, -1)
-
-            # Critic loss
+            # --- Critic Loss (Quantile Huber) ---
             critic_loss = (
-                quantile_huber_loss(current_q1, target_q, tau, tau, kappa=1.0) +
-                quantile_huber_loss(current_q2, target_q, tau, tau, kappa=1.0)
+                quantile_huber_loss(current_q1, target_q, taus1, taus1, kappa=1.0) +
+                quantile_huber_loss(current_q2, target_q, taus2, taus2, kappa=1.0)
             )
 
-            # Actor loss
+            # --- Actor Loss ---
             q1_new, _ = self.critic1(batch.obs, act_tanh)
             q2_new, _ = self.critic2(batch.obs, act_tanh)
             q_new = torch.min(q1_new, q2_new).mean(dim=1)
             actor_loss = (self.get_alpha.detach() * log_prob - q_new).mean()
 
-            # PnL prediction loss (optional)
+            # --- PnL Prediction Loss ---
             if isinstance(rewards, torch.Tensor):
                 pnl_target = rewards if rewards.dim() == 1 else rewards[:, -1]
                 pnl_loss = F.mse_loss(predicted_pnl.squeeze(-1), pnl_target)
@@ -373,7 +376,7 @@ class CustomSACPolicy(SACPolicy):
 
             total_loss = actor_loss + critic_loss + 0.1 * pnl_loss
 
-        # Optimizer steps
+        # --- Optimization ---
         self.critic1_optim.zero_grad()
         self.critic2_optim.zero_grad()
         self.actor_optim.zero_grad()
@@ -383,6 +386,7 @@ class CustomSACPolicy(SACPolicy):
         self.scaler.scale(actor_loss + 0.1 * pnl_loss).backward(retain_graph=True)
         self.scaler.scale(alpha_loss).backward()
 
+        # Gradient clipping
         self.scaler.unscale_(self.critic1_optim)
         self.scaler.unscale_(self.critic2_optim)
         self.scaler.unscale_(self.actor_optim)
@@ -392,14 +396,17 @@ class CustomSACPolicy(SACPolicy):
         torch.nn.utils.clip_grad_norm_(self.critic2.parameters(), max_norm=10.0)
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=10.0)
 
+        # Step optimizers
         self.scaler.step(self.critic1_optim)
         self.scaler.step(self.critic2_optim)
         self.scaler.step(self.actor_optim)
         self.scaler.step(self.alpha_optim)
         self.scaler.update()
 
+        # Sync target networks
         self.sync_weight()
 
+        # --- Logging ---
         print("\nDetailed Training Stats:")
         print(f"Actor Loss: {actor_loss.item():.6f}")
         print(f"P/L Prediction Loss: {pnl_loss.item():.6f}")
@@ -422,6 +429,7 @@ class CustomSACPolicy(SACPolicy):
             alpha=self.get_alpha.item(),
             train_time=time.time() - start_time
         )
+
     def update(self, sample_size, buffer, **kwargs):
         batch, indices = buffer.sample(sample_size)
 
@@ -1098,9 +1106,11 @@ def save_checkpoint_fn(epoch, env_step, gradient_step):
 results_dir = Path("results")
 results_dir.mkdir(exist_ok=True)
 
+torch.manual_seed(42)
 # Initialize models and optimizers
 actor = RecurrentActor().to(device)
 critic1 = IQNCritic().to(device)
+torch.manual_seed(1221)
 critic2 = IQNCritic().to(device)
 
 critic1_optim = Adam(critic1.parameters(), lr=3e-4)
