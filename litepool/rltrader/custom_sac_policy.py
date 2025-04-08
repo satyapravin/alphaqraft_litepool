@@ -68,24 +68,24 @@ def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, 
 
     discounted_rewards = torch.zeros(batch_size, device=device)
     for t in range(n_step):
-        mask = 1 - dones[:, :t].any(dim=1).float()  # [batch_size]
-        discounted_rewards += mask * (gamma ** t) * rewards[:, t]  # [batch_size]
+        mask = 1 - dones[:, :t].any(dim=1).float()
+        discounted_rewards += mask * (gamma ** t) * rewards[:, t]
 
     with torch.no_grad():
-        next_state = obs_next[:, -1, :]
+        next_state = obs_next[:, -1]  # [batch_size, obs_dim], e.g., [64, 2420]
         next_loc, next_scale, *_ = actor(next_state)
         next_dist = Independent(Normal(next_loc, next_scale), 1)
 
         next_actions = torch.tanh(next_dist.rsample((num_quantiles,)))
-        next_actions = next_actions.transpose(0, 1)
+        next_actions = next_actions.transpose(0, 1)  # [batch_size, num_quantiles, action_dim]
 
         next_log_prob = next_dist.log_prob(next_actions)
         next_log_prob = next_log_prob - torch.sum(torch.log(1 - next_actions.pow(2) + 1e-6), dim=-1)
 
-        next_q1, _ = critic1(next_state.unsqueeze(1).expand(-1, num_quantiles, -1),
-                            next_actions)
-        next_q2, _ = critic2(next_state.unsqueeze(1).expand(-1, num_quantiles, -1),
-                            next_actions)
+        # Expand next_state to match num_quantiles
+        next_state_expanded = next_state.unsqueeze(1).expand(-1, num_quantiles, -1)  # [64, 32, 2420]
+        next_q1, _ = critic1(next_state_expanded, next_actions)
+        next_q2, _ = critic2(next_state_expanded, next_actions)
         next_q = torch.min(next_q1, next_q2)
         target_q = next_q - alpha * next_log_prob
 
@@ -167,7 +167,6 @@ class CustomSACPolicy(SACPolicy):
         return new_state_h1, new_state_h2
 
     def process_fn(self, batch: Batch, buffer, indices: np.ndarray) -> Batch:
-        """Convert NumPy arrays to PyTorch tensors and compute quantile-based n-step return."""
         for key in ['obs', 'act', 'rew', 'done', 'obs_next']:
             val = getattr(batch, key)
             if isinstance(val, np.ndarray):
@@ -179,13 +178,12 @@ class CustomSACPolicy(SACPolicy):
         return batch
 
     def _compute_nstep_return(self, batch: Batch, buffer, indices: np.ndarray) -> Batch:
-        """Custom n-step return computation for quantiles."""
         target_q = compute_n_step_return(
             batch, self.gamma, self.critic1_target, self.critic2_target,
             self.actor, self.get_alpha.detach(), self.device, n_step=60,
             num_quantiles=self.critic1.num_quantiles
         )
-        batch.q_target = target_q  # [batch_size, num_quantiles]
+        batch.q_target = target_q
         return batch
 
     def learn(self, batch: Batch, state_h1=None, state_h2=None, **kwargs):
@@ -196,7 +194,6 @@ class CustomSACPolicy(SACPolicy):
         batch_size = batch.obs.shape[0]
 
         with autocast(device_type='cuda'):
-            # Actor forward pass
             loc, scale, _, predicted_pnl = self.actor(batch.obs)
             dist = Independent(Normal(loc, scale), 1)
             act = dist.rsample()
@@ -204,44 +201,35 @@ class CustomSACPolicy(SACPolicy):
             act_tanh = torch.tanh(act)
             log_prob = log_prob - torch.sum(torch.log(1 - act_tanh.pow(2) + 1e-6), dim=-1)
 
-            # Alpha loss
             alpha_loss = -(self.get_alpha * (log_prob + self.target_entropy).detach()).mean()
 
-            # Sample taus for critics
             taus1 = torch.rand(batch_size, self.critic1.num_quantiles, device=self.device)
             taus2 = torch.rand(batch_size, self.critic2.num_quantiles, device=self.device)
             taus_target = torch.rand(batch_size, self.critic1.num_quantiles, device=self.device)
 
-            # Current quantile predictions
             current_q1, _ = self.critic1(batch.obs, batch.act, taus1)
             current_q2, _ = self.critic2(batch.obs, batch.act, taus2)
 
-            # Use precomputed quantile target from process_fn
             target_q = batch.q_target
             print(f"target_q shape: {target_q.shape}")
             print(f"current_q1 shape: {current_q1.shape}")
             print(f"current_q2 shape: {current_q2.shape}")
 
-            # Critic loss with quantiles
             critic_loss = (
                 quantile_huber_loss(current_q1, target_q, taus1, taus_target, kappa=5.0) +
                 quantile_huber_loss(current_q2, target_q, taus2, taus_target, kappa=5.0)
             )
 
-            # Actor loss
             q1_new, _ = self.critic1(batch.obs, act_tanh)
             q2_new, _ = self.critic2(batch.obs, act_tanh)
             q_new = torch.min(q1_new, q2_new).mean(dim=1)
             actor_loss = (self.get_alpha.detach() * log_prob - q_new).mean()
 
-            # PnL prediction loss
             pnl_target = batch.rew.sum(dim=1)
             pnl_loss = F.mse_loss(predicted_pnl.squeeze(-1), pnl_target)
 
-            # Total loss
             total_loss = actor_loss + critic_loss + 0.1 * pnl_loss
 
-        # Optimize
         self.critic1_optim.zero_grad()
         self.critic2_optim.zero_grad()
         self.actor_optim.zero_grad()
