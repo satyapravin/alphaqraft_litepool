@@ -63,13 +63,13 @@ def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, 
     obs_next = batch.obs_next  # [batch_size, n_step, obs_dim], e.g., [64, 60, 2420]
     batch_size = rewards.shape[0]
 
-    assert rewards.ndim == 2 and rewards.shape[1] >= n_step, \
+    assert rewards.dim() == 2 and rewards.shape[1] >= n_step, \
         f"Expected 2D rewards with at least {n_step} steps, got {rewards.shape}"
 
     discounted_rewards = torch.zeros(batch_size, device=device)
     for t in range(n_step):
-        mask = 1 - dones[:, :t].any(dim=1).float()
-        discounted_rewards += mask * (gamma ** t) * rewards[:, t]
+        mask = 1 - dones[:, :t].any(dim=1).float()  # [batch_size]
+        discounted_rewards += mask * (gamma ** t) * rewards[:, t]  # [batch_size]
 
     with torch.no_grad():
         next_state = obs_next[:, -1, :]
@@ -167,7 +167,14 @@ class CustomSACPolicy(SACPolicy):
         return new_state_h1, new_state_h2
 
     def process_fn(self, batch: Batch, buffer, indices: np.ndarray) -> Batch:
-        """Override process_fn to use custom quantile-based n-step return."""
+        """Convert NumPy arrays to PyTorch tensors and compute quantile-based n-step return."""
+        for key in ['obs', 'act', 'rew', 'done', 'obs_next']:
+            val = getattr(batch, key)
+            if isinstance(val, np.ndarray):
+                setattr(batch, key, torch.as_tensor(val, dtype=torch.float32, device=self.device))
+            elif isinstance(val, torch.Tensor) and val.device != self.device:
+                setattr(batch, key, val.to(self.device))
+
         batch = self._compute_nstep_return(batch, buffer, indices)
         return batch
 
@@ -178,19 +185,11 @@ class CustomSACPolicy(SACPolicy):
             self.actor, self.get_alpha.detach(), self.device, n_step=60,
             num_quantiles=self.critic1.num_quantiles
         )
-        # Since learn expects q_target directly, assign it to batch
         batch.q_target = target_q  # [batch_size, num_quantiles]
         return batch
 
     def learn(self, batch: Batch, state_h1=None, state_h2=None, **kwargs):
         start_time = time.time()
-
-        for key in ['obs', 'act', 'rew', 'done', 'obs_next']:
-            val = getattr(batch, key)
-            if isinstance(val, np.ndarray):
-                setattr(batch, key, torch.as_tensor(val, dtype=torch.float32, device=self.device))
-            elif isinstance(val, torch.Tensor) and val.device != self.device:
-                setattr(batch, key, val.to(self.device))
 
         print(f"learn: batch.rew shape: {batch.rew.shape}, sample rewards: {batch.rew[0, :5]}")
 
@@ -218,7 +217,7 @@ class CustomSACPolicy(SACPolicy):
             current_q2, _ = self.critic2(batch.obs, batch.act, taus2)
 
             # Use precomputed quantile target from process_fn
-            target_q = batch.q_target  # [batch_size, num_quantiles]
+            target_q = batch.q_target
             print(f"target_q shape: {target_q.shape}")
             print(f"current_q1 shape: {current_q1.shape}")
             print(f"current_q2 shape: {current_q2.shape}")
