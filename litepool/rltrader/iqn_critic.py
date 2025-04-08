@@ -1,18 +1,13 @@
 import numpy as np
-import time
 import torch
 
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Normal, Independent
-from torch.optim import Adam
-import gymnasium as gym
-from gymnasium import spaces
+
 
 class IQNCritic(nn.Module):
     def __init__(
-        self, 
-        state_dim=2420, 
+        self,
         action_dim=3, 
         hidden_dim=128, 
         num_quantiles=64, 

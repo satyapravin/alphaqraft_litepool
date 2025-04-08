@@ -1,19 +1,9 @@
+from dataclasses import dataclass
+
 import numpy as np
 import time
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions import Normal, Independent
-from torch.optim import Adam
-import copy
-from pathlib import Path
-import gymnasium as gym
-from gymnasium import spaces
-from tianshou.env import BaseVectorEnv
-from tianshou.data import Collector, VectorReplayBuffer, Batch
-from tianshou.policy import SACPolicy
-from tianshou.trainer import OffpolicyTrainer
-from tianshou.env import DummyVectorEnv
+from tianshou.data import Collector, Batch
 
 
 @dataclass
@@ -40,18 +30,22 @@ class CollectStats:
     lengths: np.ndarray
     continuous_step: int
 
+
 class StatClass:
     def __init__(self, mean_val, std_val):
         self.mean = mean_val
         self._std = std_val
+
     def std(self):
         return self._std
 
+
 class GPUCollector(Collector):
-    def __init__(self, policy, env, buffer=None, device='cuda', **kwargs):
+    def __init__(self, policy, env, num_of_envs, buffer=None, device='cuda', **kwargs):
         super().__init__(policy, env, buffer, **kwargs)
         self.device = device
         self.env_active = False
+        self.num_of_envs = num_of_envs
         self.continuous_step_count = 0
         self.data = Batch()
         self.reset_batch_data()
@@ -103,7 +97,7 @@ class GPUCollector(Collector):
         self.state_h1[:, indices, :] = 0
         self.state_h2[:, indices, :] = 0
 
-    def _collect(self, n_step=None, n_episode=None, random=False, render=None, gym_reset_kwargs=None):
+    def _collect(self, n_step=None, n_episode=None):
         if n_step is not None:
             assert n_episode is None, "Only one of n_step or n_episode is allowed"
         assert not self.env.is_async, "Please use AsyncCollector if using async venv."
@@ -211,12 +205,12 @@ class GPUCollector(Collector):
             local_step_count += 1
             self.continuous_step_count += 1
 
-            for idx in range(num_of_envs):
+            for idx in range(self.num_of_envs):
                 episode_lens_dict[idx] += 1
                 episode_rews_dict[idx] += rew[idx]
 
-                env_reset = done[idx] or (isinstance(info, dict) and 
-                                          'reset' in info and 
+                env_reset = done[idx] or (isinstance(info, dict) and
+                                          'reset' in info and
                                           info['reset'][idx])
 
                 if env_reset:

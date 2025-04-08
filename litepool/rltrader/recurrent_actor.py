@@ -1,14 +1,10 @@
-import numpy as np
-import time
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import gymnasium as gym
-from gymnasium import spaces
+from tianshou.data import Batch
 
 
 class RecurrentActor(nn.Module):
-    def __init__(self, state_dim=2420, action_dim=3, hidden_dim=64, gru_hidden_dim=128, num_layers=2, predict_steps=10):
+    def __init__(self, action_dim=3, hidden_dim=64, gru_hidden_dim=128, num_layers=2, predict_steps=10):
         super().__init__()
         self.gru_hidden_dim = gru_hidden_dim
         self.num_layers = num_layers
@@ -53,7 +49,7 @@ class RecurrentActor(nn.Module):
         self.log_std.weight.data.uniform_(-1, 0)
         self.log_std.bias.data.uniform_(-1, 0)
 
-    def forward(self, obs, state=None, info=None):
+    def forward(self, obs, state=None):
         if isinstance(obs, Batch):
             obs = obs.obs
 
@@ -63,7 +59,8 @@ class RecurrentActor(nn.Module):
 
         market_state = obs[:, :, :self.market_dim]
         position_state = obs[:, :, self.market_dim:self.market_dim + self.position_dim]
-        trade_state = obs[:, :, self.market_dim + self.position_dim:self.market_dim + self.position_dim + self.trade_dim]
+        trade_state = obs[:, :,
+                          self.market_dim + self.position_dim:self.market_dim + self.position_dim + self.trade_dim]
 
         position_out = self.position_fc(position_state)
         trade_out = self.trade_fc(trade_state)
