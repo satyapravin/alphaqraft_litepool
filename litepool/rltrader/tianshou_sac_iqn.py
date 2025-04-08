@@ -189,8 +189,7 @@ collector = GPUCollector(
     policy=policy,
     env=env,
     buffer=buffer,
-    device=device,
-    preprocess_fn=lambda batch: batch  # No additional preprocessing needed with VecNormalize
+    device=device
 )
 
 trainer = OffpolicyTrainer(
@@ -198,7 +197,7 @@ trainer = OffpolicyTrainer(
     train_collector=collector,
     test_collector=None,  # No test env for now; add if needed
     max_epoch=50,  # Number of epochs to train
-    step_per_epoch=10000,  # Steps per epoch (adjust based on your needs)
+    step_per_epoch=64*100,  # Steps per epoch (adjust based on your needs)
     step_per_collect=64,  # Collect 64 steps (1 step per env) per iteration
     episode_per_test=0,  # No test episodes; set if you add a test env
     batch_size=64,  # Match num_of_envs for efficient sampling

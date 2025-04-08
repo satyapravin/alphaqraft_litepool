@@ -16,26 +16,25 @@ torch.backends.cudnn.allow_tf32 = True
 
 
 def quantile_huber_loss(prediction, target, taus_predicted, taus_target, kappa=1.0):
-    B, N = prediction.shape  # [batch_size, num_quantiles], e.g., [64, 32]
-    _, M = target.shape      # [batch_size, num_quantiles], e.g., [64, 32]
+    B, N = prediction.shape
+    _, M = target.shape
 
-    prediction = prediction.unsqueeze(2)  # [B, N, 1]
-    target = target.unsqueeze(1)          # [B, 1, M]
-    td_error = target - prediction        # [B, N, M]
+    prediction = prediction.unsqueeze(2)
+    target = target.unsqueeze(1)
+    td_error = target - prediction
 
     huber = F.smooth_l1_loss(prediction.expand(-1, -1, M), 
                             target.expand(-1, N, -1), 
                             beta=kappa, 
-                            reduction="none")  # [B, N, M]
+                            reduction="none")
 
-    taus_predicted = taus_predicted.unsqueeze(2)  # [B, N, 1]
-    taus_target = taus_target.unsqueeze(1)        # [B, 1, M]
+    taus_predicted = taus_predicted.unsqueeze(2)
+    taus_target = taus_target.unsqueeze(1)
     
-    weight_pred = torch.abs(taus_predicted - (td_error.detach() < 0).float())  # [B, N, M]
-    weight_target = torch.abs(taus_target - (td_error.detach() < 0).float())   # [B, N, M]
-    weight = (weight_pred + weight_target) / 2  # [B, N, M]
-
-    quantile_loss = weight * huber  # [B, N, M]
+    weight_pred = torch.abs(taus_predicted - (td_error.detach() < 0).float())
+    weight_target = torch.abs(taus_target - (td_error.detach() < 0).float())
+    weight = (weight_pred + weight_target) / 2
+    quantile_loss = weight * huber
     return quantile_loss.mean()
 
 
@@ -59,41 +58,40 @@ class SACSummary:
 
 
 def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, n_step=60, num_quantiles=32):
-    rewards = batch.rew  # Shape: [batch_size, n_step], e.g., [64, 60]
-    dones = batch.done   # Shape: [batch_size, n_step]
-    obs_next = batch.obs_next  # Shape: [batch_size, n_step, obs_dim], e.g., [64, 60, 2420]
+    rewards = batch.rew  # [batch_size, n_step], e.g., [64, 60]
+    dones = batch.done   # [batch_size, n_step]
+    obs_next = batch.obs_next  # [batch_size, n_step, obs_dim], e.g., [64, 60, 2420]
     batch_size = rewards.shape[0]
 
-    assert rewards.dim() == 2 and rewards.shape[1] >= n_step, \
+    assert rewards.ndim == 2 and rewards.shape[1] >= n_step, \
         f"Expected 2D rewards with at least {n_step} steps, got {rewards.shape}"
 
-    # Compute discounted rewards over n steps
     discounted_rewards = torch.zeros(batch_size, device=device)
     for t in range(n_step):
-        mask = 1 - dones[:, :t].any(dim=1).float()  # [batch_size]
-        discounted_rewards += mask * (gamma ** t) * rewards[:, t]  # [batch_size]
+        mask = 1 - dones[:, :t].any(dim=1).float()
+        discounted_rewards += mask * (gamma ** t) * rewards[:, t]
 
     with torch.no_grad():
-        next_state = obs_next[:, -1, :]  # [batch_size, obs_dim]
-        next_loc, next_scale, *_ = actor(next_state)  # [batch_size, action_dim]
+        next_state = obs_next[:, -1, :]
+        next_loc, next_scale, *_ = actor(next_state)
         next_dist = Independent(Normal(next_loc, next_scale), 1)
 
-        next_actions = torch.tanh(next_dist.rsample((num_quantiles,)))  # [num_quantiles, batch_size, action_dim]
-        next_actions = next_actions.transpose(0, 1)  # [batch_size, num_quantiles, action_dim]
+        next_actions = torch.tanh(next_dist.rsample((num_quantiles,)))
+        next_actions = next_actions.transpose(0, 1)
 
-        next_log_prob = next_dist.log_prob(next_actions)  # [batch_size, num_quantiles]
+        next_log_prob = next_dist.log_prob(next_actions)
         next_log_prob = next_log_prob - torch.sum(torch.log(1 - next_actions.pow(2) + 1e-6), dim=-1)
 
         next_q1, _ = critic1(next_state.unsqueeze(1).expand(-1, num_quantiles, -1),
-                            next_actions)  # [batch_size, num_quantiles]
+                            next_actions)
         next_q2, _ = critic2(next_state.unsqueeze(1).expand(-1, num_quantiles, -1),
-                            next_actions)  # [batch_size, num_quantiles]
-        next_q = torch.min(next_q1, next_q2)  # [batch_size, num_quantiles]
-        target_q = next_q - alpha * next_log_prob  # [batch_size, num_quantiles]
+                            next_actions)
+        next_q = torch.min(next_q1, next_q2)
+        target_q = next_q - alpha * next_log_prob
 
-        not_done = 1 - dones[:, :n_step].any(dim=1).float()  # [batch_size]
+        not_done = 1 - dones[:, :n_step].any(dim=1).float()
         target_q = discounted_rewards.unsqueeze(1) + \
-                  not_done.unsqueeze(1) * (gamma ** n_step) * target_q  # [batch_size, num_quantiles]
+                  not_done.unsqueeze(1) * (gamma ** n_step) * target_q
 
     return target_q  # [batch_size, num_quantiles]
 
@@ -168,6 +166,22 @@ class CustomSACPolicy(SACPolicy):
 
         return new_state_h1, new_state_h2
 
+    def process_fn(self, batch: Batch, buffer, indices: np.ndarray) -> Batch:
+        """Override process_fn to use custom quantile-based n-step return."""
+        batch = self._compute_nstep_return(batch, buffer, indices)
+        return batch
+
+    def _compute_nstep_return(self, batch: Batch, buffer, indices: np.ndarray) -> Batch:
+        """Custom n-step return computation for quantiles."""
+        target_q = compute_n_step_return(
+            batch, self.gamma, self.critic1_target, self.critic2_target,
+            self.actor, self.get_alpha.detach(), self.device, n_step=60,
+            num_quantiles=self.critic1.num_quantiles
+        )
+        # Since learn expects q_target directly, assign it to batch
+        batch.q_target = target_q  # [batch_size, num_quantiles]
+        return batch
+
     def learn(self, batch: Batch, state_h1=None, state_h2=None, **kwargs):
         start_time = time.time()
 
@@ -200,18 +214,14 @@ class CustomSACPolicy(SACPolicy):
             taus_target = torch.rand(batch_size, self.critic1.num_quantiles, device=self.device)
 
             # Current quantile predictions
-            current_q1, _ = self.critic1(batch.obs, batch.act, taus1)  # [batch_size, num_quantiles]
-            current_q2, _ = self.critic2(batch.obs, batch.act, taus2)  # [batch_size, num_quantiles]
+            current_q1, _ = self.critic1(batch.obs, batch.act, taus1)
+            current_q2, _ = self.critic2(batch.obs, batch.act, taus2)
 
-            # Compute quantile target
-            target_q = compute_n_step_return(
-                batch, self.gamma, self.critic1_target, self.critic2_target,
-                self.actor, self.get_alpha.detach(), self.device, n_step=60,
-                num_quantiles=self.critic1.num_quantiles
-            )
-            print(f"target_q shape: {target_q.shape}")  # Debug print
-            print(f"current_q1 shape: {current_q1.shape}")  # Debug print
-            print(f"current_q2 shape: {current_q2.shape}")  # Debug print
+            # Use precomputed quantile target from process_fn
+            target_q = batch.q_target  # [batch_size, num_quantiles]
+            print(f"target_q shape: {target_q.shape}")
+            print(f"current_q1 shape: {current_q1.shape}")
+            print(f"current_q2 shape: {current_q2.shape}")
 
             # Critic loss with quantiles
             critic_loss = (
@@ -226,7 +236,7 @@ class CustomSACPolicy(SACPolicy):
             actor_loss = (self.get_alpha.detach() * log_prob - q_new).mean()
 
             # PnL prediction loss
-            pnl_target = batch.rew.sum(dim=1)  # Sum 60-step PnL
+            pnl_target = batch.rew.sum(dim=1)
             pnl_loss = F.mse_loss(predicted_pnl.squeeze(-1), pnl_target)
 
             # Total loss
@@ -259,7 +269,6 @@ class CustomSACPolicy(SACPolicy):
 
         self.sync_weight()
 
-        # Logging
         print("\nDetailed Training Stats:")
         print(f"Actor Loss: {actor_loss.item():.6f}")
         print(f"P/L Prediction Loss: {pnl_loss.item():.6f}")
@@ -282,4 +291,3 @@ class CustomSACPolicy(SACPolicy):
             alpha=self.get_alpha.item(),
             train_time=time.time() - start_time
         )
-

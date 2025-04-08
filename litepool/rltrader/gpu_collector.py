@@ -97,7 +97,7 @@ class GPUCollector(Collector):
         self.state_h1[:, indices, :] = 0
         self.state_h2[:, indices, :] = 0
 
-    def _collect(self, n_step=None, n_episode=None):
+    def _collect(self, random=None, render=None, n_step=None, n_episode=None, gym_reset_kwargs=None):
         if n_step is not None:
             assert n_episode is None, "Only one of n_step or n_episode is allowed"
         assert not self.env.is_async, "Please use AsyncCollector if using async venv."
