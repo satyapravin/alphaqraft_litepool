@@ -231,8 +231,8 @@ class CustomSACPolicy(SACPolicy):
             print(f"obs_flat shape: {obs_flat.shape}")
             print(f"act_flat shape: {act_flat.shape}")
 
-            current_q1, _ = self.critic1(obs_flat, act_flat, taus1.reshape(batch_size * 32, -1))  # Pass [2048, 32]
-            current_q2, _ = self.critic2(obs_flat, act_flat, taus2.reshape(batch_size * 32, -1))  # Pass [2048, 32]
+            current_q1, _ = self.critic1(obs_flat, act_flat, taus1)  # Pass [2048, 32]
+            current_q2, _ = self.critic2(obs_flat, act_flat, taus2)  # Pass [2048, 32]
             current_q1 = current_q1.view(batch_size, 32)  # [2048, 32] -> [64, 32]
             current_q2 = current_q2.view(batch_size, 32)  # [2048, 32] -> [64, 32]
             print(f"current_q1 shape: {current_q1.shape}")
