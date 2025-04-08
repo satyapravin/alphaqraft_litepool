@@ -255,11 +255,11 @@ class CustomSACPolicy(SACPolicy):
             actor=actor,
             actor_optim=actor_optim,
             critic=critic1,
-            critic_optim=critic_optim1,
+            critic_optim=critic1_optim,
             action_space=action_space,
             tau=tau,
             gamma=gamma,
-            alpha=alpha,  # Directly passing alpha
+            alpha=init_alpha,  # Directly passing alpha
             **kwargs
         )
 
@@ -1112,7 +1112,7 @@ policy = CustomSACPolicy(
     actor_optim=Adam(actor.parameters(), lr=3e-4),
     critic1_optim=critic1_optim,
     critic2_optim=critic2_optim,
-    tau=0.01, gamma=0.99, alpha=5.0,
+    tau=0.01, gamma=0.99, init_alpha=5.0,
     action_space=env_action_space
 )
 
