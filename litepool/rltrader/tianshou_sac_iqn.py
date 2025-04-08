@@ -96,10 +96,10 @@ results_dir.mkdir(exist_ok=True)
 
 # Model initialization
 torch.manual_seed(42)
-actor = RecurrentActor().to(device)
-critic1 = IQNCritic(action_dim=3, num_quantiles=32, hidden_dim=128, quantile_embedding_dim=128, gru_hidden_dim=128, num_layers=2).to(device)
+actor = RecurrentActor(device).to(device)
+critic1 = IQNCritic(action_dim=3, num_quantiles=32, hidden_dim=128, quantile_embedding_dim=32, gru_hidden_dim=128, num_layers=2).to(device)
 torch.manual_seed(1221)
-critic2 = IQNCritic(action_dim=3, num_quantiles=32, hidden_dim=128, quantile_embedding_dim=128, gru_hidden_dim=128, num_layers=2).to(device)
+critic2 = IQNCritic(action_dim=3, num_quantiles=32, hidden_dim=128, quantile_embedding_dim=32, gru_hidden_dim=128, num_layers=2).to(device)
 
 critic1_optim = Adam(critic1.parameters(), lr=3e-4)
 critic2_optim = Adam(critic2.parameters(), lr=3e-4)

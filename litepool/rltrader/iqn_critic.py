@@ -8,8 +8,8 @@ class IQNCritic(nn.Module):
         self,
         action_dim=3,
         hidden_dim=128,
-        num_quantiles=32,  # Reduced from 64 to help with memory
-        quantile_embedding_dim=64,  # Reduced embedding dimension
+        num_quantiles=32,  
+        quantile_embedding_dim=32,  
         gru_hidden_dim=128,
         num_layers=2
     ):
@@ -75,19 +75,16 @@ class IQNCritic(nn.Module):
 
     def forward(self, state, action, taus=None, state_h=None):
         device = next(self.parameters()).device
-        
-        # Convert inputs to tensors if needed
         state = torch.as_tensor(state, dtype=torch.float32, device=device)
         action = torch.as_tensor(action, dtype=torch.float32, device=device)
 
-        # Get original batch size (before quantile expansion)
+        # Reshape state: [batch, 2420] -> [batch, 10, 242] OR [batch, seq, 2420] -> [batch*seq, 10, 242]
         original_batch_size = state.size(0)
-        
-        # Reshape state to [batch_size, time_steps, features]
         if state.dim() == 2:
             state = state.view(original_batch_size, self.time_steps, self.feature_dim)
-        elif state.dim() != 3:
-            raise ValueError(f"Unexpected state shape: {state.shape}")
+        elif state.dim() == 3:
+            batch_size, seq_len, _ = state.shape
+            state = state.view(batch_size * seq_len, self.time_steps, self.feature_dim) 
 
         # Process state components
         market_state = state[:, :, :self.market_dim]
@@ -110,7 +107,6 @@ class IQNCritic(nn.Module):
         x = x[:, -1, :]  # Take last timestep
 
         # Process action and combine with state
-        action = action.view(original_batch_size, -1)[:, :3]  # Ensure correct action dim
         x = torch.cat([x, new_state_h[-1], action], dim=-1)
 
         # Quantile processing

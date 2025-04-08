@@ -122,7 +122,10 @@ class GPUCollector(Collector):
                 obs_batch = Batch(obs=torch.as_tensor(self.data.obs, device=self.device))
 
             with torch.no_grad():
-                result = self.policy(obs_batch, state=self.data.state)
+                if self.data.state is not None:
+                    result = self.policy(obs_batch, state=self.data.state.transpose(0, 1))
+                else:
+                    result = self.policy(obs_batch, state=self.data.state)
 
             self.data.act = result.act
             self.data.state = result.state if hasattr(result, 'state') else None
