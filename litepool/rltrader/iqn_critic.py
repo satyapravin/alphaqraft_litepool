@@ -1,6 +1,5 @@
 import numpy as np
 import torch
-
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -10,7 +9,7 @@ class IQNCritic(nn.Module):
         self,
         action_dim=3, 
         hidden_dim=128, 
-        num_quantiles=64, 
+        num_quantiles=32, 
         quantile_embedding_dim=128,
         gru_hidden_dim=128, 
         num_layers=2
@@ -109,16 +108,24 @@ class IQNCritic(nn.Module):
         if taus is None:
             taus = torch.rand(batch_size, self.num_quantiles, device=device)
 
+        # Ensure taus has the correct shape: [batch_size, num_quantiles]
+        if taus.dim() == 1:
+            taus = taus.view(-1, 1)  # [batch_size, 1]
+        # If taus is [2048, 32], keep it as is; no reshaping needed since batch_size=2048
+
         i_pi = torch.arange(1, self.quantile_embedding_dim + 1, device=device).float() * np.pi
-        cos = torch.cos(taus.unsqueeze(-1) * i_pi)
-        quantile_embedding = F.relu(self.cosine_layer(cos))
+        cos = torch.cos(taus.unsqueeze(-1) * i_pi)  # [batch_size, num_quantiles, quantile_embedding_dim]
+        quantile_embedding = F.relu(self.cosine_layer(cos))  # [batch_size, num_quantiles, hidden_dim]
 
-        x = x.unsqueeze(1).expand(-1, self.num_quantiles, -1)
-        x = torch.cat([x, quantile_embedding], dim=-1)
+        print(f"x shape before expand: {x.shape}")
+        x = x.unsqueeze(1).expand(-1, self.num_quantiles, -1)  # [batch_size, num_quantiles, hidden_dim + ...]
+        print(f"x shape after expand: {x.shape}")
+        print(f"quantile_embedding shape: {quantile_embedding.shape}")
+        x = torch.cat([x, quantile_embedding], dim=-1)  # [batch_size, num_quantiles, total_dim]
 
-        x = x.view(-1, x.shape[-1])
+        x = x.view(-1, x.shape[-1])  # [batch_size * num_quantiles, total_dim]
         x = self.fusion_fc(x)
         q_values = self.q_values(x)
-        q_values = q_values.view(batch_size, self.num_quantiles)
+        q_values = q_values.view(batch_size, self.num_quantiles)  # [batch_size, num_quantiles]
 
         return q_values, new_state_h
