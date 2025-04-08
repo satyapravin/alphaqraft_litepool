@@ -349,32 +349,15 @@ class CustomSACPolicy(SACPolicy):
                 )
                 target_q = target_q.unsqueeze(1).expand(-1, self.critic.num_quantiles)
             
-            # Critic loss computation using quantile regression
+            # Generate tau values for quantile regression
             tau = torch.linspace(0, 1, self.critic.num_quantiles, device=device).unsqueeze(0)
             tau = tau.expand(batch_size, -1)
             
-            # TD errors
-            td_error1 = target_q - current_q1
-            td_error2 = target_q - current_q2
-            
-            # Huber loss with kappa=1
-            k = 1.0
-            huber_loss1 = torch.where(
-                td_error1.abs() <= k,
-                0.5 * td_error1.pow(2),
-                k * td_error1.abs() - 0.5 * k**2
+            # Replace original Huber loss with quantile_huber_loss
+            critic_loss = (
+                quantile_huber_loss(current_q1, target_q, tau, tau, kappa=1.0) +
+                quantile_huber_loss(current_q2, target_q, tau, tau, kappa=1.0)
             )
-            huber_loss2 = torch.where(
-                td_error2.abs() <= k,
-                0.5 * td_error2.pow(2),
-                k * td_error2.abs() - 0.5 * k**2
-            )
-            
-            # Quantile weights
-            quantile_weight = torch.abs(tau - (td_error1 < 0).float().detach())
-            
-            # Final critic loss
-            critic_loss = (quantile_weight * huber_loss1).mean() + (quantile_weight * huber_loss2).mean()
             
             # Actor loss computation
             new_actions = act_tanh
@@ -399,7 +382,7 @@ class CustomSACPolicy(SACPolicy):
         
         # Backward passes with gradient scaling
         self.scaler.scale(critic_loss).backward(retain_graph=True)
-        self.scaler.scale(actor_loss +  0.1 * pnl_loss).backward(retain_graph=True)
+        self.scaler.scale(actor_loss + 0.1 * pnl_loss).backward(retain_graph=True)
         self.scaler.scale(alpha_loss).backward()
         
         # Gradient clipping
@@ -482,10 +465,6 @@ class RecurrentActor(nn.Module):
         self.predict_steps = predict_steps
 
         # Feature extractors
-        self.position_fc = nn.Sequential(
-            nn.Linear(self.position_dim, 64), nn.ReLU(), nn.LayerNorm(64),
-            nn.Linear(64, 32), nn.ReLU()
-        )
         self.trade_fc = nn.Sequential(
             nn.Linear(self.trade_dim, 64), nn.ReLU(), nn.LayerNorm(64),
             nn.Linear(64, 32), nn.ReLU()
@@ -787,6 +766,14 @@ class CollectStats:
     lengths: np.ndarray
     continuous_step: int
 
+
+class StatClass:
+    def __init__(self, mean_val, std_val):
+        self.mean = mean_val
+        self._std = std_val
+    def std(self):
+        return self._std
+
 class GPUCollector(Collector):
     def __init__(self, policy, env, buffer=None, preprocess_fn=None, device='cuda', **kwargs):
         super().__init__(policy, env, buffer, **kwargs)
@@ -1022,13 +1009,6 @@ class GPUCollector(Collector):
             empty_arr = np.array([])
             rews = lens = empty_arr
             mean_rew = mean_len = std_rew = std_len = 0.0
-
-        class StatClass:
-            def __init__(self, mean_val, std_val):
-                self.mean = mean_val
-                self._std = std_val
-            def std(self):
-                return self._std
 
         # Create stat objects
         return_stat = StatClass(mean_rew, std_rew)
