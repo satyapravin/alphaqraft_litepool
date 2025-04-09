@@ -43,9 +43,9 @@ def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, 
     rewards = batch.rew.squeeze(-1)
     dones = batch.done.squeeze(-1)
     
-    actor_state = batch.get('actor_state', None)
-    critic1_state = batch.get('critic1_state', None)
-    critic2_state = batch.get('critic2_state', None)
+    actor_state = batch.get('state', None)
+    critic1_state = batch.get('state_h1', None)
+    critic2_state = batch.get('state_h2', None)
     
     discount_factors = gamma ** torch.arange(n_step, device=device)
     mask = 1 - dones.cumsum(dim=1).clamp(0, 1).float()
@@ -55,10 +55,8 @@ def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, 
         obs_next = batch.obs_next
         flat_obs = obs_next.reshape(batch_size * n_step, -1)
         
-        if actor_state is not None:
-            actor_state = actor_state.transpose(0, 1).reshape(actor.num_layers, -1, actor.gru_hidden_dim).contiguous()
+        actor_state = actor_state.transpose(0, 1).reshape(actor.num_layers, -1, actor.gru_hidden_dim).contiguous()
         loc, scale, _, _ = actor(flat_obs, state=actor_state)
-        scale = scale.clamp(min=1e-3)
         dist = Independent(Normal(loc, scale), 1)
         raw_actions = dist.rsample()
         actions = torch.tanh(raw_actions)
@@ -72,10 +70,8 @@ def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, 
         flat_actions = actions.reshape(batch_size * n_step, -1)
         taus = torch.rand(batch_size * n_step, num_quantiles, device=device)
         
-        if critic1_state is not None:
-            critic1_state = critic1_state.transpose(0, 1).reshape(critic1.num_layers, -1, critic1.gru_hidden_dim).contiguous()
-        if critic2_state is not None:
-            critic2_state = critic2_state.transpose(0, 1).reshape(critic2.num_layers, -1, critic2.gru_hidden_dim).contiguous()
+        critic1_state = critic1_state.transpose(0, 1).reshape(critic1.num_layers, -1, critic1.gru_hidden_dim).contiguous()
+        critic2_state = critic2_state.transpose(0, 1).reshape(critic2.num_layers, -1, critic2.gru_hidden_dim).contiguous()
             
         q1, _ = critic1(flat_obs, flat_actions, taus, state_h=critic1_state)
         q2, _ = critic2(flat_obs, flat_actions, taus, state_h=critic2_state)
