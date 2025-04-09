@@ -96,11 +96,6 @@ class CPUCollector(Collector):
         env_reward_sums = np.zeros(self.num_of_envs)
         env_length_sums = np.zeros(self.num_of_envs, dtype=int)
 
-        total_ep_rew = 0.0
-        total_ep_len = 0
-        avg_ep_rew = 0.0
-        avg_ep_len = 0.0
-
         obs_seq = [[] for _ in range(self.num_of_envs)]
         act_seq = [[] for _ in range(self.num_of_envs)]
         rew_seq = [[] for _ in range(self.num_of_envs)]
@@ -112,27 +107,17 @@ class CPUCollector(Collector):
         state_h1_seq = [[] for _ in range(self.num_of_envs)]
         state_h2_seq = [[] for _ in range(self.num_of_envs)]
         
-        if hasattr(self.data, 'info') and isinstance(self.data.info, dict):
-            info_dict_seq = {k: [[] for _ in range(self.num_of_envs)] for k in self.data.info.keys()}
-            info_is_dict = True
-        else:
-            info_seq = [[] for _ in range(self.num_of_envs)]
-            info_is_dict = False
+        info_dict_seq = {k: [[] for _ in range(self.num_of_envs)] for k in self.data.info.keys()} if self.data.info else {}
+        info_is_dict = True
 
-        latest_info = None
+        if self.data.obs is None or not self.env_active:
+            obs, info = self.reset_env(gym_reset_kwargs)
+            self.data.obs = obs
+            self.data.info = info
+            info_dict_seq = {k: [[] for _ in range(self.num_of_envs)] for k in info.keys()}
+            print(f"Initial reset, trade_count: {info['trade_count']}")
 
         while True:
-            if self.data.obs is None:
-                obs, info = self.reset_env(gym_reset_kwargs)
-                self.data.obs = obs
-                self.data.info = info
-                if isinstance(info, dict):
-                    info_dict_seq = {k: [[] for _ in range(self.num_of_envs)] for k in info.keys()}
-                    info_is_dict = True
-                else:
-                    info_seq = [[] for _ in range(self.num_of_envs)]
-                    info_is_dict = False
-
             with torch.no_grad():
                 if random:
                     act = np.array([self.env.action_space.sample() for _ in range(self.num_of_envs)])
@@ -155,6 +140,8 @@ class CPUCollector(Collector):
                 terminated = done
                 truncated = np.zeros_like(done)
 
+            print(f"Step {local_step_count}/{self.continuous_step_count}, trade_count: {info['trade_count']}, done: {done}")
+
             for env_idx in range(self.num_of_envs):
                 obs_seq[env_idx].append(self.data.obs[env_idx])
                 act_seq[env_idx].append(self.data.act[env_idx])
@@ -164,24 +151,16 @@ class CPUCollector(Collector):
                 truncated_seq[env_idx].append(truncated[env_idx])
                 obs_next_seq[env_idx].append(obs_next[env_idx])
                 state_seq[env_idx].append(
-                    self.data.state[:, env_idx, :].cpu().numpy() 
-                    if self.data.state is not None 
-                    else np.zeros((2, 128))
+                    self.data.state[:, env_idx, :].cpu().numpy() if self.data.state is not None else np.zeros((2, 128))
                 )
                 state_h1_seq[env_idx].append(self.state_h1[:, env_idx].cpu().numpy())
                 state_h2_seq[env_idx].append(self.state_h2[:, env_idx].cpu().numpy())
                 
-                if info_is_dict:
-                    for k, v in info.items():
-                        if isinstance(v, (np.ndarray, list)) and len(v) == self.num_of_envs:
-                            info_dict_seq[k][env_idx].append(v[env_idx])
-                        else:
-                            info_dict_seq[k][env_idx].append(v)
-                else:
-                    if isinstance(info, (np.ndarray, list)) and len(info) == self.num_of_envs:
-                        info_seq[env_idx].append(info[env_idx])
+                for k, v in info.items():
+                    if isinstance(v, (np.ndarray, list)) and len(v) == self.num_of_envs:
+                        info_dict_seq[k][env_idx].append(v[env_idx])
                     else:
-                        info_seq[env_idx].append(info)
+                        info_dict_seq[k][env_idx].append(v)
 
                 if done[env_idx]:
                     env_episode_counts[env_idx] += 1
@@ -190,28 +169,22 @@ class CPUCollector(Collector):
                     episode_count += 1
                     episode_rews.append(env_reward_sums[env_idx])
                     episode_lens.append(env_length_sums[env_idx])
-                    # Update running stats
                     self.returns_stat.update(np.array([env_reward_sums[env_idx]]))
                     self.lens_stat.update(np.array([env_length_sums[env_idx]]))
                     env_reward_sums[env_idx] = 0
                     env_length_sums[env_idx] = 0
+                    if hasattr(self.env, 'reset_one'):
+                        obs_next[env_idx], info_reset = self.env.reset_one(env_idx)
+                        for k, v in info_reset.items():
+                            info_dict_seq[k][env_idx][-1] = v
+                    print(f"Env {env_idx} done at step {local_step_count}, trade_count: {info['trade_count'][env_idx]}")
 
-            self.rewards_stat.update(np.array([np.mean(rew)]))  # Update step rewards stat
-            latest_info = info_dict_seq if info_is_dict else np.array(info_seq)
-
-            self.state_h1, self.state_h2 = self.policy.update_hidden_states(
-                torch.as_tensor(obs_next, device=self.model_device),
-                torch.as_tensor(self.data.act, device=self.model_device),
-                self.state_h1, self.state_h2
-            )
-
+            self.rewards_stat.update(np.array([np.mean(rew)]))
             step_rews.extend(rew)
             local_step_count += 1
             self.continuous_step_count += 1
 
-            if local_step_count >= self.seq_len:
-                batch_info = info_dict_seq if info_is_dict else np.array(info_seq)
-                
+            if self.buffer and local_step_count % self.seq_len == 0:
                 batch = Batch(
                     obs=np.array(obs_seq),
                     act=np.array(act_seq),
@@ -223,16 +196,9 @@ class CPUCollector(Collector):
                     state=np.array(state_seq),
                     state_h1=np.array(state_h1_seq),
                     state_h2=np.array(state_h2_seq),
-                    info=batch_info
+                    info=info_dict_seq
                 )
-
                 buffer_results = self.buffer.add(batch)
-                
-                total_ep_rew = sum(r[1] for r in buffer_results)
-                total_ep_len = sum(r[2] for r in buffer_results)
-                avg_ep_rew = total_ep_rew / len(buffer_results) if buffer_results else 0
-                avg_ep_len = total_ep_len / len(buffer_results) if buffer_results else 0
-                
                 obs_seq = [[] for _ in range(self.num_of_envs)]
                 act_seq = [[] for _ in range(self.num_of_envs)]
                 rew_seq = [[] for _ in range(self.num_of_envs)]
@@ -243,38 +209,45 @@ class CPUCollector(Collector):
                 state_seq = [[] for _ in range(self.num_of_envs)]
                 state_h1_seq = [[] for _ in range(self.num_of_envs)]
                 state_h2_seq = [[] for _ in range(self.num_of_envs)]
-                
-                if info_is_dict:
-                    info_dict_seq = {k: [[] for _ in range(self.num_of_envs)] for k in info_dict_seq.keys()}
-                else:
-                    info_seq = [[] for _ in range(self.num_of_envs)]
+                info_dict_seq = {k: [[] for _ in range(self.num_of_envs)] for k in info_dict_seq.keys()}
+                print(f"Buffer added at step {local_step_count}")
 
-            if n_episode and episode_count >= n_episode:
-                break
-            if n_step and local_step_count >= n_step:
-                break
-
+            # Update state before breaking
             self.data.obs = obs_next
+            self.state_h1, self.state_h2 = self.policy.update_hidden_states(
+                torch.as_tensor(obs_next, device=self.model_device),
+                torch.as_tensor(self.data.act, device=self.model_device),
+                self.state_h1, self.state_h2
+            )
+
+            # Exit conditions
+            if n_step and local_step_count >= n_step:
+                print(f"Breaking at n_step={n_step}, local_step_count={local_step_count}")
+                break
+            if n_episode and episode_count >= n_episode:
+                print(f"Breaking at n_episode={n_episode}, episode_count={episode_count}")
+                break
 
         collect_time = time.time() - start_time
-        
+        latest_info = info_dict_seq
+
         return CollectStats(
             n_ep=episode_count,
             n_st=local_step_count,
             rews=np.array(step_rews),
             lens=np.array(episode_lens),
-            rew=avg_ep_rew,
-            len=avg_ep_len,
-            rew_std=np.std([r[1] for r in buffer_results]) if 'buffer_results' in locals() else 0.0,
-            len_std=np.std([r[2] for r in buffer_results]) if 'buffer_results' in locals() else 0.0,
+            rew=np.mean(step_rews) if step_rews else 0.0,
+            len=np.mean(episode_lens) if episode_lens else 0.0,
+            rew_std=np.std(step_rews) if step_rews else 0.0,
+            len_std=np.std(episode_lens) if episode_lens else 0.0,
             n_collected_steps=local_step_count,
             n_collected_episodes=episode_count,
-            returns_stat=self.returns_stat,  # No .copy() needed for RunningMeanStd
+            returns_stat=self.returns_stat,
             lens_stat=self.lens_stat,
             rewards_stat=self.rewards_stat,
             episodes=episode_count,
-            reward_sum=total_ep_rew,
-            length_sum=int(total_ep_len),
+            reward_sum=sum(step_rews),
+            length_sum=sum(episode_lens),
             collect_time=collect_time,
             step_time=collect_time / local_step_count if local_step_count > 0 else 0.0,
             returns=np.array(episode_rews) if episode_rews else np.array([]),

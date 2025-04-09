@@ -203,7 +203,7 @@ collector = CPUCollector(
 # Define train_fn to log metrics
 def train_fn(epoch, env_step):
     # Collect latest stats from collector
-    stats = collector.collect(n_step=num_of_envs)  # Collect one step per env
+    stats = collector.collect(n_step=600)  
     metric_logger.log(
         step_count=env_step,
         info=stats.info,  

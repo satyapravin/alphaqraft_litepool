@@ -50,7 +50,7 @@ class MetricLogger:
                       f"{r_pnl:+6.6f} | "
                       f"{ur_pnl:+6.6f} | "
                       f"{fees:+6.6f} | "
-                      f"{trades:8d} | "
+                      f"{trades:8f} | "
                       f"{drawdown:+8.6f} | "
                       f"{leverage:+8.6f} | "
                       f"{reward:+8.6f}")
