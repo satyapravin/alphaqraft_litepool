@@ -10,7 +10,7 @@ from vec_normalizer import VecNormalize
 from recurrent_actor import RecurrentActor
 from iqn_critic import IQNCritic
 from custom_sac_policy import CustomSACPolicy
-from replay_buffer import StackedVectorReplayBuffer
+from replay_buffer import SequentialReplayBuffer
 from gpu_collector import GPUCollector
 import logging
 from datetime import datetime
@@ -149,37 +149,41 @@ if final_buffer_path.exists():
         print(f"Loaded buffer config: {buffer_config}")
     else:
         buffer_config = {
-            'total_size': num_of_envs * 100,
-            'buffer_num': num_of_envs,
-            'stack_num': 60,
-            'env_segment_size': 100
+            'buffer_num': num_of_envs * 6000,  # Total buffer size
+            'seq_len': 300,              # Sequence length
+            'num_envs': num_of_envs,     # Number of environments
+            'device': str(device)        # Device as string for serialization
         }
 
-    buffer = StackedVectorReplayBuffer(
-        total_size=buffer_config['total_size'],
-        buffer_num=buffer_config['buffer_num'],
-        stack_num=buffer_config['stack_num'],
+    # Initialize SequentialReplayBuffer
+    buffer = SequentialReplayBuffer(
+        size=buffer_config['buffer_num'],
+        seq_len=buffer_config['seq_len'],
+        num_envs=buffer_config['num_envs'],
         device=device
     )
 
+    # Load data from saved buffer
     temp_buffer = VectorReplayBuffer.load_hdf5(final_buffer_path)
+    
+    # Transfer data to our sequential buffer
     buffer._meta = temp_buffer._meta
     buffer._index = temp_buffer._index
     buffer._size = temp_buffer._size
+    
+    # Verify segment size matches
+    expected_segment = buffer_config['total_size'] // buffer_config['buffer_num']
+    if buffer.env_segment_size != expected_segment:
+        print(f"Adjusting env_segment_size from {buffer.env_segment_size} to {expected_segment}")
+        buffer.env_segment_size = expected_segment
 
-    if hasattr(buffer, 'env_segment_size'):
-        expected_segment = buffer_config['total_size'] // buffer_config['buffer_num']
-        if buffer.env_segment_size != expected_segment:
-            print(f"Warning: Adjusting env_segment_size from {buffer.env_segment_size} to {expected_segment}")
-            buffer.env_segment_size = expected_segment
-
-    print(f"Buffer loaded with {len(buffer)} transitions")
+    print(f"Buffer loaded with {len(buffer)} transitions (max sequence length: {buffer.seq_len})")
 else:
-    print(f"No buffer found at {final_buffer_path}, creating new buffer")
-    buffer = StackedVectorReplayBuffer(
-        total_size=num_of_envs * 100,  # 6400 transitions total
-        buffer_num=num_of_envs,  # 64 envs
-        stack_num=60,  # 60 steps stacked
+    print(f"No buffer found at {final_buffer_path}, creating new sequential buffer")
+    buffer = SequentialReplayBuffer(
+        total_size=num_of_envs * 1000,  # Total buffer size (e.g., 64 envs × 6000 steps)
+        seq_len=300,              # Length of sequences to sample
+        buffer_num=num_of_envs,     # Match your environment count
         device=device
     )
 
@@ -230,9 +234,9 @@ torch.save({
 buffer.save_hdf5(final_buffer_path)
 torch.save({
     'buffer_type': 'StackedVectorReplayBuffer',
-    'total_size': num_of_envs * 100,
+    'total_size': num_of_envs * 1000,
     'buffer_num': num_of_envs,
-    'stack_num': 60,
+    'seq_len': 300,
     'device': str(device)
 }, metadata_path)
 

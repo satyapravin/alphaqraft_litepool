@@ -53,42 +53,38 @@ class RecurrentActor(nn.Module):
     def forward(self, obs, state=None):
         if isinstance(obs, Batch):
             obs = obs.obs
-        obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-        
-        # Handle both [batch, 2420] and [batch, seq_len, 2420]
-        if obs.dim() == 2:
-            batch_size = obs.shape[0]
-            obs = obs.view(batch_size, self.time_steps, self.feature_dim)
-        elif obs.dim() == 3:
-            batch_size, seq_len, _ = obs.shape
-            obs = obs.view(batch_size * seq_len, self.time_steps, self.feature_dim)
-        else:
-            raise ValueError(f"Unexpected obs shape: {obs.shape}")
 
+        obs = torch.as_tensor(obs, dtype=torch.float32, device=next(self.parameters()).device)
+        batch_size = obs.shape[0]
+        obs = obs.view(batch_size, self.time_steps, -1)
 
+        # State shape handling (input)
+        if state is not None:
+            if state.dim() == 3 and state.shape[0] == batch_size:  # [B, L, H]
+                state = state.transpose(0, 1).contiguous()  # -> [L, B, H]
+            elif state.dim() != 3 or state.shape[1] != batch_size:
+                raise ValueError(f"Invalid state shape: {state.shape}")
 
+        # Default state if None
+        if state is None:
+            state = torch.zeros(self.num_layers, batch_size, self.gru_hidden_dim, 
+                              device=obs.device)
+
+        # Original processing
         market_state = obs[:, :, :self.market_dim]
         position_state = obs[:, :, self.market_dim:self.market_dim + self.position_dim]
-        trade_state = obs[:, :,
-                          self.market_dim + self.position_dim:self.market_dim + self.position_dim + self.trade_dim]
+        trade_state = obs[:, :, self.market_dim + self.position_dim:self.market_dim + self.position_dim + self.trade_dim]
 
         position_out = self.position_fc(position_state)
         trade_out = self.trade_fc(trade_state)
         market_out = self.market_fc(market_state)
-
         x = torch.cat([trade_out, market_out, position_out], dim=-1)
 
-        if state is None:
-            state = torch.zeros(self.num_layers, obs.shape[0], self.gru_hidden_dim, device=self.device)
-        
-        x, new_state = self.gru(x, state.transpose(0, 1))
+        # GRU processing
+        x, new_state = self.gru(x, state)
         x_last = x[:, -1, :]
-
-        if obs.dim() == 3:  # Single observation mode
-            x_last = x[:, -1, :]
-        else:  # Batch sequence mode
-            x_last = x.view(batch_size, seq_len, self.time_steps, -1)[:, -1, -1, :]
         
+        # Prepare outputs
         predictor_input = torch.cat([new_state[-1], x_last], dim=-1)
         predicted_pnl = self.pnl_predictor(predictor_input)
         x = self.fusion_fc(predictor_input)
@@ -97,7 +93,4 @@ class RecurrentActor(nn.Module):
         log_std = self.log_std(x).clamp(-10, 2)
         std = log_std.exp() + 1e-6
 
-        loc = mean
-        scale = std
-
-        return loc, scale, new_state.detach().transpose(0, 1), predicted_pnl
+        return mean, std, new_state.transpose(0, 1), predicted_pnl

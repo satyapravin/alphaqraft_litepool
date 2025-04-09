@@ -158,14 +158,21 @@ class CustomSACPolicy(SACPolicy):
             obs = batch.obs
         else:
             obs = batch
-        loc, scale, h, _ = self.actor(obs, state=state)
+        
+        # State shape handling
+        if state is not None:
+            if state.dim() == 3 and state.shape[0] == obs.shape[0]:  # [B, L, H]
+                state = state.transpose(0, 1).contiguous()  # -> [L, B, H] for GRU
+        
+        loc, scale, new_state, _ = self.actor(obs, state=state)
         dist = Independent(Normal(loc, scale), 1)
         act = dist.rsample()
         log_prob = dist.log_prob(act)
         act = torch.tanh(act)
         log_prob = log_prob - torch.sum(torch.log(1 - act.pow(2) + 1e-6), dim=-1)
 
-        return Batch(act=act, state=h, dist=dist, log_prob=log_prob)
+        # Return state in collector-friendly shape [B, L, H]
+        return Batch(act=act, state=new_state, dist=dist, log_prob=log_prob)
 
     def update_hidden_states(self, obs_next, act, state_h1, state_h2):
         with torch.no_grad():

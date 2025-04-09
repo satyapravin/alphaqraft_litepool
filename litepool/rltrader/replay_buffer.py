@@ -2,48 +2,67 @@ import numpy as np
 import torch
 from tianshou.data import VectorReplayBuffer
 
-
-class StackedVectorReplayBuffer(VectorReplayBuffer):
-    def __init__(self, total_size, buffer_num, stack_num=60, device='cuda', **kwargs):
-        super().__init__(total_size=total_size, buffer_num=buffer_num, stack_num=stack_num, **kwargs)
-        self.stack_num = stack_num
+class SequentialReplayBuffer(VectorReplayBuffer):
+    def __init__(self, total_size, seq_len=600, buffer_num=1, device='cuda'):
+        """
+        Args:
+            total_size: Total buffer size (number of steps)
+            seq_len: Length of sequential chunks to sample
+            buffer_num: Number of parallel environments
+            device: Target device for tensors
+        """
+        super().__init__(total_size, buffer_num)
+        self.seq_len = seq_len
         self.device = device
-        self.env_segment_size = total_size // buffer_num  # Size per environment
-        print(f"Buffer initialized with total_size={total_size}, buffer_num={buffer_num}, stack_num={stack_num}")
-
-class StackedVectorReplayBuffer(VectorReplayBuffer):
+        self.env_segment_size = total_size // buffer_num
+        
     def sample(self, batch_size):
-        indices = np.random.randint(0, len(self), size=batch_size)
+        """Sample batch_size sequences of seq_len consecutive steps"""
+        # Calculate valid start indices for each environment
+        valid_starts = self.env_segment_size - self.seq_len
+        if valid_starts <= 0:
+            raise ValueError(
+                f"Not enough samples in buffer (needs {self.seq_len} steps per env, "
+                f"but only {self.env_segment_size} available per env)"
+            )
+        
+        # Sample one sequence per environment
+        indices = []
+        for env_idx in range(self.buffer_num):
+            start = env_idx * self.env_segment_size + np.random.randint(0, valid_starts)
+            indices.extend(range(start, start + self.seq_len))
+        
+        # Get the sequential batch
         batch = super().__getitem__(indices)
-
-        # Reshape obs: [batch, 60, 2420] -> [batch, 60, 10, 242]
-        obs = batch.obs.view(batch_size, self.stack_num, 10, 242)
-        batch.obs = obs.to(self.device)
+        
+        # Convert to tensors and reshape
+        for key in ['obs', 'act', 'rew', 'done', 'obs_next']:
+            val = getattr(batch, key)
+            if isinstance(val, np.ndarray):
+                setattr(batch, key, torch.as_tensor(val, device=self.device))
+        
+        # Reshape observations: [batch_size*seq_len, ...] -> [batch_size, seq_len, ...]
+        batch_size = self.buffer_num
+        for key in ['obs', 'act', 'rew', 'done', 'obs_next']:
+            val = getattr(batch, key)
+            if val is not None:
+                setattr(batch, key, val.view(batch_size, self.seq_len, *val.shape[1:]))
+        
+        # Special handling for 2420-dim observations
+        if batch.obs.dim() == 3:  # [batch, seq_len, 2420]
+            batch.obs = batch.obs.view(batch_size, self.seq_len, 10, 242)
+        if batch.obs_next.dim() == 3:
+            batch.obs_next = batch.obs_next.view(batch_size, self.seq_len, 10, 242)
+        
         return batch, indices
 
     def __getitem__(self, index):
-        if isinstance(index, (int, np.integer)):
-            # Handle single index
-            index = np.array([index])
-        
-        if isinstance(index, (np.ndarray, torch.Tensor)):
-            if isinstance(index, torch.Tensor):
-                index = index.cpu().numpy()
-            
-            # Get the data for all indices
-            batch = super().__getitem__(index)
-            
-            # If the indices were stacked (2D array), reshape the data
-            if index.ndim == 2:
-                batch_size, stack_num = index.shape
-                for key in ['obs', 'act', 'rew', 'done', 'obs_next']:
-                    if hasattr(batch, key):
-                        val = getattr(batch, key)
-                        if isinstance(val, np.ndarray):
-                            setattr(batch, key, val.reshape(batch_size, stack_num, *val.shape[1:]))
-                        elif isinstance(val, torch.Tensor):
-                            setattr(batch, key, val.view(batch_size, stack_num, *val.shape[1:]))
-            
-            return batch
-        
-        return super().__getitem__(index)
+        """Override to maintain proper batching"""
+        if isinstance(index, slice):
+            # Handle sequential sampling
+            return super().__getitem__(index)
+        elif isinstance(index, (list, np.ndarray)):
+            # Handle batch sampling
+            return super().__getitem__(index)
+        else:
+            raise TypeError("Index must be slice, list, or np.ndarray")
