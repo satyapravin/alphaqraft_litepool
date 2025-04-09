@@ -11,7 +11,7 @@ from recurrent_actor import RecurrentActor
 from iqn_critic import IQNCritic
 from custom_sac_policy import CustomSACPolicy
 from replay_buffer import SequentialReplayBuffer
-from gpu_collector import GPUCollector
+from cpu_collector import CPUCollector
 import logging
 from datetime import datetime
 
@@ -157,10 +157,10 @@ if final_buffer_path.exists():
 
     # Initialize SequentialReplayBuffer
     buffer = SequentialReplayBuffer(
-        size=buffer_config['buffer_num'],
+        total_size=buffer_config['total_size'],
         seq_len=buffer_config['seq_len'],
-        num_envs=buffer_config['num_envs'],
-        device=device
+        buffer_num=buffer_config['buffer_num'],
+        device='cpu'
     )
 
     # Load data from saved buffer
@@ -181,28 +181,29 @@ if final_buffer_path.exists():
 else:
     print(f"No buffer found at {final_buffer_path}, creating new sequential buffer")
     buffer = SequentialReplayBuffer(
-        total_size=num_of_envs * 1000,  # Total buffer size (e.g., 64 envs × 6000 steps)
-        seq_len=300,              # Length of sequences to sample
-        buffer_num=num_of_envs,     # Match your environment count
-        device=device
+        total_size=num_of_envs * 900,  # Total buffer size (e.g., 64 envs × 6000 steps)
+        seq_len=300,                   # Length of sequences to sample
+        buffer_num=num_of_envs,        # Match your environment count
+        device="cpu"
     )
 
 # Collector setup
-collector = GPUCollector(
+collector = CPUCollector(
     num_of_envs=num_of_envs,
     policy=policy,
     env=env,
     buffer=buffer,
-    device=device
+    seq_len=300,
+    device='cpu'
 )
 
 trainer = OffpolicyTrainer(
     policy=policy,
     train_collector=collector,
     test_collector=None,  # No test env for now; add if needed
-    max_epoch=50,  # Number of epochs to train
-    step_per_epoch=10,  # Steps per epoch (adjust based on your needs)
-    step_per_collect=64*300,  # Collect 64 steps (1 step per env) per iteration
+    max_epoch=10,  # Number of epochs to train
+    step_per_epoch=60,  # Steps per epoch (adjust based on your needs)
+    step_per_collect=64*100,  # Collect 64 steps (1 step per env) per iteration
     episode_per_test=0,  # No test episodes; set if you add a test env
     batch_size=64,  # Match num_of_envs for efficient sampling
     update_per_step=0.1,  # Update policy once per collected step
@@ -211,7 +212,6 @@ trainer = OffpolicyTrainer(
     stop_fn=lambda mean_rewards: mean_rewards >= 1000,  # Stop if mean reward exceeds threshold
     save_checkpoint_fn=save_checkpoint_fn,
     resume_from_log=start_epoch > 0,
-    reward_metric=lambda rews: np.mean(rews)  # Average reward across envs
 )
 
 # Run the trainer
@@ -234,10 +234,10 @@ torch.save({
 buffer.save_hdf5(final_buffer_path)
 torch.save({
     'buffer_type': 'StackedVectorReplayBuffer',
-    'total_size': num_of_envs * 1000,
+    'total_size': num_of_envs * 900,
     'buffer_num': num_of_envs,
     'seq_len': 300,
-    'device': str(device)
+    'device': 'cpu'
 }, metadata_path)
 
 print(f"Final model saved to {final_checkpoint_path}")

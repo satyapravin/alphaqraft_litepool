@@ -37,58 +37,53 @@ def quantile_huber_loss(prediction, target, taus_predicted, taus_target, kappa=1
     quantile_loss = weight * huber
     return quantile_loss.mean()
 
-def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, n_step=300, num_quantiles=32, chunk_size=8):
+def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, n_step=300, num_quantiles=32):
     batch_size = len(batch)
-    rewards = batch.rew.squeeze(-1)
-    dones = batch.done.squeeze(-1)
-
-    print(rewards.shape, dones.shape)
+    rewards = batch.rew.squeeze(-1)  # [64, 300]
+    dones = batch.done.squeeze(-1)  # [64, 300]
+    
     assert rewards.shape == (batch_size, n_step), "Rewards shape mismatch"
     assert dones.shape == (batch_size, n_step), "Dones shape mismatch"
-    assert batch.obs_next.dim() == 3, "obs_next should be 4D [B, seq_len, obs_dim]"
+    assert batch.obs_next.shape == (batch_size, n_step, 2420), "obs_next should be [B, seq_len, obs_dim]"
 
-    # 1. Compute cumulative rewards
-    cumulative_rewards = torch.zeros(batch_size, n_step, device=device)
-    discount_factors = gamma ** torch.arange(n_step, device=device)
+    # 1. Compute cumulative rewards (vectorized)
+    discount_factors = gamma ** torch.arange(n_step, device=device)  # [300]
+    mask = 1 - dones.cumsum(dim=1).clamp(0, 1).float()  # [64, 300]
+    cumulative_rewards = torch.zeros(batch_size, n_step, device=device)  # [64, 300]
     for t in range(n_step):
-        mask = 1 - dones[:, :t+1].any(dim=1).float()
-        cumulative_rewards[:, t] = mask * (rewards[:, t:] * discount_factors[:n_step-t]).sum(dim=1)
+        cumulative_rewards[:, t] = (rewards[:, t:] * discount_factors[:n_step-t] * mask[:, t:]).sum(dim=1)
 
-    # 2. Compute target Q-values in chunks
-    target_q = torch.zeros(batch_size, n_step, num_quantiles, device=device)
+    # 2. Compute target Q-values with sequential hidden state propagation
+    target_q = torch.zeros(batch_size, n_step, num_quantiles, device=device)  # [64, 300, 32]
 
-    for b_start in range(0, batch_size, chunk_size):
-        b_end = min(b_start + chunk_size, batch_size)
-        chunk_obs = batch.obs_next[b_start:b_end, :, :]  # [8, 60, 2420]
+    # Initialize hidden states for the full batch
+    actor_h = torch.zeros(actor.num_layers, batch_size, actor.gru_hidden_dim, device=device)  # [2, 64, 128]
+    critic1_h = torch.zeros(critic1.num_layers, batch_size, critic1.gru_hidden_dim, device=device)  # [2, 64, 128]
+    critic2_h = torch.zeros(critic2.num_layers, batch_size, critic2.gru_hidden_dim, device=device)  # [2, 64, 128]
 
-        with torch.no_grad():
-            for t in range(n_step):
-                loc, scale, *_ = actor(chunk_obs[:, t])  # [8, 3]
-                dist = Independent(Normal(loc, scale), 1)
-                actions = torch.tanh(dist.rsample())  # [8, 3] (one action per sample)
-                obs_expanded = chunk_obs[:, t]  # [8, 2420]
-                taus = torch.rand(len(obs_expanded), num_quantiles, device=device)  # [8, 32]
+    with torch.no_grad():
+        for t in range(n_step):
+            # Actor forward pass with hidden state
+            loc, scale, actor_h, _ = actor(batch.obs_next[:, t:t+1], state=actor_h)  # [64, 1, 3], [2, 64, 128]
+            loc = loc.squeeze(1)  # [64, 3]
+            scale = scale.squeeze(1)  # [64, 3]
+            dist = Independent(Normal(loc, scale), 1)
+            actions = torch.tanh(dist.rsample())  # [64, 3]
+            log_prob = dist.log_prob(actions)  # [64]
 
-                q1, _ = critic1(
-                    obs_expanded,  # [8, 2420]
-                    actions,  # [8, 3]
-                    taus  # [8, 32]
-                )
-                q2, _ = critic2(
-                    obs_expanded,  # [8, 2420]
-                    actions,  # [8, 3]
-                    taus  # [8, 32]
-                )
+            # Critic forward passes with hidden states
+            taus = torch.rand(batch_size, num_quantiles, device=device)  # [64, 32]
+            q1, critic1_h = critic1(batch.obs_next[:, t, :], actions, taus, state_h=critic1_h)  # [64, 32], [2, 64, 128]
+            q2, critic2_h = critic2(batch.obs_next[:, t, :], actions, taus, state_h=critic2_h)  # [64, 32], [2, 64, 128]
 
-                q = torch.min(q1, q2)  # [8, 32]
-                log_prob = dist.log_prob(actions)  # [8]
-                target_q[b_start:b_end, t] = q - alpha * log_prob.unsqueeze(-1)  # [8, 32]
+            q = torch.min(q1, q2)  # [64, 32]
+            target_q[:, t] = q - alpha * log_prob.unsqueeze(-1)  # [64, 32]
 
     # 3. Compute final targets
-    not_done = 1 - batch.done.any(dim=1).float().view(batch_size, 1, 1)
-    final_targets = cumulative_rewards.unsqueeze(2) + not_done * (gamma ** n_step) * target_q
+    not_done = 1 - dones.any(dim=1).float().view(batch_size, 1, 1)  # [64, 1, 1]
+    final_targets = cumulative_rewards.unsqueeze(2) + not_done * (gamma ** n_step) * target_q  # [64, 300, 32]
 
-    return final_targets.reshape(batch_size * n_step, num_quantiles)  # [3840, 32]
+    return final_targets.reshape(batch_size * n_step, num_quantiles)  # [19200, 32]
 
 @dataclass
 class SACSummary:

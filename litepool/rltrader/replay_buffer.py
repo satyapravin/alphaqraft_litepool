@@ -1,69 +1,118 @@
 import numpy as np
 import torch
-from tianshou.data import VectorReplayBuffer
+from tianshou.data import VectorReplayBuffer, Batch, ReplayBuffer
 
 class SequentialReplayBuffer(VectorReplayBuffer):
-    def __init__(self, total_size, seq_len=600, buffer_num=1, device='cuda'):
-        """
-        Args:
-            total_size: Total buffer size (number of steps)
-            seq_len: Length of sequential chunks to sample
-            buffer_num: Number of parallel environments
-            device: Target device for tensors
-        """
-        super().__init__(total_size, buffer_num)
+    def __init__(self, total_size, seq_len=300, buffer_num=1, device='cpu'):
+        assert total_size % seq_len == 0, "total_size must be divisible by seq_len"
         self.seq_len = seq_len
+        buffer_size = total_size // buffer_num
         self.device = device
-        self.env_segment_size = total_size // buffer_num
-        
-    def sample(self, batch_size):
-        """Sample batch_size sequences of seq_len consecutive steps from random buffers"""
-        # Calculate valid start indices
-        valid_starts = self.env_segment_size - self.seq_len
-        if valid_starts <= 0:
-            raise ValueError(
-                f"Not enough samples in buffer (needs {self.seq_len} steps per env, "
-                f"but only {self.env_segment_size} available per env)"
-            )
-        
-        # Randomly select which buffers to sample from
-        env_indices = np.random.randint(0, self.buffer_num, size=batch_size)
-        indices = []
-        
-        for env_idx in env_indices:
-            # Sample random start position within this buffer's segment
-            start = env_idx * self.env_segment_size + np.random.randint(0, valid_starts)
-            indices.extend(range(start, start + self.seq_len))
-        
-        # Get the sequential batch
-        batch = super().__getitem__(indices)
-        
-        # Convert to tensors and reshape
-        for key in ['obs', 'act', 'rew', 'done', 'obs_next']:
-            val = getattr(batch, key)
-            if isinstance(val, np.ndarray):
-                setattr(batch, key, torch.as_tensor(val, device=self.device))
-        
-        # Reshape all components to [batch_size, seq_len, ...]
-        batch_size = len(env_indices)
-        for key in ['obs', 'act', 'rew', 'done', 'obs_next']:
-            val = getattr(batch, key)
-            if val is not None:
-                # For rewards and done flags, we add a dimension
-                if key in ['rew', 'done'] and val.dim() == 1:
-                    setattr(batch, key, val.view(batch_size, self.seq_len, 1))
+        self._size = buffer_size // seq_len
+        self._meta_keys = ['state', 'state_h1', 'state_h2']
+        super().__init__(buffer_size, buffer_num)
+        self.reset()
+
+    def _get_shape(self, key):
+        """Adjust shapes for 2-layer GRU."""
+        if key == 'obs' or key == 'obs_next':
+            return (2420,)  # [size, 300, 2420]
+        elif key == 'act':
+            return (3,)     # [size, 300, 3]
+        elif key in ['rew', 'done', 'terminated', 'truncated']:
+            return ()
+        elif key == 'state':
+            return (2, 128)  # [size, 300, 2, 128] for full GRU state
+        elif key == 'state_h1' or key == 'state_h2':
+            return (2, 128)  # [size, 300, 2, 128]
+        return None
+
+    def add(self, batch, buffer_ids=None):
+        if buffer_ids is None:
+            buffer_ids = np.arange(self.buffer_num)
+
+        ptrs = []
+        for buf_idx in buffer_ids:
+            buf = self.buffers[buf_idx]
+            idx = buf._index % self._size
+            steps = min(self.seq_len, buf.max_size - buf._reserved)
+
+            for key in ['obs', 'act', 'rew', 'done', 'terminated', 'truncated', 'obs_next']:
+                buf.data[key][idx, :steps] = batch[key][buf_idx][:steps]
+            for key in self._meta_keys:
+                if key in batch and batch[key] is not None:
+                    buf.data[key][idx, :steps] = batch[key][buf_idx][:steps]
+            buf.data['info'][idx * self.seq_len:(idx + 1) * self.seq_len] = batch.info[buf_idx]
+
+            buf._index += 1
+            buf._reserved = min(buf._reserved + steps, buf.max_size)
+
+            ep_rew = batch.rew[buf_idx].sum() if steps == self.seq_len else 0.0
+            ep_len = steps if steps == self.seq_len else 0
+            ptrs.append((idx, ep_rew, ep_len, buf_idx))
+
+        return ptrs
+
+    def sample(self, batch_size, train_device='cuda'):
+        indices = self.sample_indices(batch_size)
+        if indices.size == 0:
+            return Batch(), np.array([])
+
+        batch = Batch()
+        for buf_idx, seq_idx in indices:
+            buf = self.buffers[buf_idx]
+            for key in ['obs', 'act', 'rew', 'done', 'terminated', 'truncated', 'obs_next']:
+                val = buf.data[key][seq_idx]
+                batch[key] = np.concatenate([batch[key], val[None]], axis=0) if key in batch else val[None]
+            for key in self._meta_keys:
+                if key in buf.data:
+                    val = buf.data[key][seq_idx]
+                    batch[key] = np.concatenate([batch[key], val[None]], axis=0) if key in batch else val[None]
+            start = seq_idx * self.seq_len
+            end = start + self.seq_len
+            batch.info = buf.data['info'][start:end] if 'info' not in batch else batch.info + buf.data['info'][start:end]
+
+        for key in batch.keys():
+            if key != 'info':
+                val = batch[key]
+                if key in ['rew', 'done', 'terminated', 'truncated'] and val.ndim == 2:
+                    batch[key] = torch.as_tensor(val, device=train_device).view(batch_size, self.seq_len, 1)
                 else:
-                    setattr(batch, key, val.view(batch_size, self.seq_len, *val.shape[1:]))
-        
+                    batch[key] = torch.as_tensor(val, device=train_device).view(batch_size, self.seq_len, *val.shape[1:])
+
         return batch, indices
 
-    def __getitem__(self, index):
-        """Override to maintain proper batching"""
-        if isinstance(index, slice):
-            # Handle sequential sampling
-            return super().__getitem__(index)
-        elif isinstance(index, (list, np.ndarray)):
-            # Handle batch sampling
-            return super().__getitem__(index)
-        else:
-            raise TypeError("Index must be slice, list, or np.ndarray")
+    def sample_indices(self, batch_size):
+        valid_buffers = [i for i in range(self.buffer_num) if self.buffers[i]._reserved >= self.seq_len]
+        if not valid_buffers:
+            return np.array([])
+
+        total_sequences = sum((self.buffers[i]._reserved // self.seq_len) for i in valid_buffers)
+        batch_size = min(batch_size, total_sequences)
+        if batch_size <= 0:
+            return np.array([])
+
+        indices = []
+        for _ in range(batch_size):
+            buf_idx = np.random.choice(valid_buffers)
+            max_idx = (self.buffers[buf_idx]._reserved // self.seq_len) - 1
+            seq_idx = np.random.randint(0, max_idx + 1)
+            indices.append((buf_idx, seq_idx))
+        return np.array(indices)
+
+    def reset(self, keep_statistics=False):
+        for buf in self.buffers:
+            buf._index = 0
+            buf._reserved = 0
+            if not keep_statistics:
+                buf.data = {}
+                for key in ['obs', 'act', 'rew', 'done', 'terminated', 'truncated', 'obs_next']:
+                    shape = self._get_shape(key)
+                    buf.data[key] = np.empty((self._size, self.seq_len) + shape, dtype=np.float32)
+                for key in self._meta_keys:
+                    shape = self._get_shape(key)
+                    if shape:
+                        buf.data[key] = np.empty((self._size, self.seq_len) + shape, dtype=np.float32)
+                buf.data['info'] = [None] * self._size * self.seq_len
+            buf.max_size = self.seq_len * self._size
+            buf._meta = Batch()
