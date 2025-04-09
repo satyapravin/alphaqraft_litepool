@@ -310,6 +310,18 @@ class CustomSACPolicy(SACPolicy):
 
         # Update target networks
         self.sync_weight()
+        
+        mean_reward = batch.rew.mean().item()
+        # Print training statistics
+        print("\n=== Training Statistics ===")
+        print(f"1. Policy Loss: {actor_loss.item():.4f}")
+        print(f"2. Critic Loss: {critic_loss.item():.4f}")
+        print(f"3. Alpha Loss: {alpha_loss.item():.4f}")
+        print(f"4. PnL Loss: {pnl_loss.item():.4f}")
+        print(f"5. Total Loss: {total_loss.item():.4f}")
+        print(f"6. Alpha Value: {self.get_alpha.item():.4f}")
+        print(f"7. Mean Reward: {mean_reward:.4f}")
+        print("="*30 + "\n")
 
         return SACSummary(
             loss=total_loss.item(),
