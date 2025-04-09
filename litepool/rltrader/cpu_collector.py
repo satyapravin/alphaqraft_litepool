@@ -71,7 +71,6 @@ class CPUCollector(Collector):
                 obs, info = obs
             else:
                 info = None
-            print(f"Reset obs shape: {obs.shape}")  # Debug: [64, 2420]
             self.data.obs = obs if isinstance(obs, np.ndarray) else np.array(obs)
             self.data.info = info
             self.env_active = True
@@ -118,12 +117,9 @@ class CPUCollector(Collector):
                     act = np.array([action_space.sample() for _ in range(self.num_of_envs)])
                     result = Batch(act=torch.as_tensor(act, device=self.model_device))
                 else:
-                    print(f"Input state shape: {self.data.state.shape if self.data.state is not None else 'None'}")
-                    result = self.policy(obs_batch, state=self.data.state.transpose(0, 1) if self.data.state is not None else None)
-                    print(f"Policy result.state shape: {result.state.shape if result.state is not None else 'None'}")
+                    result = self.policy(obs_batch, state=self.data.state.transpose(0, 1).contiguous() if self.data.state is not None else None)
             self.data.act = result.act.cpu().numpy()
             self.data.state = result.state.transpose(0, 1).contiguous() if result.state is not None else None
-            print(f"self.data.state shape: {self.data.state.shape if self.data.state is not None else 'None'}")
 
             result = self.env.step(self.data.act)
             if len(result) == 5:
@@ -155,7 +151,7 @@ class CPUCollector(Collector):
                 terminated_seq[env_idx].append(self.data.terminated[env_idx])
                 truncated_seq[env_idx].append(self.data.truncated[env_idx])
                 obs_next_seq[env_idx].append(self.data.obs_next[env_idx])  # [2420]
-                state = (self.data.state[env_idx].cpu().numpy() if self.data.state is not None 
+                state = (self.data.state[:, env_idx, :].cpu().numpy() if self.data.state is not None 
                          else np.zeros((2, 128)))  # [2, 128]
                 state_seq[env_idx].append(state)
                 state_h1_seq[env_idx].append(self.state_h1[:, env_idx].cpu().numpy())  # [2, 128]
