@@ -28,6 +28,15 @@ class SequentialReplayBuffer(VectorReplayBuffer):
         return None
 
     def add(self, batch, buffer_ids=None):
+        """Adds batch data to all buffers and returns per-environment stats.
+
+        Args:
+            batch: Batch object containing vectorized data across environments
+            buffer_ids: Which buffers to update (default: all)
+
+        Returns:
+            List of tuples (index, episode_reward, episode_length, buffer_idx)
+        """
         if buffer_ids is None:
             buffer_ids = np.arange(self.buffer_num)
 
@@ -37,21 +46,40 @@ class SequentialReplayBuffer(VectorReplayBuffer):
             idx = buf._index % self._size
             steps = min(self.seq_len, buf.max_size - buf._reserved)
 
+            # Store vectorized data
             for key in ['obs', 'act', 'rew', 'done', 'terminated', 'truncated', 'obs_next']:
                 buf.data[key][idx, :steps] = batch[key][buf_idx][:steps]
+
+            # Store hidden states
             for key in self._meta_keys:
                 if key in batch and batch[key] is not None:
                     buf.data[key][idx, :steps] = batch[key][buf_idx][:steps]
-            buf.data['info'][idx * self.seq_len:(idx + 1) * self.seq_len] = batch['info'][buf_idx]
 
+            # Properly handle info dictionary
+            start_idx = idx * self.seq_len
+            end_idx = start_idx + self.seq_len
+            if isinstance(batch.info, dict):
+                # Store each info field separately
+                for k, v in batch.info.items():
+                    if k not in buf.data:
+                        buf.data[k] = [None] * (self._size * self.seq_len)
+                    buf.data[k][start_idx:end_idx] = v[buf_idx]
+            else:
+                # Fallback for non-dict info
+                buf.data['info'][start_idx:end_idx] = batch.info[buf_idx]
+
+            # Update pointers
             buf._index += 1
             buf._reserved = min(buf._reserved + steps, buf.max_size)
 
-            ep_rew = batch.rew[buf_idx].sum() if steps == self.seq_len else 0.0
-            ep_len = steps if steps == self.seq_len else 0
+            # Calculate episode stats
+            ep_rew = batch.rew[buf_idx].sum()
+            ep_len = steps
+
             ptrs.append((idx, ep_rew, ep_len, buf_idx))
 
         return ptrs
+
 
     def sample(self, batch_size, train_device='cuda'):
         indices = self.sample_indices(batch_size)

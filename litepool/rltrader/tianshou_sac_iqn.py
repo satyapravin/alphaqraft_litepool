@@ -25,7 +25,7 @@ env = litepool.make(
     num_threads=num_of_envs, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
     maker_fee=0.00001, taker_fee=0.0005, foldername="./train_files/",
-    balance=1.0, start=3601 * 20, max=3600 * 10
+    balance=1.0, start=3601 * 20, max=6400 * 10
 )
 
 env.spec.id = 'RlTrader-v0'

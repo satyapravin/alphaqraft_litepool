@@ -86,9 +86,13 @@ class CPUCollector(Collector):
         episode_rews = []
         episode_lens = []
         step_rews = []
-        episode_lens_dict = {i: 0 for i in range(self.num_of_envs)}
-        episode_rews_dict = {i: 0.0 for i in range(self.num_of_envs)}
+        
+        # Initialize per-environment tracking
+        env_episode_counts = np.zeros(self.num_of_envs, dtype=int)
+        env_reward_sums = np.zeros(self.num_of_envs)
+        env_length_sums = np.zeros(self.num_of_envs, dtype=int)
 
+        # Initialize sequence storage
         obs_seq = [[] for _ in range(self.num_of_envs)]
         act_seq = [[] for _ in range(self.num_of_envs)]
         rew_seq = [[] for _ in range(self.num_of_envs)]
@@ -99,29 +103,43 @@ class CPUCollector(Collector):
         state_seq = [[] for _ in range(self.num_of_envs)]
         state_h1_seq = [[] for _ in range(self.num_of_envs)]
         state_h2_seq = [[] for _ in range(self.num_of_envs)]
-        info_seq = [[] for _ in range(self.num_of_envs)]
+        
+        # Initialize info storage - handles both dict and array cases
+        if hasattr(self.data, 'info') and isinstance(self.data.info, dict):
+            info_dict_seq = {k: [[] for _ in range(self.num_of_envs)] for k in self.data.info.keys()}
+            info_is_dict = True
+        else:
+            info_seq = [[] for _ in range(self.num_of_envs)]
+            info_is_dict = False
 
         while True:
             if self.data.obs is None:
                 obs, info = self.reset_env(gym_reset_kwargs)
                 self.data.obs = obs
                 self.data.info = info
+                # Reinitialize info tracking after reset
+                if isinstance(info, dict):
+                    info_dict_seq = {k: [[] for _ in range(self.num_of_envs)] for k in info.keys()}
+                    info_is_dict = True
+                else:
+                    info_seq = [[] for _ in range(self.num_of_envs)]
+                    info_is_dict = False
 
-            obs_batch = Batch(obs=torch.as_tensor(self.data.obs, device=self.model_device))  # [64, 2420]
-            # Ensure state is [num_envs, num_layers, hidden_dim] for policy
-            if self.data.state is not None and self.data.state.shape[0] != self.num_of_envs:
-                self.data.state = self.data.state.transpose(0, 1).contiguous()  # Fix if needed
-
+            # Get actions
             with torch.no_grad():
                 if random:
-                    action_space = self.env.action_space
-                    act = np.array([action_space.sample() for _ in range(self.num_of_envs)])
+                    act = np.array([self.env.action_space.sample() for _ in range(self.num_of_envs)])
                     result = Batch(act=torch.as_tensor(act, device=self.model_device))
                 else:
-                    result = self.policy(obs_batch, state=self.data.state.transpose(0, 1).contiguous() if self.data.state is not None else None)
+                    result = self.policy(
+                        Batch(obs=torch.as_tensor(self.data.obs, device=self.model_device)),
+                        state=self.data.state.transpose(0, 1).contiguous() if self.data.state is not None else None
+                    )
+            
             self.data.act = result.act.cpu().numpy()
             self.data.state = result.state.transpose(0, 1).contiguous() if result.state is not None else None
 
+            # Environment step
             result = self.env.step(self.data.act)
             if len(result) == 5:
                 obs_next, rew, terminated, truncated, info = result
@@ -131,68 +149,82 @@ class CPUCollector(Collector):
                 terminated = done
                 truncated = np.zeros_like(done)
 
-            self.data.obs_next = obs_next if isinstance(obs_next, np.ndarray) else np.array(obs_next)
-            self.data.rew = rew if isinstance(rew, np.ndarray) else np.array(rew)
-            self.data.done = done
-            self.data.terminated = terminated
-            self.data.truncated = truncated
-            self.data.info = info
+            # Store data in sequences
+            for env_idx in range(self.num_of_envs):
+                obs_seq[env_idx].append(self.data.obs[env_idx])
+                act_seq[env_idx].append(self.data.act[env_idx])
+                rew_seq[env_idx].append(rew[env_idx])
+                done_seq[env_idx].append(done[env_idx])
+                terminated_seq[env_idx].append(terminated[env_idx])
+                truncated_seq[env_idx].append(truncated[env_idx])
+                obs_next_seq[env_idx].append(obs_next[env_idx])
+                state_seq[env_idx].append(
+                    self.data.state[:, env_idx, :].cpu().numpy() 
+                    if self.data.state is not None 
+                    else np.zeros((2, 128))
+                )
+                state_h1_seq[env_idx].append(self.state_h1[:, env_idx].cpu().numpy())
+                state_h2_seq[env_idx].append(self.state_h2[:, env_idx].cpu().numpy())
+                
+                # Handle info - supports both dict and array-style
+                if info_is_dict:
+                    for k, v in info.items():
+                        if isinstance(v, (np.ndarray, list)) and len(v) == self.num_of_envs:
+                            info_dict_seq[k][env_idx].append(v[env_idx])
+                        else:
+                            info_dict_seq[k][env_idx].append(v)  # Scalar or global value
+                else:
+                    if isinstance(info, (np.ndarray, list)) and len(info) == self.num_of_envs:
+                        info_seq[env_idx].append(info[env_idx])
+                    else:
+                        info_seq[env_idx].append(info)  # Scalar value
 
+                # Update per-env episode stats
+                if done[env_idx]:
+                    env_episode_counts[env_idx] += 1
+                    env_reward_sums[env_idx] += rew[env_idx]
+                    env_length_sums[env_idx] += 1
+
+            # Update hidden states
             self.state_h1, self.state_h2 = self.policy.update_hidden_states(
-                torch.as_tensor(self.data.obs_next, device=self.model_device),
+                torch.as_tensor(obs_next, device=self.model_device),
                 torch.as_tensor(self.data.act, device=self.model_device),
                 self.state_h1, self.state_h2
             )
 
-            for env_idx in range(self.num_of_envs):
-                obs_seq[env_idx].append(self.data.obs[env_idx])  # [2420]
-                act_seq[env_idx].append(self.data.act[env_idx])  # [3]
-                rew_seq[env_idx].append(self.data.rew[env_idx])  # scalar
-                done_seq[env_idx].append(self.data.done[env_idx])  # scalar
-                terminated_seq[env_idx].append(self.data.terminated[env_idx])
-                truncated_seq[env_idx].append(self.data.truncated[env_idx])
-                obs_next_seq[env_idx].append(self.data.obs_next[env_idx])  # [2420]
-                state = (self.data.state[:, env_idx, :].cpu().numpy() if self.data.state is not None 
-                         else np.zeros((2, 128)))  # [2, 128]
-                state_seq[env_idx].append(state)
-                state_h1_seq[env_idx].append(self.state_h1[:, env_idx].cpu().numpy())  # [2, 128]
-                state_h2_seq[env_idx].append(self.state_h2[:, env_idx].cpu().numpy())  # [2, 128]
-                info_seq[env_idx].append(self.data.info[env_idx]) 
             step_rews.extend(rew)
             local_step_count += 1
             self.continuous_step_count += 1
 
-            for idx in range(self.num_of_envs):
-                episode_lens_dict[idx] += 1
-                episode_rews_dict[idx] += rew[idx]
-                env_reset = done[idx] or (isinstance(info, dict) and 'reset' in info and info['reset'][idx])
-
-                if env_reset:
-                    episode_lens.append(episode_lens_dict[idx])
-                    episode_rews.append(episode_rews_dict[idx])
-                    episode_count += 1
-                    episode_lens_dict[idx] = 0
-                    episode_rews_dict[idx] = 0.0
-                    single_obs, _ = self.env.reset()
-                    self.data.obs_next[idx] = single_obs[0] if isinstance(single_obs, tuple) else single_obs
-
+            # When sequence is complete
             if local_step_count >= self.seq_len:
+                # Prepare batch with proper info handling
+                batch_info = info_dict_seq if info_is_dict else np.array(info_seq)
+                
                 batch = Batch(
-                    obs=np.array(obs_seq),           # [64, 300, 2420]
-                    act=np.array(act_seq),           # [64, 300, 3]
-                    rew=np.array(rew_seq),           # [64, 300]
-                    done=np.array(done_seq),         # [64, 300]
+                    obs=np.array(obs_seq),
+                    act=np.array(act_seq),
+                    rew=np.array(rew_seq),
+                    done=np.array(done_seq),
                     terminated=np.array(terminated_seq),
                     truncated=np.array(truncated_seq),
-                    obs_next=np.array(obs_next_seq), # [64, 300, 2420]
-                    state=np.array(state_seq),       # [64, 300, 2, 128]
-                    state_h1=np.array(state_h1_seq), # [64, 300, 2, 128]
-                    state_h2=np.array(state_h2_seq), # [64, 300, 2, 128]
-                    info=np.array(info_seq)
+                    obs_next=np.array(obs_next_seq),
+                    state=np.array(state_seq),
+                    state_h1=np.array(state_h1_seq),
+                    state_h2=np.array(state_h2_seq),
+                    info=batch_info
                 )
 
-                print(self.buffer.add(batch))
-                ptr, ep_rew, ep_len, ep_idx = self.buffer.add(batch)
+                # Add to all buffers (64) and get per-env stats
+                buffer_results = self.buffer.add(batch)
+                
+                # Calculate statistics
+                total_ep_rew = sum(r[1] for r in buffer_results)
+                total_ep_len = sum(r[2] for r in buffer_results)
+                avg_ep_rew = total_ep_rew / len(buffer_results) if buffer_results else 0
+                avg_ep_len = total_ep_len / len(buffer_results) if buffer_results else 0
+                
+                # Reset sequence buffers
                 obs_seq = [[] for _ in range(self.num_of_envs)]
                 act_seq = [[] for _ in range(self.num_of_envs)]
                 rew_seq = [[] for _ in range(self.num_of_envs)]
@@ -203,54 +235,45 @@ class CPUCollector(Collector):
                 state_seq = [[] for _ in range(self.num_of_envs)]
                 state_h1_seq = [[] for _ in range(self.num_of_envs)]
                 state_h2_seq = [[] for _ in range(self.num_of_envs)]
-                info_seq = [[] for _ in range(self.num_of_envs)]
+                
+                if info_is_dict:
+                    info_dict_seq = {k: [[] for _ in range(self.num_of_envs)] for k in info_dict_seq.keys()}
+                else:
+                    info_seq = [[] for _ in range(self.num_of_envs)]
 
+            # Termination conditions
             if n_episode and episode_count >= n_episode:
                 break
             if n_step and local_step_count >= n_step:
                 break
 
-            self.data.obs = self.data.obs_next
+            self.data.obs = obs_next
 
+        # Final statistics
         collect_time = time.time() - start_time
-        rews = np.array(episode_rews) if episode_count > 0 else np.array([])
-        lens = np.array(episode_lens) if episode_count > 0 else np.array([])
-        step_rews = np.array(step_rews) if local_step_count > 0 else np.array([])
-
-        if episode_count > 0:
-            mean_rew = rews.mean()
-            mean_len = lens.mean()
-            std_rew = rews.std()
-            std_len = lens.std()
-            reward_sum = rews.sum()
-            length_sum = lens.sum()
-        else:
-            mean_rew = mean_len = std_rew = std_len = reward_sum = length_sum = 0.0
-
-        step_time = collect_time / local_step_count if local_step_count > 0 else 0.0
-
+        
         return CollectStats(
             n_ep=episode_count,
             n_st=local_step_count,
-            rews=step_rews,
-            lens=lens,
-            rew=mean_rew,
-            len=mean_len,
-            rew_std=std_rew,
-            len_std=std_len,
+            rews=np.array(step_rews),
+            lens=np.array(episode_lens),
+            rew=avg_ep_rew,
+            len=avg_ep_len,
+            rew_std=np.std([r[1] for r in buffer_results]) if buffer_results else 0.0,
+            len_std=np.std([r[2] for r in buffer_results]) if buffer_results else 0.0,
             n_collected_steps=local_step_count,
             n_collected_episodes=episode_count,
             returns_stat=None,
             lens_stat=None,
             rewards_stat=None,
             episodes=episode_count,
-            reward_sum=reward_sum,
-            length_sum=int(length_sum),
+            reward_sum=total_ep_rew,
+            length_sum=int(total_ep_len),
             collect_time=collect_time,
-            step_time=step_time,
-            returns=rews,
-            lengths=lens,
-            continuous_step=self.continuous_step_count
+            step_time=collect_time / local_step_count if local_step_count > 0 else 0.0,
+            returns=np.array(episode_rews),
+            lengths=np.array(episode_lens),
+            continuous_step=self.continuous_step_count,
         )
 
     def collect(self, n_step=None, n_episode=None, random=False, render=None, no_grad=True, gym_reset_kwargs=None):
