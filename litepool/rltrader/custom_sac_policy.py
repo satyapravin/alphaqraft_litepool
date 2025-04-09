@@ -332,6 +332,15 @@ class CustomSACPolicy(SACPolicy):
         self.sync_weight()
 
 
+        # Calculate average losses
+        total_samples = batch_size * n_step
+        avg_actor_loss = total_actor_loss / total_samples
+        avg_critic_loss = total_critic_loss / total_samples
+        avg_alpha_loss = total_alpha_loss / total_samples
+        avg_pnl_loss = total_pnl_loss / total_samples
+        avg_total_loss = avg_actor_loss + avg_critic_loss + 0.1 * avg_pnl_loss
+        mean_reward = batch.rew.mean().item()
+
 
         # Print training statistics
         print("\n=== Training Statistics ===")
