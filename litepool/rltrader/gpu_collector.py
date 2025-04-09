@@ -219,20 +219,19 @@ class GPUCollector(Collector):
                                           'reset' in info and
                                           info['reset'][idx])
 
-                if env_reset:
-                    episode_lens.append(episode_lens_dict[idx])
-                    episode_rews.append(episode_rews_dict[idx])
-                    episode_count += 1
+            if env_reset:
+                episode_lens.append(episode_lens_dict[idx])
+                episode_rews.append(episode_rews_dict[idx])
+                episode_count += 1
 
-                    episode_lens_dict[idx] = 0
-                    episode_rews_dict[idx] = 0.0
+                episode_lens_dict[idx] = 0
+                episode_rews_dict[idx] = 0.0
 
-                    reset_indices = np.array([idx], dtype=np.int64)
-                    single_obs, _ = self.env.reset(indices=reset_indices)
-                    if isinstance(self.data.obs_next, torch.Tensor):
-                        self.data.obs_next[idx] = torch.as_tensor(single_obs[0], device=self.device)
-                    else:
-                        self.data.obs_next[idx] = single_obs[0]
+                single_obs, _ = self.env.reset()
+                if isinstance(self.data.obs_next, torch.Tensor):
+                    self.data.obs_next[idx] = torch.as_tensor(single_obs[0], device=self.device)
+                else:
+                    self.data.obs_next[idx] = single_obs[0]
 
             if n_episode and episode_count >= n_episode:
                 break

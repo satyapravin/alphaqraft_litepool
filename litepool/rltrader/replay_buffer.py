@@ -17,8 +17,8 @@ class SequentialReplayBuffer(VectorReplayBuffer):
         self.env_segment_size = total_size // buffer_num
         
     def sample(self, batch_size):
-        """Sample batch_size sequences of seq_len consecutive steps"""
-        # Calculate valid start indices for each environment
+        """Sample batch_size sequences of seq_len consecutive steps from random buffers"""
+        # Calculate valid start indices
         valid_starts = self.env_segment_size - self.seq_len
         if valid_starts <= 0:
             raise ValueError(
@@ -26,9 +26,12 @@ class SequentialReplayBuffer(VectorReplayBuffer):
                 f"but only {self.env_segment_size} available per env)"
             )
         
-        # Sample one sequence per environment
+        # Randomly select which buffers to sample from
+        env_indices = np.random.randint(0, self.buffer_num, size=batch_size)
         indices = []
-        for env_idx in range(self.buffer_num):
+        
+        for env_idx in env_indices:
+            # Sample random start position within this buffer's segment
             start = env_idx * self.env_segment_size + np.random.randint(0, valid_starts)
             indices.extend(range(start, start + self.seq_len))
         
@@ -41,18 +44,16 @@ class SequentialReplayBuffer(VectorReplayBuffer):
             if isinstance(val, np.ndarray):
                 setattr(batch, key, torch.as_tensor(val, device=self.device))
         
-        # Reshape observations: [batch_size*seq_len, ...] -> [batch_size, seq_len, ...]
-        batch_size = self.buffer_num
+        # Reshape all components to [batch_size, seq_len, ...]
+        batch_size = len(env_indices)
         for key in ['obs', 'act', 'rew', 'done', 'obs_next']:
             val = getattr(batch, key)
             if val is not None:
-                setattr(batch, key, val.view(batch_size, self.seq_len, *val.shape[1:]))
-        
-        # Special handling for 2420-dim observations
-        if batch.obs.dim() == 3:  # [batch, seq_len, 2420]
-            batch.obs = batch.obs.view(batch_size, self.seq_len, 10, 242)
-        if batch.obs_next.dim() == 3:
-            batch.obs_next = batch.obs_next.view(batch_size, self.seq_len, 10, 242)
+                # For rewards and done flags, we add a dimension
+                if key in ['rew', 'done'] and val.dim() == 1:
+                    setattr(batch, key, val.view(batch_size, self.seq_len, 1))
+                else:
+                    setattr(batch, key, val.view(batch_size, self.seq_len, *val.shape[1:]))
         
         return batch, indices
 

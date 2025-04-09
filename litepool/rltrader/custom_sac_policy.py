@@ -37,25 +37,29 @@ def quantile_huber_loss(prediction, target, taus_predicted, taus_target, kappa=1
     quantile_loss = weight * huber
     return quantile_loss.mean()
 
-def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, n_step=60, num_quantiles=32, chunk_size=8):
+def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, n_step=300, num_quantiles=32, chunk_size=8):
     batch_size = len(batch)
-    assert batch.rew.shape == (batch_size, n_step), "Rewards shape mismatch"
-    assert batch.done.shape == (batch_size, n_step), "Dones shape mismatch"
-    assert batch.obs_next.dim() == 4, "obs_next should be 4D [B,T,stack,obs_dim]"
+    rewards = batch.rew.squeeze(-1)
+    dones = batch.done.squeeze(-1)
+
+    print(rewards.shape, dones.shape)
+    assert rewards.shape == (batch_size, n_step), "Rewards shape mismatch"
+    assert dones.shape == (batch_size, n_step), "Dones shape mismatch"
+    assert batch.obs_next.dim() == 3, "obs_next should be 4D [B, seq_len, obs_dim]"
 
     # 1. Compute cumulative rewards
     cumulative_rewards = torch.zeros(batch_size, n_step, device=device)
     discount_factors = gamma ** torch.arange(n_step, device=device)
     for t in range(n_step):
-        mask = 1 - batch.done[:, :t+1].any(dim=1).float()
-        cumulative_rewards[:, t] = mask * (batch.rew[:, t:] * discount_factors[:n_step-t]).sum(dim=1)
+        mask = 1 - dones[:, :t+1].any(dim=1).float()
+        cumulative_rewards[:, t] = mask * (rewards[:, t:] * discount_factors[:n_step-t]).sum(dim=1)
 
     # 2. Compute target Q-values in chunks
     target_q = torch.zeros(batch_size, n_step, num_quantiles, device=device)
 
     for b_start in range(0, batch_size, chunk_size):
         b_end = min(b_start + chunk_size, batch_size)
-        chunk_obs = batch.obs_next[b_start:b_end, :, -1, :]  # [8, 60, 2420]
+        chunk_obs = batch.obs_next[b_start:b_end, :, :]  # [8, 60, 2420]
 
         with torch.no_grad():
             for t in range(n_step):
@@ -197,7 +201,7 @@ class CustomSACPolicy(SACPolicy):
     def _compute_nstep_return(self, batch: Batch, buffer, indices: np.ndarray) -> Batch:
         target_q = compute_n_step_return(
             batch, self.gamma, self.critic1_target, self.critic2_target,
-            self.actor, self.get_alpha.detach(), self.device, n_step=60,
+            self.actor, self.get_alpha.detach(), self.device, n_step=300,
             num_quantiles=32
         )
         batch.q_target = target_q
