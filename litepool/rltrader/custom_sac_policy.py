@@ -40,40 +40,35 @@ def quantile_huber_loss(prediction, target, taus_predicted, taus_target, kappa=1
 
 def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, n_step=60, num_quantiles=32, chunk_size=16):
     batch_size = len(batch)
-    rewards = batch.rew.squeeze(-1)  # [batch_size, n_step]
-    dones = batch.done.squeeze(-1)   # [batch_size, n_step]
+    rewards = batch.rew.squeeze(-1)
+    dones = batch.done.squeeze(-1)
     
-    # Get hidden states from batch if available
     actor_state = batch.get('actor_state', None)
     critic1_state = batch.get('critic1_state', None)
     critic2_state = batch.get('critic2_state', None)
     
-    # 1. Compute cumulative rewards (vectorized)
-    discount_factors = gamma ** torch.arange(n_step, device=device)  # [n_step]
-    mask = 1 - dones.cumsum(dim=1).clamp(0, 1).float()  # [batch_size, n_step]
-    cumulative_rewards = (rewards * discount_factors.unsqueeze(0) * mask).sum(dim=1)  # [batch_size]
-
-    # 2. Compute target Q-values in parallel
+    discount_factors = gamma ** torch.arange(n_step, device=device)
+    mask = 1 - dones.cumsum(dim=1).clamp(0, 1).float()
+    cumulative_rewards = (rewards * discount_factors.unsqueeze(0) * mask).sum(dim=1)
+    
     with torch.no_grad():
-        # Process all time steps in parallel
-        obs_next = batch.obs_next  # [batch_size, n_step, obs_dim]
-        
-        # Reshape for parallel processing
+        obs_next = batch.obs_next
         flat_obs = obs_next.reshape(batch_size * n_step, -1)
         
-        # Get actions and log probs for all steps
         if actor_state is not None:
             actor_state = actor_state.transpose(0, 1).reshape(actor.num_layers, -1, actor.gru_hidden_dim).contiguous()
         loc, scale, _, _ = actor(flat_obs, state=actor_state)
+        scale = scale.clamp(min=1e-3)
         dist = Independent(Normal(loc, scale), 1)
-        actions = torch.tanh(dist.rsample())
-        log_prob = dist.log_prob(actions)
+        raw_actions = dist.rsample()
+        actions = torch.tanh(raw_actions)
+        raw_log_prob = dist.log_prob(raw_actions)
+        correction = torch.log(1 - actions.pow(2) + 1e-6).sum(dim=-1)
+        log_prob = raw_log_prob - correction
         
-        # Reshape actions and log probs back to [batch_size, n_step, ...]
         actions = actions.reshape(batch_size, n_step, -1)
         log_prob = log_prob.reshape(batch_size, n_step)
         
-        # Compute Q-values for all steps
         flat_actions = actions.reshape(batch_size * n_step, -1)
         taus = torch.rand(batch_size * n_step, num_quantiles, device=device)
         
@@ -86,13 +81,21 @@ def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, 
         q2, _ = critic2(flat_obs, flat_actions, taus, state_h=critic2_state)
         q = torch.min(q1, q2).reshape(batch_size, n_step, num_quantiles)
         
-        # Compute target Q values
         target_q = q - alpha * log_prob.unsqueeze(-1)
-
-    # 3. Compute final targets
+    
     not_done = 1 - dones.any(dim=1).float().view(batch_size, 1, 1)
     final_targets = cumulative_rewards.unsqueeze(1).unsqueeze(2) + not_done * (gamma ** n_step) * target_q
-
+    
+    print("\n=== compute_n_step_return Debug ===")
+    print(f"Actor Loc Mean: {loc.mean().item():.4f}, Min: {loc.min().item():.4f}, Max: {loc.max().item():.4f}")
+    print(f"Actor Scale Mean: {scale.mean().item():.4f}, Min: {scale.min().item():.4f}, Max: {scale.max().item():.4f}")
+    print(f"Raw Log Prob Mean: {raw_log_prob.mean().item():.4f}, Min: {raw_log_prob.min().item():.4f}, Max: {raw_log_prob.max().item():.4f}")
+    print(f"Correction Mean: {correction.mean().item():.4f}, Min: {correction.min().item():.4f}, Max: {correction.max().item():.4f}")
+    print(f"Log Prob Mean: {log_prob.mean().item():.4f}, Min: {log_prob.min().item():.4f}, Max: {log_prob.max().item():.4f}")
+    print(f"Target Q Mean: {target_q.mean().item():.4f}, Min: {target_q.min().item():.4f}, Max: {target_q.max().item():.4f}")
+    print(f"Final Targets Mean: {final_targets.mean().item():.4f}, Min: {final_targets.min().item():.4f}, Max: {final_targets.max().item():.4f}")
+    print("="*35 + "\n")
+    
     return final_targets.reshape(batch_size * n_step, num_quantiles)
 
 @dataclass
@@ -112,15 +115,6 @@ class SACSummary:
             "loss_alpha": self.loss_alpha,
             "alpha": self.alpha
         }
-
-def validate_tensor(name, tensor):
-    if torch.isnan(tensor).any():
-        print(f"NaN detected in {name}!")
-        return tensor.nan_to_num(0.0)
-    if torch.isinf(tensor).any():
-        print(f"Inf detected in {name}!")
-        return tensor.clamp(-1e8, 1e8)
-    return tensor
 
 
 class CustomSACPolicy(SACPolicy):
@@ -236,10 +230,9 @@ class CustomSACPolicy(SACPolicy):
         flat_act = batch.act.view(batch_size * n_step, -1)
         flat_target = batch.q_target
 
+         
         # Actor forward pass with stabilization
         loc, scale, new_actor_state, predicted_pnl = self.actor(flat_obs, state=actor_state)
-        loc = validate_tensor("loc", loc)
-        scale = validate_tensor("scale", scale).clamp(min=1e-1)
 
         dist = Independent(Normal(loc, scale), 1)
         actions = torch.tanh(dist.rsample()).clamp(-0.999, 0.999)
@@ -250,20 +243,19 @@ class CustomSACPolicy(SACPolicy):
         taus = torch.rand(batch_size * n_step, self.num_quantiles, device=self.device)
         current_q1, new_critic1_state = self.critic1(flat_obs, flat_act, taus, state_h=critic1_state)
         current_q2, new_critic2_state = self.critic2(flat_obs, flat_act, taus, state_h=critic2_state)
-        current_q1 = validate_tensor("current_q1", current_q1).clamp(-1e3, 1e3) / 10.0
-        current_q2 = validate_tensor("current_q2", current_q2).clamp(-1e3, 1e3) / 10.0
 
-        # Actor Q-values with median instead of mean
-        with torch.no_grad():
-            single_tau = torch.rand(batch_size * n_step, 1, device=self.device)
-        new_q1, _ = self.critic1(flat_obs, actions, single_tau, state_h=critic1_state)
-        new_q2, _ = self.critic2(flat_obs, actions, single_tau, state_h=critic2_state)
-        new_q1 = validate_tensor("new_q1", new_q1).clamp(-1e3, 1e3) / 10.0
-        new_q2 = validate_tensor("new_q2", new_q2).clamp(-1e3, 1e3) / 10.0
-        # Use median instead of mean across quantiles
-        new_q1_median = torch.median(new_q1, dim=1).values  # Median over quantiles
-        new_q2_median = torch.median(new_q2, dim=1).values  # Median over quantiles
-        new_q = torch.min(new_q1_median, new_q2_median)  # Minimum of medians
+        print("\n=== Q-Value Statistics ===")
+        print(f"Q1 Mean: {current_q1.mean().item():.4f}, Min: {current_q1.min().item():.4f}, Max: {current_q1.max().item():.4f}")
+        print(f"Q2 Mean: {current_q2.mean().item():.4f}, Min: {current_q2.min().item():.4f}, Max: {current_q2.max().item():.4f}")
+        print(f"Target (q_target) Mean: {batch.q_target.mean().item():.4f}, Min: {batch.q_target.min().item():.4f}, Max: {batch.q_target.max().item():.4f}")
+        print("="*30 + "\n")
+
+        # Actor Q-values with multiple quantiles (improved over single tau)
+        taus_actor = torch.rand(batch_size * n_step, self.num_quantiles, device=self.device)
+        new_q1, _ = self.critic1(flat_obs, actions, taus_actor, state_h=critic1_state)
+        new_q2, _ = self.critic2(flat_obs, actions, taus_actor, state_h=critic2_state)
+        new_q_dist = torch.min(new_q1, new_q2)  # [batch_size * n_step, num_quantiles]
+        new_q = new_q_dist.mean(dim=1)  # Average over quantiles for stability
 
         # Stabilized losses
         alpha_loss = -(self.log_alpha.clamp(-10, 10) * (log_prob.detach() + self.target_entropy)).mean()
@@ -274,14 +266,8 @@ class CustomSACPolicy(SACPolicy):
         # PnL loss with stabilization
         pnl_target = batch.rew.view(batch_size, n_step).sum(dim=1)
         pnl_target = pnl_target.unsqueeze(1).expand(-1, n_step).reshape(-1)
-        pnl_loss = F.mse_loss(validate_tensor("predicted_pnl", predicted_pnl.squeeze(-1)),
-                             validate_tensor("pnl_target", pnl_target))
+        pnl_loss = F.mse_loss(predicted_pnl.squeeze(-1), pnl_target)
 
-        # Validate and clip losses
-        actor_loss = validate_tensor("actor_loss", actor_loss).clamp(-1e4, 1e4)
-        critic_loss = validate_tensor("critic_loss", critic_loss).clamp(-1e4, 1e4)
-        alpha_loss = validate_tensor("alpha_loss", alpha_loss).clamp(-1e4, 1e4)
-        pnl_loss = validate_tensor("pnl_loss", pnl_loss).clamp(-1e4, 1e4)
 
         total_loss = actor_loss + critic_loss + 0.1 * pnl_loss
 
@@ -292,14 +278,6 @@ class CustomSACPolicy(SACPolicy):
         self.alpha_optim.zero_grad()
 
         total_loss.backward()
-
-        # Gradient safety
-        for param in self.actor.parameters():
-            if param.grad is not None:
-                param.grad = validate_tensor("actor_grad", param.grad).clamp(-0.1, 0.1)
-        for param in chain(self.critic1.parameters(), self.critic2.parameters()):
-            if param.grad is not None:
-                param.grad = validate_tensor("critic_grad", param.grad).clamp(-0.1, 0.1)
 
         self.critic1_optim.step()
         self.critic2_optim.step()
