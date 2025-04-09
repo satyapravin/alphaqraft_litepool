@@ -191,7 +191,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
 
     if (pnls.size() >= 1) {
         previous_reward = pnls.front();
-	if (pnls.size() >= 90) pnls.pop_front();
+	pnls.pop_front();
     }
 
     pnls.push_back(current_reward);

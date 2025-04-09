@@ -28,7 +28,6 @@ class SequentialReplayBuffer(VectorReplayBuffer):
         return None
 
     def add(self, batch, buffer_ids=None):
-        print("replaybuffer add called")
         if buffer_ids is None:
             buffer_ids = np.arange(self.buffer_num)
 
