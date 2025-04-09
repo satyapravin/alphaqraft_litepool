@@ -245,6 +245,9 @@ class CustomSACPolicy(SACPolicy):
             chunk_act = flat_act[start_idx:end_idx]
             chunk_target = flat_target[start_idx:end_idx]  # [chunk_size, 32]
 
+            taus = torch.rand(end_idx - start_idx, num_quantiles, device=self.device)
+            single_tau = torch.rand(end_idx - start_idx, 1, device=self.device)
+
             with autocast(device_type='cuda'):
                 # Actor forward pass
                 loc, scale, _, predicted_pnl = self.actor(chunk_obs)
@@ -252,17 +255,15 @@ class CustomSACPolicy(SACPolicy):
                 actions = torch.tanh(dist.rsample())
                 log_prob = dist.log_prob(actions) - torch.log(1 - actions.pow(2) + 1e-6).sum(dim=-1)
 
-                # Critic forward passes - use full num_quantiles
-                taus = torch.rand(end_idx - start_idx, num_quantiles, device=self.device)
-
                 # Current Q estimates
                 current_q1, _ = self.critic1(chunk_obs, chunk_act, taus)
                 current_q2, _ = self.critic2(chunk_obs, chunk_act, taus)
 
                 # New Q estimates for actor loss (use single tau)
-                single_tau = torch.rand(end_idx - start_idx, 1, device=self.device)
                 new_q1, _ = self.critic1(chunk_obs, actions, single_tau)
                 new_q2, _ = self.critic2(chunk_obs, actions, single_tau)
+                new_q1 = new_q1.mean(dim=1, keepdim=True)  # Average over quantiles
+                new_q2 = new_q2.mean(dim=1, keepdim=True)
                 new_q = torch.min(new_q1, new_q2)
 
             # Loss calculations for this chunk
@@ -277,8 +278,7 @@ class CustomSACPolicy(SACPolicy):
                                   taus, kappa=5.0)
             )
 
-
-            actor_loss = (self.get_alpha.detach() * log_prob - new_q).mean()
+            actor_loss = (self.get_alpha.detach() * log_prob - new_q.mean(dim=1)).mean()
 
             # PnL prediction loss (auxiliary task)
             pnl_target = batch.rew.view(batch_size, n_step).sum(dim=1)  # [batch_size]
