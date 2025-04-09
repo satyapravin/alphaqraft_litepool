@@ -183,6 +183,9 @@ class CustomSACPolicy(SACPolicy):
         return new_state_h1, new_state_h2
 
     def process_fn(self, batch: Batch, buffer, indices: np.ndarray) -> Batch:
+        if not batch:
+            return batch
+
         for key in ['obs', 'act', 'rew', 'done', 'obs_next']:
             val = getattr(batch, key)
             if isinstance(val, np.ndarray):
@@ -204,6 +207,7 @@ class CustomSACPolicy(SACPolicy):
 
 
     def learn(self, batch: Batch, state_h1=None, state_h2=None, **kwargs):
+        print(batch)
         start_time = time.time()
         batch_size = batch.obs.shape[0]
         n_step = batch.obs.shape[1]  # Should be 60 (stack_num)

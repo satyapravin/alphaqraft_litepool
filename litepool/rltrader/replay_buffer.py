@@ -29,6 +29,7 @@ class SequentialReplayBuffer(VectorReplayBuffer):
 
     def add(self, batch, buffer_ids=None):
         """Adds batch data to all buffers and returns per-environment stats."""
+        print("replaybuffer add called")
         if buffer_ids is None:
             buffer_ids = np.arange(self.buffer_num)
 
@@ -133,7 +134,7 @@ class SequentialReplayBuffer(VectorReplayBuffer):
         return batch, indices
 
     def sample_indices(self, batch_size):
-        valid_buffers = [i for i in range(self.buffer_num) if self.buffers[buf_idx]._reserved >= self.seq_len]
+        valid_buffers = [i for i in range(self.buffer_num) if self.buffers[i]._reserved >= self.seq_len]
         if not valid_buffers:
             return np.array([])
 
