@@ -151,7 +151,7 @@ if final_buffer_path.exists():
     else:
         buffer_config = {
             'buffer_num': num_of_envs * 6000,  # Total buffer size
-            'seq_len': 300,              # Sequence length
+            'seq_len': 60,              # Sequence length
             'num_envs': num_of_envs,     # Number of environments
             'device': str(device)        # Device as string for serialization
         }
@@ -183,7 +183,7 @@ else:
     print(f"No buffer found at {final_buffer_path}, creating new sequential buffer")
     buffer = SequentialReplayBuffer(
         total_size=num_of_envs * 6000,  # Total buffer size (e.g., 64 envs × 6000 steps)
-        seq_len=300,                   # Length of sequences to sample
+        seq_len=60,                   # Length of sequences to sample
         buffer_num=num_of_envs,        # Match your environment count
         device="cpu"
     )
@@ -195,7 +195,7 @@ collector = CPUCollector(
     policy=policy,
     env=env,
     buffer=buffer,
-    seq_len=300,
+    seq_len=60,
     device='cpu',
     print_interval=1000
 )
@@ -206,8 +206,8 @@ trainer = OffpolicyTrainer(
     train_collector=collector,
     test_collector=None,
     max_epoch=10,
-    step_per_epoch=2,
-    step_per_collect=300,
+    step_per_epoch=20,
+    step_per_collect=600,
     episode_per_test=0,
     batch_size=64,
     update_per_step=1,
@@ -239,7 +239,7 @@ torch.save({
     'buffer_type': 'StackedVectorReplayBuffer',
     'total_size': num_of_envs * 900,
     'buffer_num': num_of_envs,
-    'seq_len': 300,
+    'seq_len': 60,
     'device': 'cpu'
 }, metadata_path)
 

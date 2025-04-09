@@ -32,7 +32,7 @@ class CollectStats:
     info: object
 
 class CPUCollector(Collector):
-    def __init__(self, policy, env, num_of_envs, print_interval=1000, buffer=None, device='cpu', seq_len=300, **kwargs):
+    def __init__(self, policy, env, num_of_envs, print_interval=1000, buffer=None, device='cpu', seq_len=60, **kwargs):
         super().__init__(policy, env, buffer, **kwargs)
         self.device = device
         self.model_device = 'cuda'

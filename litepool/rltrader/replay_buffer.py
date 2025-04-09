@@ -3,7 +3,7 @@ import torch
 from tianshou.data import VectorReplayBuffer, Batch, ReplayBuffer
 
 class SequentialReplayBuffer(VectorReplayBuffer):
-    def __init__(self, total_size, seq_len=300, buffer_num=1, device='cpu'):
+    def __init__(self, total_size, seq_len=60, buffer_num=1, device='cpu'):
         assert total_size % seq_len == 0, "total_size must be divisible by seq_len"
         self.seq_len = seq_len
         buffer_size = total_size // buffer_num
@@ -16,15 +16,15 @@ class SequentialReplayBuffer(VectorReplayBuffer):
     def _get_shape(self, key):
         """Adjust shapes for 2-layer GRU."""
         if key == 'obs' or key == 'obs_next':
-            return (2420,)  # [size, 300, 2420]
+            return (2420,)  # [size, 60, 2420]
         elif key == 'act':
-            return (3,)     # [size, 300, 3]
+            return (3,)     # [size, 60, 3]
         elif key in ['rew', 'done', 'terminated', 'truncated']:
             return ()
         elif key == 'state':
-            return (2, 128)  # [size, 300, 2, 128] for full GRU state
+            return (2, 128)  # [size, 60, 2, 128] for full GRU state
         elif key == 'state_h1' or key == 'state_h2':
-            return (2, 128)  # [size, 300, 2, 128]
+            return (2, 128)  # [size, 60, 2, 128]
         return None
 
     def add(self, batch, buffer_ids=None):

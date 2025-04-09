@@ -36,7 +36,7 @@ def quantile_huber_loss(prediction, target, taus_predicted, taus_target, kappa=1
     quantile_loss = weight * huber
     return quantile_loss.mean()
 
-def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, n_step=300, num_quantiles=32, chunk_size=16):
+def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, n_step=60, num_quantiles=32, chunk_size=16):
     batch_size = len(batch)
     rewards = batch.rew.squeeze(-1)  # [batch_size, n_step]
     dones = batch.done.squeeze(-1)   # [batch_size, n_step]
@@ -206,7 +206,7 @@ class CustomSACPolicy(SACPolicy):
     def _compute_nstep_return(self, batch: Batch, buffer, indices: np.ndarray) -> Batch:
         target_q = compute_n_step_return(
             batch, self.gamma, self.critic1_target, self.critic2_target,
-            self.actor, self.get_alpha.detach(), self.device, n_step=300,
+            self.actor, self.get_alpha.detach(), self.device, n_step=60,
             num_quantiles=32, chunk_size=self.chunk_size
         )
         batch.q_target = target_q
