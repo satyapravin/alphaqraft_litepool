@@ -239,7 +239,7 @@ class CustomSACPolicy(SACPolicy):
                 log_prob = dist.log_prob(actions) - torch.log(1 - actions.pow(2) + 1e-6).sum(dim=-1)
 
                 # Critic forward passes
-                obs_expanded = chunk_obs.expand(-1, num_quantiles, -1).reshape(-1, 242)
+                obs_expanded = chunk_obs.unsqueeze(1).expand(-1, num_quantiles, -1).reshape(-1, 2420)
                 act_expanded = actions.unsqueeze(1).expand(-1, num_quantiles, -1).reshape(-1, actions.shape[-1])
 
                 # Current Q estimates
@@ -249,8 +249,8 @@ class CustomSACPolicy(SACPolicy):
                 current_q2 = current_q2.view(-1, num_quantiles)
 
                 # New Q estimates for actor loss
-                new_q1, _ = self.critic1(chunk_obs[:, -1, :], actions)
-                new_q2, _ = self.critic2(chunk_obs[:, -1, :], actions)
+                new_q1, _ = self.critic1(chunk_obs, actions)
+                new_q2, _ = self.critic2(chunk_obs, actions)
                 new_q = torch.min(new_q1, new_q2)
 
             # Loss calculations
