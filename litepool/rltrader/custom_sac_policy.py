@@ -221,30 +221,30 @@ class CustomSACPolicy(SACPolicy):
         start_time = time.time()
         batch_size = batch.obs.shape[0]
         n_step = batch.obs.shape[1]  # Should be 60 (stack_num)
-        num_quantiles = 32
+        num_quantiles = self.num_quantiles  # Use the policy's num_quantiles (32)
 
         # Reshape batch for processing
         flat_obs = batch.obs.view(batch_size * n_step, -1)  # [B*N, obs_dim]
         flat_act = batch.act.view(batch_size * n_step, -1)  # [B*N, action_dim]
         flat_target = batch.q_target  # [B*N, num_quantiles]
-        
+
         # Initialize losses
         total_actor_loss = 0.0
         total_critic_loss = 0.0
         total_alpha_loss = 0.0
         total_pnl_loss = 0.0
-        
-        # Process in chunks
+
+        # Process in chunks of observations, keeping full quantile dimension
         num_chunks = (batch_size * n_step + self.chunk_size - 1) // self.chunk_size
-        
+
         for chunk_idx in range(num_chunks):
             start_idx = chunk_idx * self.chunk_size
             end_idx = min((chunk_idx + 1) * self.chunk_size, batch_size * n_step)
-            
+
             chunk_obs = flat_obs[start_idx:end_idx]
             chunk_act = flat_act[start_idx:end_idx]
-            chunk_target = flat_target[start_idx:end_idx]
-            
+            chunk_target = flat_target[start_idx:end_idx]  # [chunk_size, 32]
+
             with autocast(device_type='cuda'):
                 # Actor forward pass
                 loc, scale, _, predicted_pnl = self.actor(chunk_obs)
@@ -252,39 +252,31 @@ class CustomSACPolicy(SACPolicy):
                 actions = torch.tanh(dist.rsample())
                 log_prob = dist.log_prob(actions) - torch.log(1 - actions.pow(2) + 1e-6).sum(dim=-1)
 
-                # Critic forward passes
-                chunk_num_quantiles = min(num_quantiles, self.chunk_size)  # Adjust for last chunk
-                taus = torch.rand(end_idx - start_idx, chunk_num_quantiles, device=self.device)
-                
-                obs_expanded = chunk_obs.unsqueeze(1).expand(-1, chunk_num_quantiles, -1).reshape(-1, chunk_obs.shape[-1])
-                act_expanded = actions.unsqueeze(1).expand(-1, chunk_num_quantiles, -1).reshape(-1, actions.shape[-1])
+                # Critic forward passes - use full num_quantiles
+                taus = torch.rand(end_idx - start_idx, num_quantiles, device=self.device)
 
                 # Current Q estimates
-                current_q1, _ = self.critic1(obs_expanded, act_expanded, taus.reshape(-1, 1))
-                current_q2, _ = self.critic2(obs_expanded, act_expanded, taus.reshape(-1, 1))
+                current_q1, _ = self.critic1(chunk_obs, chunk_act, taus)
+                current_q2, _ = self.critic2(chunk_obs, chunk_act, taus)
 
-                current_q1 = current_q1.view(end_idx - start_idx, chunk_num_quantiles)
-                current_q2 = current_q2.view(end_idx - start_idx, chunk_num_quantiles)
-               
-               # New Q estimates for actor loss
-                new_q1, _ = self.critic1(chunk_obs, actions)
-                new_q2, _ = self.critic2(chunk_obs, actions)
+                # New Q estimates for actor loss (use single tau)
+                single_tau = torch.rand(end_idx - start_idx, 1, device=self.device)
+                new_q1, _ = self.critic1(chunk_obs, actions, single_tau)
+                new_q2, _ = self.critic2(chunk_obs, actions, single_tau)
                 new_q = torch.min(new_q1, new_q2)
 
             # Loss calculations for this chunk
             alpha_loss = -(self.get_alpha * (log_prob + self.target_entropy).detach()).mean()
-            
-            print(f"flat_target shape: {chunk_target.shape}")
-            print(f"current_q1 shape: {current_q1.shape}")
-            print(f"current_q2 shape: {current_q2.shape}")
+
             critic_loss = (
-                quantile_huber_loss(current_q1, chunk_target[:, :chunk_num_quantiles],
-                                  torch.rand(end_idx - start_idx, chunk_num_quantiles, device=self.device),
+                quantile_huber_loss(current_q1, chunk_target,
+                                  torch.rand(end_idx - start_idx, num_quantiles, device=self.device),
                                   taus, kappa=5.0) +
-                quantile_huber_loss(current_q2, chunk_target[:, :chunk_num_quantiles],
-                                  torch.rand(end_idx - start_idx, chunk_num_quantiles, device=self.device),
+                quantile_huber_loss(current_q2, chunk_target,
+                                  torch.rand(end_idx - start_idx, num_quantiles, device=self.device),
                                   taus, kappa=5.0)
             )
+
 
             actor_loss = (self.get_alpha.detach() * log_prob - new_q).mean()
 
@@ -322,7 +314,7 @@ class CustomSACPolicy(SACPolicy):
 
         # Update target networks
         self.sync_weight()
-        
+
         # Calculate average losses
         total_samples = batch_size * n_step
         avg_actor_loss = total_actor_loss / total_samples
@@ -330,9 +322,9 @@ class CustomSACPolicy(SACPolicy):
         avg_alpha_loss = total_alpha_loss / total_samples
         avg_pnl_loss = total_pnl_loss / total_samples
         avg_total_loss = avg_actor_loss + avg_critic_loss + 0.1 * avg_pnl_loss
-        
+
         mean_reward = batch.rew.mean().item()
-        
+
         # Print training statistics
         print("\n=== Training Statistics ===")
         print(f"1. Policy Loss: {avg_actor_loss:.4f}")
