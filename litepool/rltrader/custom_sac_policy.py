@@ -8,6 +8,8 @@ import copy
 from tianshou.policy import SACPolicy
 from dataclasses import dataclass
 from tianshou.data import Batch
+from itertools import chain
+from tqdm import tqdm
 
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -111,6 +113,14 @@ class SACSummary:
             "alpha": self.alpha
         }
 
+def validate_tensor(name, tensor):
+    if torch.isnan(tensor).any():
+        print(f"NaN detected in {name}!")
+        return tensor.nan_to_num(0.0)
+    if torch.isinf(tensor).any():
+        print(f"Inf detected in {name}!")
+        return tensor.clamp(-1e8, 1e8)
+    return tensor
 
 class CustomSACPolicy(SACPolicy):
     def __init__(
@@ -211,101 +221,87 @@ class CustomSACPolicy(SACPolicy):
         )
         batch.q_target = target_q
         return batch
-\
+
+
     def learn(self, batch: Batch, **kwargs):
         start_time = time.time()
         batch_size = batch.obs.shape[0]
         n_step = batch.obs.shape[1]
         num_quantiles = self.num_quantiles
 
-        # Get hidden states from batch if available
-        actor_state = batch.get('state', None)
-        critic1_state = batch.get('state_h1', None)
-        critic2_state = batch.get('state_h2', None)
+        # Get and reshape hidden states
+        actor_state = batch.get('state', None).reshape(-1, *batch.state.shape[2:]).transpose(0, 1)
+        critic1_state = batch.get('state_h1', None).reshape(-1, *batch.state_h1.shape[2:]).transpose(0, 1)
+        critic2_state = batch.get('state_h2', None).reshape(-1, *batch.state_h2.shape[2:]).transpose(0, 1)
 
-        assert actor_state is not None
-        assert critic1_state is not None
-        assert critic2_state is not None
-
-        # Reshape batch for processing
+        # Reshape batch
         flat_obs = batch.obs.view(batch_size * n_step, -1)
         flat_act = batch.act.view(batch_size * n_step, -1)
         flat_target = batch.q_target
 
-        actor_state = actor_state.reshape(-1, *actor_state.shape[2:])
-        critic1_state = critic1_state.reshape(-1, *critic1_state.shape[2:])
-        critic2_state = critic2_state.reshape(-1, *critic2_state.shape[2:])
-
-        actor_state = actor_state.transpose(0, 1)
-        critic1_state = critic1_state.transpose(0, 1)
-        critic2_state = critic2_state.transpose(0, 1)
-
         # Process in chunks
         num_chunks = (batch_size * n_step + self.chunk_size - 1) // self.chunk_size
+        total_actor_loss = total_critic_loss = total_alpha_loss = total_pnl_loss = 0
 
-        total_actor_loss = 0
-        total_critic_loss = 0
-        total_alpha_loss = 0
-        total_pnl_loss = 0
-    
-        for chunk_idx in range(num_chunks):
+        for chunk_idx in tqdm(range(num_chunks)):
             start_idx = chunk_idx * self.chunk_size
             end_idx = min((chunk_idx + 1) * self.chunk_size, batch_size * n_step)
 
-            # Get chunk data and corresponding hidden states
+            # Get chunk data
             chunk_obs = flat_obs[start_idx:end_idx]
             chunk_act = flat_act[start_idx:end_idx]
             chunk_target = flat_target[start_idx:end_idx]
-
             chunk_actor_state = actor_state[:, start_idx:end_idx, :].contiguous()
             chunk_critic1_state = critic1_state[:, start_idx:end_idx, :].contiguous()
             chunk_critic2_state = critic2_state[:, start_idx:end_idx, :].contiguous()
 
-            # Actor forward pass with hidden state
+            # Actor forward pass with stabilization
             loc, scale, new_actor_state, predicted_pnl = self.actor(chunk_obs, state=chunk_actor_state)
-            dist = Independent(Normal(loc, scale), 1)
-            actions = torch.tanh(dist.rsample())
-            log_prob = dist.log_prob(actions) - torch.log(1 - actions.pow(2) + 1e-6).sum(dim=-1)                
+            loc = validate_tensor("loc", loc)
+            scale = validate_tensor("scale", scale).clamp(min=1e-6)
 
+            dist = Independent(Normal(loc, scale), 1)
+            actions = torch.tanh(dist.rsample()).clamp(-0.999, 0.999)
+            log_prob = (dist.log_prob(actions) -
+                      torch.log(1 - actions.pow(2) + 1e-6).sum(dim=-1)).clamp(-20, 20)
+
+            # Critic forward passes with stabilization
             taus = torch.rand(end_idx - start_idx, num_quantiles, device=self.device)
             current_q1, new_critic1_state = self.critic1(chunk_obs, chunk_act, taus, state_h=chunk_critic1_state)
             current_q2, new_critic2_state = self.critic2(chunk_obs, chunk_act, taus, state_h=chunk_critic2_state)
+            current_q1 = validate_tensor("current_q1", current_q1).clamp(-1e3, 1e3) / 10.0
+            current_q2 = validate_tensor("current_q2", current_q2).clamp(-1e3, 1e3) / 10.0
 
-
-            single_tau = torch.rand(end_idx - start_idx, 1, device=self.device)  # Single quantile per sample
-    
+            # Actor Q-values with stabilization
+            with torch.no_grad(): 
+                single_tau = torch.rand(end_idx - start_idx, 1, device=self.device)
             new_q1, _ = self.critic1(chunk_obs, actions, single_tau, state_h=chunk_critic1_state)
             new_q2, _ = self.critic2(chunk_obs, actions, single_tau, state_h=chunk_critic2_state)
-            new_q1 = new_q1.mean(dim=1, keepdim=True)
-            new_q2 = new_q2.mean(dim=1, keepdim=True)
-            new_q = torch.min(new_q1, new_q2)
-       
-            alpha_loss = -(self.get_alpha * (log_prob + self.target_entropy).detach()).mean()
+            new_q1 = validate_tensor("new_q1", new_q1).clamp(-1e3, 1e3) / 10.0
+            new_q2 = validate_tensor("new_q2", new_q2).clamp(-1e3, 1e3) / 10.0
+            new_q = torch.min(new_q1.mean(dim=1), new_q2.mean(dim=1))
 
-            critic_loss = (
-                quantile_huber_loss(current_q1, chunk_target,
-                                  torch.rand(end_idx - start_idx, num_quantiles, device=self.device),
-                                  taus, kappa=5.0) +
-                quantile_huber_loss(current_q2, chunk_target,
-                                  torch.rand(end_idx - start_idx, num_quantiles, device=self.device),
-                                  taus, kappa=5.0)
-            )
+            # Stabilized losses
+            alpha_loss = -(self.log_alpha.clamp(-10, 10) * (log_prob.detach() + self.target_entropy)).mean()
+            critic_loss = (quantile_huber_loss(current_q1, chunk_target, taus, taus, kappa=1.0) +
+                          quantile_huber_loss(current_q2, chunk_target, taus, taus, kappa=1.0))
+            actor_loss = (self.get_alpha.detach() * log_prob - new_q).mean()
 
-            actor_loss = (self.get_alpha.detach() * log_prob - new_q.mean(dim=1)).mean()
-
-            # PnL prediction loss (auxiliary task)
-            pnl_target = batch.rew.view(batch_size, n_step).sum(dim=1)  # [batch_size]
+            # PnL loss with stabilization
+            pnl_target = batch.rew.view(batch_size, n_step).sum(dim=1)
             pnl_target = pnl_target.unsqueeze(1).expand(-1, n_step).reshape(-1)[start_idx:end_idx]
-            pnl_loss = F.mse_loss(predicted_pnl.squeeze(-1), pnl_target)
+            pnl_loss = F.mse_loss(validate_tensor("predicted_pnl", predicted_pnl.squeeze(-1)),
+                                 validate_tensor("pnl_target", pnl_target))
 
-            # Accumulate losses
+            # Validate and clip losses
+            actor_loss = validate_tensor("actor_loss", actor_loss).clamp(-1e4, 1e4)
+            critic_loss = validate_tensor("critic_loss", critic_loss).clamp(-1e4, 1e4)
+            alpha_loss = validate_tensor("alpha_loss", alpha_loss).clamp(-1e4, 1e4)
+            pnl_loss = validate_tensor("pnl_loss", pnl_loss).clamp(-1e4, 1e4)
+
             chunk_loss = actor_loss + critic_loss + 0.1 * pnl_loss
-            total_actor_loss += actor_loss.item() * (end_idx - start_idx)
-            total_critic_loss += critic_loss.item() * (end_idx - start_idx)
-            total_alpha_loss += alpha_loss.item() * (end_idx - start_idx)
-            total_pnl_loss += pnl_loss.item() * (end_idx - start_idx)
 
-            # Backpropagation for this chunk
+            # Backpropagation with safety checks
             self.critic1_optim.zero_grad()
             self.critic2_optim.zero_grad()
             self.actor_optim.zero_grad()
@@ -313,29 +309,29 @@ class CustomSACPolicy(SACPolicy):
 
             chunk_loss.backward()
 
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.critic1.parameters(), max_norm=0.5)
-            torch.nn.utils.clip_grad_norm_(self.critic2.parameters(), max_norm=0.5)
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=0.5)
+            # Gradient safety
+            for param in self.actor.parameters():
+                if param.grad is not None:
+                    param.grad = validate_tensor("actor_grad", param.grad).clamp(-0.1, 0.1)
+            for param in chain(self.critic1.parameters(), self.critic2.parameters()):
+                if param.grad is not None:
+                    param.grad = validate_tensor("critic_grad", param.grad).clamp(-0.1, 0.1)
 
-            # Update parameters
             self.critic1_optim.step()
             self.critic2_optim.step()
             self.actor_optim.step()
             self.alpha_optim.step()
 
+            # Accumulate losses
+            total_actor_loss += actor_loss.item() * (end_idx - start_idx)
+            total_critic_loss += critic_loss.item() * (end_idx - start_idx)
+            total_alpha_loss += alpha_loss.item() * (end_idx - start_idx)
+            total_pnl_loss += pnl_loss.item() * (end_idx - start_idx)
+
         # Update target networks
         self.sync_weight()
 
-        # Calculate average losses
-        total_samples = batch_size * n_step
-        avg_actor_loss = total_actor_loss / total_samples
-        avg_critic_loss = total_critic_loss / total_samples
-        avg_alpha_loss = total_alpha_loss / total_samples
-        avg_pnl_loss = total_pnl_loss / total_samples
-        avg_total_loss = avg_actor_loss + avg_critic_loss + 0.1 * avg_pnl_loss
 
-        mean_reward = batch.rew.mean().item()
 
         # Print training statistics
         print("\n=== Training Statistics ===")
@@ -348,11 +344,15 @@ class CustomSACPolicy(SACPolicy):
         print(f"7. Mean Reward: {mean_reward:.4f}")
         print("="*30 + "\n", flush=True)
 
+        # Return training statistics
+        total_samples = batch_size * n_step
         return SACSummary(
-            loss=avg_total_loss,
-            loss_actor=avg_actor_loss,
-            loss_critic=avg_critic_loss,
-            loss_alpha=avg_alpha_loss,
+            loss=(total_actor_loss + total_critic_loss + 0.1 * total_pnl_loss) / total_samples,
+            loss_actor=total_actor_loss / total_samples,
+            loss_critic=total_critic_loss / total_samples,
+            loss_alpha=total_alpha_loss / total_samples,
             alpha=self.get_alpha.item(),
             train_time=time.time() - start_time
         )
+
+        
