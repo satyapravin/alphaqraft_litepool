@@ -28,15 +28,7 @@ class SequentialReplayBuffer(VectorReplayBuffer):
         return None
 
     def add(self, batch, buffer_ids=None):
-        """Adds batch data to all buffers and returns per-environment stats.
-
-        Args:
-            batch: Batch object containing vectorized data across environments
-            buffer_ids: Which buffers to update (default: all)
-
-        Returns:
-            List of tuples (index, episode_reward, episode_length, buffer_idx)
-        """
+        """Adds batch data to all buffers and returns per-environment stats."""
         if buffer_ids is None:
             buffer_ids = np.arange(self.buffer_num)
 
@@ -55,18 +47,22 @@ class SequentialReplayBuffer(VectorReplayBuffer):
                 if key in batch and batch[key] is not None:
                     buf.data[key][idx, :steps] = batch[key][buf_idx][:steps]
 
-            # Properly handle info dictionary
+            # Handle info (dict or list)
             start_idx = idx * self.seq_len
-            end_idx = start_idx + self.seq_len
+            end_idx = start_idx + steps  # Use steps, not seq_len, for partial fills
             if isinstance(batch.info, dict):
-                # Store each info field separately
-                for k, v in batch.info.items():
+                # Initialize info fields if not present
+                for k in batch.info.keys():
                     if k not in buf.data:
                         buf.data[k] = [None] * (self._size * self.seq_len)
-                    buf.data[k][start_idx:end_idx] = v[buf_idx]
+                # Store each dict field separately
+                for k, v in batch.info.items():
+                    buf.data[k][start_idx:end_idx] = v[buf_idx][:steps]
             else:
-                # Fallback for non-dict info
-                buf.data['info'][start_idx:end_idx] = batch.info[buf_idx]
+                # Non-dict info (list or array per env)
+                if 'info' not in buf.data:
+                    buf.data['info'] = [None] * (self._size * self.seq_len)
+                buf.data['info'][start_idx:end_idx] = batch.info[buf_idx][:steps]
 
             # Update pointers
             buf._index += 1
@@ -80,15 +76,18 @@ class SequentialReplayBuffer(VectorReplayBuffer):
 
         return ptrs
 
-
     def sample(self, batch_size, train_device='cuda'):
         indices = self.sample_indices(batch_size)
         if indices.size == 0:
             return Batch(), np.array([])
 
         batch = Batch()
+        info_list = []  # Collect info as a list initially
+        is_dict_info = None
+
         for buf_idx, seq_idx in indices:
             buf = self.buffers[buf_idx]
+            # Standard fields
             for key in ['obs', 'act', 'rew', 'done', 'terminated', 'truncated', 'obs_next']:
                 val = buf.data[key][seq_idx]
                 batch[key] = np.concatenate([batch[key], val[None]], axis=0) if key in batch else val[None]
@@ -96,10 +95,33 @@ class SequentialReplayBuffer(VectorReplayBuffer):
                 if key in buf.data:
                     val = buf.data[key][seq_idx]
                     batch[key] = np.concatenate([batch[key], val[None]], axis=0) if key in batch else val[None]
+
+            # Handle info
             start = seq_idx * self.seq_len
             end = start + self.seq_len
-            batch.info = buf.data['info'][start:end] if 'info' not in batch else batch.info + buf.data['info'][start:end]
+            if is_dict_info is None:
+                # Determine info type from first buffer
+                is_dict_info = 'info' not in buf.data and any(k in buf.data for k in ['env_id', 'realized_pnl'])  # Example dict keys
 
+            if is_dict_info:
+                # Dictionary-style info
+                info_dict = {}
+                for key in buf.data.keys():
+                    if key not in ['obs', 'act', 'rew', 'done', 'terminated', 'truncated', 'obs_next'] + self._meta_keys:
+                        info_dict[key] = buf.data[key][start:end]
+                info_list.append(info_dict)
+            else:
+                # List-style info
+                info_list.append(buf.data['info'][start:end])
+
+        # Assign info to batch
+        if is_dict_info:
+            # Convert list of dicts to dict of lists
+            batch.info = {key: [d[key] for d in info_list] for key in info_list[0].keys()}
+        else:
+            batch.info = info_list  # List of seq_len elements per sample
+
+        # Convert other fields to tensors
         for key in batch.keys():
             if key != 'info':
                 val = batch[key]
@@ -111,7 +133,7 @@ class SequentialReplayBuffer(VectorReplayBuffer):
         return batch, indices
 
     def sample_indices(self, batch_size):
-        valid_buffers = [i for i in range(self.buffer_num) if self.buffers[i]._reserved >= self.seq_len]
+        valid_buffers = [i for i in range(self.buffer_num) if self.buffers[buf_idx]._reserved >= self.seq_len]
         if not valid_buffers:
             return np.array([])
 

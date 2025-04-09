@@ -14,6 +14,7 @@ from replay_buffer import SequentialReplayBuffer
 from cpu_collector import CPUCollector
 import logging
 from datetime import datetime
+from metric_logger import MetricLogger
 
 device = torch.device("cuda")
 num_of_envs = 64
@@ -187,6 +188,8 @@ else:
         device="cpu"
     )
 
+metric_logger = MetricLogger(print_interval=1000)
+
 # Collector setup
 collector = CPUCollector(
     num_of_envs=num_of_envs,
@@ -197,19 +200,29 @@ collector = CPUCollector(
     device='cpu'
 )
 
+# Define train_fn to log metrics
+def train_fn(epoch, env_step):
+    # Collect latest stats from collector
+    stats = collector.collect(n_step=num_of_envs)  # Collect one step per env
+    metric_logger.log(
+        step_count=env_step,
+        info=stats.info,  
+        rew=stats.rews,
+        policy=policy
+    )
+
 trainer = OffpolicyTrainer(
     policy=policy,
     train_collector=collector,
-    test_collector=None,  # No test env for now; add if needed
-    max_epoch=10,  # Number of epochs to train
-    step_per_epoch=60,  # Steps per epoch (adjust based on your needs)
-    step_per_collect=64*100,  # Collect 64 steps (1 step per env) per iteration
-    episode_per_test=0,  # No test episodes; set if you add a test env
-    batch_size=64,  # Match num_of_envs for efficient sampling
-    update_per_step=0.1,  # Update policy once per collected step
-    train_fn=lambda epoch, env_step: None,  # Optional training hooks
-    test_fn=None,  # No testing for now
-    stop_fn=lambda mean_rewards: mean_rewards >= 1000,  # Stop if mean reward exceeds threshold
+    test_collector=None,
+    max_epoch=10,
+    step_per_epoch=60,
+    step_per_collect=64*600,
+    episode_per_test=0,
+    batch_size=64,
+    update_per_step=0.1,
+    train_fn=train_fn,  # Hook MetricLogger here
+    test_fn=None,
     save_checkpoint_fn=save_checkpoint_fn,
     resume_from_log=start_epoch > 0,
 )
