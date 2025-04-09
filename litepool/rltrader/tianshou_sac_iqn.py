@@ -25,8 +25,8 @@ env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
     num_threads=num_of_envs, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
-    maker_fee=0.00001, taker_fee=0.0005, foldername="./train_files/",
-    balance=1.0, start=3601 * 20, max=6400 * 10
+    maker_fee=0.0000, taker_fee=0.0005, foldername="./train_files/",
+    balance=1.0, start=3601 * 10, max=7200 * 10
 )
 
 env.spec.id = 'RlTrader-v0'
@@ -206,12 +206,12 @@ trainer = OffpolicyTrainer(
     train_collector=collector,
     test_collector=None,
     max_epoch=10,
-    step_per_epoch=60,
+    step_per_epoch=2,
     step_per_collect=64*600,
     episode_per_test=0,
     batch_size=64,
-    update_per_step=0.1,
-    train_fn=None,  # Hook MetricLogger here
+    update_per_step=1,
+    train_fn=None,  
     test_fn=None,
     save_checkpoint_fn=save_checkpoint_fn,
     resume_from_log=start_epoch > 0,

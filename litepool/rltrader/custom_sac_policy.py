@@ -316,7 +316,7 @@ class CustomSACPolicy(SACPolicy):
         print(f"5. Total Loss: {total_loss.item():.4f}")
         print(f"6. Alpha Value: {self.get_alpha.item():.4f}")
         print(f"7. Mean Reward: {mean_reward:.4f}")
-        print("="*30 + "\n")
+        print("="*30 + "\n", flush=True)
 
         return SACSummary(
             loss=total_loss.item(),
