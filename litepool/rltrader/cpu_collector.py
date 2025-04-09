@@ -119,7 +119,6 @@ class CPUCollector(Collector):
             self.data.obs = obs
             self.data.info = info
             info_dict_seq = {k: [[] for _ in range(self.num_of_envs)] for k in info.keys()}
-            print(f"Initial reset, trade_count: {info['trade_count']}")
 
         while True:
             with torch.no_grad():

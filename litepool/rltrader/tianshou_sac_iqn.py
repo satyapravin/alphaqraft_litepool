@@ -182,7 +182,7 @@ if final_buffer_path.exists():
 else:
     print(f"No buffer found at {final_buffer_path}, creating new sequential buffer")
     buffer = SequentialReplayBuffer(
-        total_size=num_of_envs * 900,  # Total buffer size (e.g., 64 envs × 6000 steps)
+        total_size=num_of_envs * 6000,  # Total buffer size (e.g., 64 envs × 6000 steps)
         seq_len=300,                   # Length of sequences to sample
         buffer_num=num_of_envs,        # Match your environment count
         device="cpu"
@@ -207,7 +207,7 @@ trainer = OffpolicyTrainer(
     test_collector=None,
     max_epoch=10,
     step_per_epoch=2,
-    step_per_collect=600,
+    step_per_collect=300,
     episode_per_test=0,
     batch_size=64,
     update_per_step=1,

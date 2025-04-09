@@ -6,7 +6,6 @@ import torch.nn.functional as F
 from torch.distributions import Normal, Independent
 import copy
 from tianshou.policy import SACPolicy
-from torch.amp import autocast, GradScaler
 from dataclasses import dataclass
 from tianshou.data import Batch
 
@@ -39,60 +38,58 @@ def quantile_huber_loss(prediction, target, taus_predicted, taus_target, kappa=1
 
 def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, n_step=300, num_quantiles=32, chunk_size=16):
     batch_size = len(batch)
-    rewards = batch.rew.squeeze(-1)  # [64, 300]
-    dones = batch.done.squeeze(-1)  # [64, 300]
+    rewards = batch.rew.squeeze(-1)  # [batch_size, n_step]
+    dones = batch.done.squeeze(-1)   # [batch_size, n_step]
     
-    assert rewards.shape == (batch_size, n_step), "Rewards shape mismatch"
-    assert dones.shape == (batch_size, n_step), "Dones shape mismatch"
-    assert batch.obs_next.shape == (batch_size, n_step, 2420), "obs_next should be [B, seq_len, obs_dim]"
-
+    # Get hidden states from batch if available
+    actor_state = batch.get('actor_state', None)
+    critic1_state = batch.get('critic1_state', None)
+    critic2_state = batch.get('critic2_state', None)
+    
     # 1. Compute cumulative rewards (vectorized)
-    discount_factors = gamma ** torch.arange(n_step, device=device)  # [300]
-    mask = 1 - dones.cumsum(dim=1).clamp(0, 1).float()  # [64, 300]
-    cumulative_rewards = torch.zeros(batch_size, n_step, device=device)  # [64, 300]
-    for t in range(n_step):
-        cumulative_rewards[:, t] = (rewards[:, t:] * discount_factors[:n_step-t] * mask[:, t:]).sum(dim=1)
+    discount_factors = gamma ** torch.arange(n_step, device=device)  # [n_step]
+    mask = 1 - dones.cumsum(dim=1).clamp(0, 1).float()  # [batch_size, n_step]
+    cumulative_rewards = (rewards * discount_factors.unsqueeze(0) * mask).sum(dim=1)  # [batch_size]
 
-    # 2. Compute target Q-values with chunking
-    target_q = torch.zeros(batch_size, n_step, num_quantiles, device=device)  # [64, 300, 32]
-    
-    # Process in chunks to reduce memory usage
-    num_chunks = (batch_size + chunk_size - 1) // chunk_size
-    
-    for chunk_idx in range(num_chunks):
-        start_idx = chunk_idx * chunk_size
-        end_idx = min((chunk_idx + 1) * chunk_size, batch_size)
-        chunk_batch_size = end_idx - start_idx
+    # 2. Compute target Q-values in parallel
+    with torch.no_grad():
+        # Process all time steps in parallel
+        obs_next = batch.obs_next  # [batch_size, n_step, obs_dim]
         
-        # Initialize hidden states for this chunk
-        actor_h = torch.zeros(actor.num_layers, chunk_batch_size, actor.gru_hidden_dim, device=device)
-        critic1_h = torch.zeros(critic1.num_layers, chunk_batch_size, critic1.gru_hidden_dim, device=device)
-        critic2_h = torch.zeros(critic2.num_layers, chunk_batch_size, critic2.gru_hidden_dim, device=device)
-
-        with torch.no_grad():
-            for t in range(n_step):
-                # Get current chunk data
-                obs_chunk = batch.obs_next[start_idx:end_idx, t:t+1]
-                
-                # Actor forward pass with hidden state
-                loc, scale, actor_h, _ = actor(obs_chunk, state=actor_h)
-                loc = loc.squeeze(1)
-                scale = scale.squeeze(1)
-                dist = Independent(Normal(loc, scale), 1)
-                actions = torch.tanh(dist.rsample())
-                log_prob = dist.log_prob(actions)
-
-                # Critic forward passes with hidden states
-                taus = torch.rand(chunk_batch_size, num_quantiles, device=device)
-                q1, critic1_h = critic1(obs_chunk.squeeze(1), actions, taus, state_h=critic1_h)
-                q2, critic2_h = critic2(obs_chunk.squeeze(1), actions, taus, state_h=critic2_h)
-
-                q = torch.min(q1, q2)
-                target_q[start_idx:end_idx, t] = q - alpha * log_prob.unsqueeze(-1)
+        # Reshape for parallel processing
+        flat_obs = obs_next.reshape(batch_size * n_step, -1)
+        
+        # Get actions and log probs for all steps
+        if actor_state is not None:
+            actor_state = actor_state.transpose(0, 1).reshape(actor.num_layers, -1, actor.gru_hidden_dim)
+        loc, scale, _, _ = actor(flat_obs, state=actor_state)
+        dist = Independent(Normal(loc, scale), 1)
+        actions = torch.tanh(dist.rsample())
+        log_prob = dist.log_prob(actions)
+        
+        # Reshape actions and log probs back to [batch_size, n_step, ...]
+        actions = actions.reshape(batch_size, n_step, -1)
+        log_prob = log_prob.reshape(batch_size, n_step)
+        
+        # Compute Q-values for all steps
+        flat_actions = actions.reshape(batch_size * n_step, -1)
+        taus = torch.rand(batch_size * n_step, num_quantiles, device=device)
+        
+        if critic1_state is not None:
+            critic1_state = critic1_state.transpose(0, 1).reshape(critic1.num_layers, -1, critic1.gru_hidden_dim)
+        if critic2_state is not None:
+            critic2_state = critic2_state.transpose(0, 1).reshape(critic2.num_layers, -1, critic2.gru_hidden_dim)
+            
+        q1, _ = critic1(flat_obs, flat_actions, taus, state_h=critic1_state)
+        q2, _ = critic2(flat_obs, flat_actions, taus, state_h=critic2_state)
+        q = torch.min(q1, q2).reshape(batch_size, n_step, num_quantiles)
+        
+        # Compute target Q values
+        target_q = q - alpha * log_prob.unsqueeze(-1)
 
     # 3. Compute final targets
     not_done = 1 - dones.any(dim=1).float().view(batch_size, 1, 1)
-    final_targets = cumulative_rewards.unsqueeze(2) + not_done * (gamma ** n_step) * target_q
+    final_targets = cumulative_rewards.unsqueeze(1).unsqueeze(2) + not_done * (gamma ** n_step) * target_q
 
     return final_targets.reshape(batch_size * n_step, num_quantiles)
 
@@ -156,8 +153,6 @@ class CustomSACPolicy(SACPolicy):
         self.critic1_target = copy.deepcopy(critic1)
         self.critic2_target = copy.deepcopy(critic2)
         self.target_entropy = -np.prod(action_space.shape).item()
-
-        self.scaler = GradScaler()
         self.chunk_size = 16  # Reduced chunk size for memory efficiency
 
     @property
@@ -216,57 +211,75 @@ class CustomSACPolicy(SACPolicy):
         )
         batch.q_target = target_q
         return batch
-
-    def learn(self, batch: Batch, state_h1=None, state_h2=None, **kwargs):
+\
+    def learn(self, batch: Batch, **kwargs):
         start_time = time.time()
         batch_size = batch.obs.shape[0]
-        n_step = batch.obs.shape[1]  # Should be 60 (stack_num)
-        num_quantiles = self.num_quantiles  # Use the policy's num_quantiles (32)
+        n_step = batch.obs.shape[1]
+        num_quantiles = self.num_quantiles
+
+        # Get hidden states from batch if available
+        actor_state = batch.get('state', None)
+        critic1_state = batch.get('state_h1', None)
+        critic2_state = batch.get('state_h2', None)
+
+        assert actor_state is not None
+        assert critic1_state is not None
+        assert critic2_state is not None
 
         # Reshape batch for processing
-        flat_obs = batch.obs.view(batch_size * n_step, -1)  # [B*N, obs_dim]
-        flat_act = batch.act.view(batch_size * n_step, -1)  # [B*N, action_dim]
-        flat_target = batch.q_target  # [B*N, num_quantiles]
+        flat_obs = batch.obs.view(batch_size * n_step, -1)
+        flat_act = batch.act.view(batch_size * n_step, -1)
+        flat_target = batch.q_target
 
-        # Initialize losses
-        total_actor_loss = 0.0
-        total_critic_loss = 0.0
-        total_alpha_loss = 0.0
-        total_pnl_loss = 0.0
+        actor_state = actor_state.reshape(-1, *actor_state.shape[2:])
+        critic1_state = critic1_state.reshape(-1, *critic1_state.shape[2:])
+        critic2_state = critic2_state.reshape(-1, *critic2_state.shape[2:])
 
-        # Process in chunks of observations, keeping full quantile dimension
+        actor_state = actor_state.transpose(0, 1)
+        critic1_state = critic1_state.transpose(0, 1)
+        critic2_state = critic2_state.transpose(0, 1)
+
+        # Process in chunks
         num_chunks = (batch_size * n_step + self.chunk_size - 1) // self.chunk_size
 
+        total_actor_loss = 0
+        total_critic_loss = 0
+        total_alpha_loss = 0
+        total_pnl_loss = 0
+    
         for chunk_idx in range(num_chunks):
             start_idx = chunk_idx * self.chunk_size
             end_idx = min((chunk_idx + 1) * self.chunk_size, batch_size * n_step)
 
+            # Get chunk data and corresponding hidden states
             chunk_obs = flat_obs[start_idx:end_idx]
             chunk_act = flat_act[start_idx:end_idx]
-            chunk_target = flat_target[start_idx:end_idx]  # [chunk_size, 32]
+            chunk_target = flat_target[start_idx:end_idx]
+
+            chunk_actor_state = actor_state[:, start_idx:end_idx, :].contiguous()
+            chunk_critic1_state = critic1_state[:, start_idx:end_idx, :].contiguous()
+            chunk_critic2_state = critic2_state[:, start_idx:end_idx, :].contiguous()
+
+            # Actor forward pass with hidden state
+            loc, scale, new_actor_state, predicted_pnl = self.actor(chunk_obs, state=chunk_actor_state)
+            dist = Independent(Normal(loc, scale), 1)
+            actions = torch.tanh(dist.rsample())
+            log_prob = dist.log_prob(actions) - torch.log(1 - actions.pow(2) + 1e-6).sum(dim=-1)                
 
             taus = torch.rand(end_idx - start_idx, num_quantiles, device=self.device)
-            single_tau = torch.rand(end_idx - start_idx, 1, device=self.device)
+            current_q1, new_critic1_state = self.critic1(chunk_obs, chunk_act, taus, state_h=chunk_critic1_state)
+            current_q2, new_critic2_state = self.critic2(chunk_obs, chunk_act, taus, state_h=chunk_critic2_state)
 
-            with autocast(device_type='cuda'):
-                # Actor forward pass
-                loc, scale, _, predicted_pnl = self.actor(chunk_obs)
-                dist = Independent(Normal(loc, scale), 1)
-                actions = torch.tanh(dist.rsample())
-                log_prob = dist.log_prob(actions) - torch.log(1 - actions.pow(2) + 1e-6).sum(dim=-1)
 
-                # Current Q estimates
-                current_q1, _ = self.critic1(chunk_obs, chunk_act, taus)
-                current_q2, _ = self.critic2(chunk_obs, chunk_act, taus)
-
-                # New Q estimates for actor loss (use single tau)
-                new_q1, _ = self.critic1(chunk_obs, actions, single_tau)
-                new_q2, _ = self.critic2(chunk_obs, actions, single_tau)
-                new_q1 = new_q1.mean(dim=1, keepdim=True)  # Average over quantiles
-                new_q2 = new_q2.mean(dim=1, keepdim=True)
-                new_q = torch.min(new_q1, new_q2)
-
-            # Loss calculations for this chunk
+            single_tau = torch.rand(end_idx - start_idx, 1, device=self.device)  # Single quantile per sample
+    
+            new_q1, _ = self.critic1(chunk_obs, actions, single_tau, state_h=chunk_critic1_state)
+            new_q2, _ = self.critic2(chunk_obs, actions, single_tau, state_h=chunk_critic2_state)
+            new_q1 = new_q1.mean(dim=1, keepdim=True)
+            new_q2 = new_q2.mean(dim=1, keepdim=True)
+            new_q = torch.min(new_q1, new_q2)
+       
             alpha_loss = -(self.get_alpha * (log_prob + self.target_entropy).detach()).mean()
 
             critic_loss = (
@@ -298,7 +311,7 @@ class CustomSACPolicy(SACPolicy):
             self.actor_optim.zero_grad()
             self.alpha_optim.zero_grad()
 
-            self.scaler.scale(chunk_loss).backward()
+            chunk_loss.backward()
 
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(self.critic1.parameters(), max_norm=0.5)
@@ -306,11 +319,10 @@ class CustomSACPolicy(SACPolicy):
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=0.5)
 
             # Update parameters
-            self.scaler.step(self.critic1_optim)
-            self.scaler.step(self.critic2_optim)
-            self.scaler.step(self.actor_optim)
-            self.scaler.step(self.alpha_optim)
-            self.scaler.update()
+            self.critic1_optim.step()
+            self.critic2_optim.step()
+            self.actor_optim.step()
+            self.alpha_optim.step()
 
         # Update target networks
         self.sync_weight()
