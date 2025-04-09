@@ -205,79 +205,59 @@ class CustomSACPolicy(SACPolicy):
         batch.q_target = target_q
         return batch
 
-
     def learn(self, batch: Batch, state_h1=None, state_h2=None, **kwargs):
         start_time = time.time()
         batch_size = batch.obs.shape[0]
         n_step = batch.obs.shape[1]  # Should be 60 (stack_num)
         num_quantiles = 32
-        chunk_size = 8  # Adjust based on GPU memory
 
-        # Initialize losses
-        alpha_loss = torch.tensor(0.0, device=self.device)
-        actor_loss = torch.tensor(0.0, device=self.device)
-        critic_loss = torch.tensor(0.0, device=self.device)
-        pnl_loss = torch.tensor(0.0, device=self.device)
+        # Reshape batch for processing
+        flat_obs = batch.obs.view(batch_size * n_step, -1)  # [B*N, obs_dim]
+        flat_act = batch.act.view(batch_size * n_step, -1)  # [B*N, action_dim]
+        flat_target = batch.q_target  # [B*N, num_quantiles]
+        taus = torch.rand(batch_size * n_step, num_quantiles, device=self.device)
 
-        # Process in chunks to save memory
-        num_chunks = (batch_size * n_step + chunk_size - 1) // chunk_size
+        with autocast(device_type='cuda'):
+            # Actor forward pass
+            loc, scale, _, predicted_pnl = self.actor(flat_obs)
+            dist = Independent(Normal(loc, scale), 1)
+            actions = torch.tanh(dist.rsample())  # [B*N, action_dim]
+            log_prob = dist.log_prob(actions) - torch.log(1 - actions.pow(2) + 1e-6).sum(dim=-1)
 
-        for chunk_idx in range(num_chunks):
-            start = chunk_idx * chunk_size
-            end = min((chunk_idx + 1) * chunk_size, batch_size * n_step)
+            # Critic forward passes
+            obs_expanded = flat_obs.unsqueeze(1).expand(-1, num_quantiles, -1).reshape(-1, flat_obs.shape[-1])
+            act_expanded = actions.unsqueeze(1).expand(-1, num_quantiles, -1).reshape(-1, actions.shape[-1])
 
-            # Prepare chunk data
-            chunk_obs = batch.obs.view(batch_size * n_step, -1)[start:end]  # [chunk, 2420]
-            chunk_act = batch.act.view(batch_size * n_step, -1)[start:end]  # [chunk, action_dim]
-            chunk_target = batch.q_target[start:end]  # [chunk, num_quantiles]
-            chunk_taus = torch.rand(end - start, num_quantiles, device=self.device)
+            # Current Q estimates
+            current_q1, _ = self.critic1(obs_expanded, act_expanded, taus.reshape(-1, 1))
+            current_q2, _ = self.critic2(obs_expanded, act_expanded, taus.reshape(-1, 1))
+            current_q1 = current_q1.view(-1, num_quantiles)
+            current_q2 = current_q2.view(-1, num_quantiles)
 
-            with autocast(device_type='cuda'):
-                loc, scale, _, predicted_pnl = self.actor(chunk_obs)
-                dist = Independent(Normal(loc, scale), 1)
-                actions = torch.tanh(dist.rsample())  # [chunk, action_dim]
-                log_prob = dist.log_prob(actions) - torch.log(1 - actions.pow(2) + 1e-6).sum(dim=-1)
+            # New Q estimates for actor loss
+            new_q1, _ = self.critic1(flat_obs, actions)
+            new_q2, _ = self.critic2(flat_obs, actions)
+            new_q = torch.min(new_q1, new_q2)
 
-                # Critic forward passes
-                obs_expanded = chunk_obs.unsqueeze(1).expand(-1, num_quantiles, -1).reshape(-1, 2420)
-                act_expanded = actions.unsqueeze(1).expand(-1, num_quantiles, -1).reshape(-1, actions.shape[-1])
+        # Loss calculations
+        alpha_loss = -(self.get_alpha * (log_prob + self.target_entropy).detach()).mean()
 
-                # Current Q estimates
-                current_q1, _ = self.critic1(obs_expanded, act_expanded, chunk_taus.reshape(-1, 1))
-                current_q2, _ = self.critic2(obs_expanded, act_expanded, chunk_taus.reshape(-1, 1))
-                current_q1 = current_q1.view(-1, num_quantiles)
-                current_q2 = current_q2.view(-1, num_quantiles)
+        # Quantile Huber loss for critics
+        critic_loss = (
+            quantile_huber_loss(current_q1, flat_target,
+                              torch.rand(batch_size * n_step, num_quantiles, device=self.device),
+                              taus, kappa=5.0) +
+            quantile_huber_loss(current_q2, flat_target,
+                              torch.rand(batch_size * n_step, num_quantiles, device=self.device),
+                              taus, kappa=5.0)
+        )
 
-                # New Q estimates for actor loss
-                new_q1, _ = self.critic1(chunk_obs, actions)
-                new_q2, _ = self.critic2(chunk_obs, actions)
-                new_q = torch.min(new_q1, new_q2)
+        actor_loss = (self.get_alpha.detach() * log_prob - new_q).mean()
 
-            # Loss calculations
-            alpha_loss += -(self.get_alpha * (log_prob + self.target_entropy).detach()).mean()
-
-            # Quantile Huber loss for critics
-            critic_loss += (
-                quantile_huber_loss(current_q1, chunk_target,
-                                  torch.rand(end-start, num_quantiles, device=self.device),
-                                  chunk_taus, kappa=5.0) +
-                quantile_huber_loss(current_q2, chunk_target,
-                                  torch.rand(end-start, num_quantiles, device=self.device),
-                                  chunk_taus, kappa=5.0)
-            )
-
-            actor_loss += (self.get_alpha.detach() * log_prob - new_q).mean()
-
-            # PnL prediction loss (auxiliary task)
-            pnl_target = batch.rew.view(batch_size, n_step).sum(dim=1)  # [batch_size]
-            pnl_target = pnl_target.unsqueeze(1).expand(-1, n_step).reshape(-1)[start:end]  # [chunk]
-            pnl_loss += F.mse_loss(predicted_pnl.squeeze(-1), pnl_target)
-
-        # Average losses across chunks
-        alpha_loss /= num_chunks
-        actor_loss /= num_chunks
-        critic_loss /= num_chunks
-        pnl_loss /= num_chunks
+        # PnL prediction loss (auxiliary task)
+        pnl_target = batch.rew.view(batch_size, n_step).sum(dim=1)  # [batch_size]
+        pnl_target = pnl_target.unsqueeze(1).expand(-1, n_step).reshape(-1)  # [B*N]
+        pnl_loss = F.mse_loss(predicted_pnl.squeeze(-1), pnl_target)
 
         # Total loss
         total_loss = actor_loss + critic_loss + 0.1 * pnl_loss  # pnl_loss is auxiliary
