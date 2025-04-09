@@ -4,6 +4,7 @@ import torch
 from tianshou.data import Collector, Batch
 from tianshou.utils.statistics import RunningMeanStd  # Correct import
 from dataclasses import dataclass
+from metric_logger import MetricLogger
 
 @dataclass
 class CollectStats:
@@ -31,11 +32,12 @@ class CollectStats:
     info: object
 
 class CPUCollector(Collector):
-    def __init__(self, policy, env, num_of_envs, buffer=None, device='cpu', seq_len=300, **kwargs):
+    def __init__(self, policy, env, num_of_envs, print_interval=1000, buffer=None, device='cpu', seq_len=300, **kwargs):
         super().__init__(policy, env, buffer, **kwargs)
         self.device = device
         self.model_device = 'cuda'
         self.num_of_envs = num_of_envs
+        self.print_interval = print_interval
         self.seq_len = seq_len
         self.env_active = False
         self.continuous_step_count = 0
@@ -58,6 +60,8 @@ class CPUCollector(Collector):
             self.num_of_envs, policy.critic1.num_layers, policy.critic1.gru_hidden_dim,
             device=self.model_device
         )
+
+        self.metric_logger = MetricLogger(print_interval=print_interval)
 
     def reset_batch_data(self):
         self.data.obs = None
@@ -140,7 +144,6 @@ class CPUCollector(Collector):
                 terminated = done
                 truncated = np.zeros_like(done)
 
-            print(f"Step {local_step_count}/{self.continuous_step_count}, trade_count: {info['trade_count']}, done: {done}")
 
             for env_idx in range(self.num_of_envs):
                 obs_seq[env_idx].append(self.data.obs[env_idx])
@@ -228,8 +231,15 @@ class CPUCollector(Collector):
                 print(f"Breaking at n_episode={n_episode}, episode_count={episode_count}")
                 break
 
+            self.metric_logger.log(
+                step_count=self.continuous_step_count,
+                info=info,
+                rew=rew,
+                policy=self.policy
+            )
         collect_time = time.time() - start_time
         latest_info = info_dict_seq
+
 
         return CollectStats(
             n_ep=episode_count,

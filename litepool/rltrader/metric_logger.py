@@ -9,7 +9,8 @@ class MetricLogger:
         self.episode_lengths = []
 
     def log(self, step_count, info, rew, policy):
-        if step_count % self.print_interval != 0 and step_count != self.last_print_step:
+        print(step_count, self.print_interval)
+        if step_count % self.print_interval != 0:
             return
         self.last_print_step = step_count
 

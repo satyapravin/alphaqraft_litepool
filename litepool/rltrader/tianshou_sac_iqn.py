@@ -188,7 +188,6 @@ else:
         device="cpu"
     )
 
-metric_logger = MetricLogger(print_interval=1000)
 
 # Collector setup
 collector = CPUCollector(
@@ -197,19 +196,10 @@ collector = CPUCollector(
     env=env,
     buffer=buffer,
     seq_len=300,
-    device='cpu'
+    device='cpu',
+    print_interval=1000
 )
 
-# Define train_fn to log metrics
-def train_fn(epoch, env_step):
-    # Collect latest stats from collector
-    stats = collector.collect(n_step=600)  
-    metric_logger.log(
-        step_count=env_step,
-        info=stats.info,  
-        rew=stats.rews,
-        policy=policy
-    )
 
 trainer = OffpolicyTrainer(
     policy=policy,
@@ -221,7 +211,7 @@ trainer = OffpolicyTrainer(
     episode_per_test=0,
     batch_size=64,
     update_per_step=0.1,
-    train_fn=train_fn,  # Hook MetricLogger here
+    train_fn=None,  # Hook MetricLogger here
     test_fn=None,
     save_checkpoint_fn=save_checkpoint_fn,
     resume_from_log=start_epoch > 0,
