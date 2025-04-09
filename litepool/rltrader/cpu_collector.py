@@ -99,6 +99,7 @@ class CPUCollector(Collector):
         state_seq = [[] for _ in range(self.num_of_envs)]
         state_h1_seq = [[] for _ in range(self.num_of_envs)]
         state_h2_seq = [[] for _ in range(self.num_of_envs)]
+        info_seq = [[] for _ in range(self.num_of_envs)]
 
         while True:
             if self.data.obs is None:
@@ -156,7 +157,7 @@ class CPUCollector(Collector):
                 state_seq[env_idx].append(state)
                 state_h1_seq[env_idx].append(self.state_h1[:, env_idx].cpu().numpy())  # [2, 128]
                 state_h2_seq[env_idx].append(self.state_h2[:, env_idx].cpu().numpy())  # [2, 128]
-
+                info_seq[env_idx].append(self.data.info[env_idx]) 
             step_rews.extend(rew)
             local_step_count += 1
             self.continuous_step_count += 1
@@ -184,11 +185,13 @@ class CPUCollector(Collector):
                     terminated=np.array(terminated_seq),
                     truncated=np.array(truncated_seq),
                     obs_next=np.array(obs_next_seq), # [64, 300, 2420]
-                    info=self.data.info,
                     state=np.array(state_seq),       # [64, 300, 2, 128]
                     state_h1=np.array(state_h1_seq), # [64, 300, 2, 128]
-                    state_h2=np.array(state_h2_seq)  # [64, 300, 2, 128]
+                    state_h2=np.array(state_h2_seq), # [64, 300, 2, 128]
+                    info=np.array(info_seq)
                 )
+
+                print(self.buffer.add(batch))
                 ptr, ep_rew, ep_len, ep_idx = self.buffer.add(batch)
                 obs_seq = [[] for _ in range(self.num_of_envs)]
                 act_seq = [[] for _ in range(self.num_of_envs)]
@@ -200,6 +203,7 @@ class CPUCollector(Collector):
                 state_seq = [[] for _ in range(self.num_of_envs)]
                 state_h1_seq = [[] for _ in range(self.num_of_envs)]
                 state_h2_seq = [[] for _ in range(self.num_of_envs)]
+                info_seq = [[] for _ in range(self.num_of_envs)]
 
             if n_episode and episode_count >= n_episode:
                 break

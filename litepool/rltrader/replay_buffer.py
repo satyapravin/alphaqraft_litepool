@@ -42,7 +42,7 @@ class SequentialReplayBuffer(VectorReplayBuffer):
             for key in self._meta_keys:
                 if key in batch and batch[key] is not None:
                     buf.data[key][idx, :steps] = batch[key][buf_idx][:steps]
-            buf.data['info'][idx * self.seq_len:(idx + 1) * self.seq_len] = batch.info[buf_idx]
+            buf.data['info'][idx * self.seq_len:(idx + 1) * self.seq_len] = batch['info'][buf_idx]
 
             buf._index += 1
             buf._reserved = min(buf._reserved + steps, buf.max_size)
