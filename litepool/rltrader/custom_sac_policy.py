@@ -273,6 +273,9 @@ class CustomSACPolicy(SACPolicy):
             # Loss calculations for this chunk
             alpha_loss = -(self.get_alpha * (log_prob + self.target_entropy).detach()).mean()
             
+            print(f"flat_target shape: {chunk_target.shape}")
+            print(f"current_q1 shape: {current_q1.shape}")
+            print(f"current_q2 shape: {current_q2.shape}")
             critic_loss = (
                 quantile_huber_loss(current_q1, chunk_target[:, :chunk_num_quantiles],
                                   torch.rand(end_idx - start_idx, chunk_num_quantiles, device=self.device),
