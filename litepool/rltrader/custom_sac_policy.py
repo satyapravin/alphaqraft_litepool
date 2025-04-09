@@ -262,10 +262,11 @@ class CustomSACPolicy(SACPolicy):
                 # Current Q estimates
                 current_q1, _ = self.critic1(obs_expanded, act_expanded, taus.reshape(-1, 1))
                 current_q2, _ = self.critic2(obs_expanded, act_expanded, taus.reshape(-1, 1))
-                current_q1 = current_q1.view(-1, chunk_num_quantiles)
-                current_q2 = current_q2.view(-1, chunk_num_quantiles)
 
-                # New Q estimates for actor loss
+                current_q1 = current_q1.view(end_idx - start_idx, chunk_num_quantiles)
+                current_q2 = current_q2.view(end_idx - start_idx, chunk_num_quantiles)
+               
+               # New Q estimates for actor loss
                 new_q1, _ = self.critic1(chunk_obs, actions)
                 new_q2, _ = self.critic2(chunk_obs, actions)
                 new_q = torch.min(new_q1, new_q2)
