@@ -207,7 +207,6 @@ class CustomSACPolicy(SACPolicy):
 
 
     def learn(self, batch: Batch, state_h1=None, state_h2=None, **kwargs):
-        print(batch)
         start_time = time.time()
         batch_size = batch.obs.shape[0]
         n_step = batch.obs.shape[1]  # Should be 60 (stack_num)
@@ -233,10 +232,6 @@ class CustomSACPolicy(SACPolicy):
             chunk_target = batch.q_target[start:end]  # [chunk, num_quantiles]
             chunk_taus = torch.rand(end - start, num_quantiles, device=self.device)
 
-            # Reshape observations: [chunk, 2420] -> [chunk, 10, 242]
-            chunk_obs = chunk_obs.view(-1, 10, 242)
-
-            # Actor forward pass
             with autocast(device_type='cuda'):
                 loc, scale, _, predicted_pnl = self.actor(chunk_obs)
                 dist = Independent(Normal(loc, scale), 1)
@@ -244,7 +239,7 @@ class CustomSACPolicy(SACPolicy):
                 log_prob = dist.log_prob(actions) - torch.log(1 - actions.pow(2) + 1e-6).sum(dim=-1)
 
                 # Critic forward passes
-                obs_expanded = chunk_obs[:, -1, :].unsqueeze(1).expand(-1, num_quantiles, -1).reshape(-1, 242)
+                obs_expanded = chunk_obs.expand(-1, num_quantiles, -1).reshape(-1, 242)
                 act_expanded = actions.unsqueeze(1).expand(-1, num_quantiles, -1).reshape(-1, actions.shape[-1])
 
                 # Current Q estimates

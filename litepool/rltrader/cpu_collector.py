@@ -187,7 +187,7 @@ class CPUCollector(Collector):
             local_step_count += 1
             self.continuous_step_count += 1
 
-            if self.buffer and local_step_count % self.seq_len == 0:
+            if self.buffer is not None and local_step_count % self.seq_len == 0:
                 batch = Batch(
                     obs=np.array(obs_seq),
                     act=np.array(act_seq),

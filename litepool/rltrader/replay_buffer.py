@@ -28,7 +28,6 @@ class SequentialReplayBuffer(VectorReplayBuffer):
         return None
 
     def add(self, batch, buffer_ids=None):
-        """Adds batch data to all buffers and returns per-environment stats."""
         print("replaybuffer add called")
         if buffer_ids is None:
             buffer_ids = np.arange(self.buffer_num)
@@ -39,41 +38,48 @@ class SequentialReplayBuffer(VectorReplayBuffer):
             idx = buf._index % self._size
             steps = min(self.seq_len, buf.max_size - buf._reserved)
 
-            # Store vectorized data
-            for key in ['obs', 'act', 'rew', 'done', 'terminated', 'truncated', 'obs_next']:
-                buf.data[key][idx, :steps] = batch[key][buf_idx][:steps]
+            if steps <= 0:
+                print(f"Warning: steps={steps}, skipping add for buffer {buf_idx}")
+                continue
 
-            # Store hidden states
-            for key in self._meta_keys:
-                if key in batch and batch[key] is not None:
-                    buf.data[key][idx, :steps] = batch[key][buf_idx][:steps]
+            try:
+                # Store vectorized data
+                for key in ['obs', 'act', 'rew', 'done', 'terminated', 'truncated', 'obs_next']:
+                    data = batch[key][buf_idx][:steps]
+                    buf.data[key][idx, :steps] = data
 
-            # Handle info (dict or list)
-            start_idx = idx * self.seq_len
-            end_idx = start_idx + steps  # Use steps, not seq_len, for partial fills
-            if isinstance(batch.info, dict):
-                # Initialize info fields if not present
-                for k in batch.info.keys():
-                    if k not in buf.data:
-                        buf.data[k] = [None] * (self._size * self.seq_len)
-                # Store each dict field separately
-                for k, v in batch.info.items():
-                    buf.data[k][start_idx:end_idx] = v[buf_idx][:steps]
-            else:
-                # Non-dict info (list or array per env)
-                if 'info' not in buf.data:
-                    buf.data['info'] = [None] * (self._size * self.seq_len)
-                buf.data['info'][start_idx:end_idx] = batch.info[buf_idx][:steps]
+                # Store hidden states
+                for key in self._meta_keys:
+                    if key in batch and batch[key] is not None:
+                        data = batch[key][buf_idx][:steps]
+                        buf.data[key][idx, :steps] = data
 
-            # Update pointers
-            buf._index += 1
-            buf._reserved = min(buf._reserved + steps, buf.max_size)
+                # Handle info
+                start_idx = idx * self.seq_len
+                end_idx = start_idx + steps
+                if isinstance(batch.info, dict):
+                    for k in batch.info.keys():
+                        if k not in buf.data:
+                            buf.data[k] = [None] * (self._size * self.seq_len)
+                    for k, v in batch.info.items():
+                        data = v[buf_idx][:steps]
+                        buf.data[k][start_idx:end_idx] = data
+                else:
+                    if 'info' not in buf.data:
+                        buf.data['info'] = [None] * (self._size * self_seq_len)
+                    buf.data['info'][start_idx:end_idx] = batch.info[buf_idx][:steps]
 
-            # Calculate episode stats
-            ep_rew = batch.rew[buf_idx].sum()
-            ep_len = steps
+                # Update pointers
+                old_reserved = buf._reserved
+                buf._index += 1
+                buf._reserved = min(buf._reserved + steps, buf.max_size)
 
-            ptrs.append((idx, ep_rew, ep_len, buf_idx))
+                ep_rew = batch.rew[buf_idx].sum()
+                ep_len = steps
+                ptrs.append((idx, ep_rew, ep_len, buf_idx))
+            except Exception as e:
+                print(f"Error in buffer {buf_idx}: {e}")
+                raise
 
         return ptrs
 
@@ -83,12 +89,11 @@ class SequentialReplayBuffer(VectorReplayBuffer):
             return Batch(), np.array([])
 
         batch = Batch()
-        info_list = []  # Collect info as a list initially
+        info_list = []
         is_dict_info = None
 
         for buf_idx, seq_idx in indices:
             buf = self.buffers[buf_idx]
-            # Standard fields
             for key in ['obs', 'act', 'rew', 'done', 'terminated', 'truncated', 'obs_next']:
                 val = buf.data[key][seq_idx]
                 batch[key] = np.concatenate([batch[key], val[None]], axis=0) if key in batch else val[None]
@@ -97,50 +102,49 @@ class SequentialReplayBuffer(VectorReplayBuffer):
                     val = buf.data[key][seq_idx]
                     batch[key] = np.concatenate([batch[key], val[None]], axis=0) if key in batch else val[None]
 
-            # Handle info
             start = seq_idx * self.seq_len
             end = start + self.seq_len
             if is_dict_info is None:
-                # Determine info type from first buffer
-                is_dict_info = 'info' not in buf.data and any(k in buf.data for k in ['env_id', 'realized_pnl'])  # Example dict keys
-
+                is_dict_info = 'info' not in buf.data and any(k in buf.data for k in ['env_id', 'realized_pnl'])
             if is_dict_info:
-                # Dictionary-style info
-                info_dict = {}
-                for key in buf.data.keys():
-                    if key not in ['obs', 'act', 'rew', 'done', 'terminated', 'truncated', 'obs_next'] + self._meta_keys:
-                        info_dict[key] = buf.data[key][start:end]
+                info_dict = {key: buf.data[key][start:end] for key in buf.data.keys()
+                             if key not in ['obs', 'act', 'rew', 'done', 'terminated', 'truncated', 'obs_next'] + self._meta_keys}
                 info_list.append(info_dict)
             else:
-                # List-style info
                 info_list.append(buf.data['info'][start:end])
 
-        # Assign info to batch
         if is_dict_info:
-            # Convert list of dicts to dict of lists
             batch.info = {key: [d[key] for d in info_list] for key in info_list[0].keys()}
         else:
-            batch.info = info_list  # List of seq_len elements per sample
+            batch.info = info_list
 
-        # Convert other fields to tensors
+        # Convert to tensors with correct shape
         for key in batch.keys():
             if key != 'info':
                 val = batch[key]
-                if key in ['rew', 'done', 'terminated', 'truncated'] and val.ndim == 2:
-                    batch[key] = torch.as_tensor(val, device=train_device).view(batch_size, self.seq_len, 1)
+                expected_shape = self._get_shape(key)
+                if expected_shape:
+                    if key in ['rew', 'done', 'terminated', 'truncated']:
+                        # Scalar fields: [batch_size, seq_len] -> [batch_size, seq_len, 1]
+                        batch[key] = torch.as_tensor(val, device=train_device).view(batch_size, self.seq_len, 1)
+                    else:
+                        # Vector fields: [batch_size, seq_len, dim]
+                        batch[key] = torch.as_tensor(val, device=train_device).view(batch_size, self.seq_len, *expected_shape)
                 else:
-                    batch[key] = torch.as_tensor(val, device=train_device).view(batch_size, self.seq_len, *val.shape[1:])
+                    batch[key] = torch.as_tensor(val, device=train_device)
 
         return batch, indices
 
     def sample_indices(self, batch_size):
         valid_buffers = [i for i in range(self.buffer_num) if self.buffers[i]._reserved >= self.seq_len]
         if not valid_buffers:
+            print("invalid buffers", self.buffers[0]._reserved)
             return np.array([])
 
         total_sequences = sum((self.buffers[i]._reserved // self.seq_len) for i in valid_buffers)
         batch_size = min(batch_size, total_sequences)
         if batch_size <= 0:
+            print("batch_size < 0")
             return np.array([])
 
         indices = []
