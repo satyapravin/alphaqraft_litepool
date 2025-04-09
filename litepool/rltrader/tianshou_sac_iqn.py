@@ -135,7 +135,7 @@ if final_checkpoint_path.exists():
     policy.critic2_optim.load_state_dict(saved_model['critic2_optim_state_dict'])
     policy.alpha_optim.load_state_dict(saved_model['alpha_optim_state_dict'])
 
-    start_epoch = saved_model.get('epoch', 0)
+    start_epoch = 0
     print(f"Resumed from epoch {start_epoch}")
     print(f"Alpha value: {policy.get_alpha.item():.6f}")
 else:
@@ -210,7 +210,7 @@ trainer = OffpolicyTrainer(
     step_per_collect=600,
     episode_per_test=0,
     batch_size=64,
-    update_per_step=0.05,
+    update_per_step=0.5,
     train_fn=None,  
     test_fn=None,
     save_checkpoint_fn=save_checkpoint_fn,
@@ -229,9 +229,6 @@ torch.save({
     'critic1_optim_state_dict': policy.critic1_optim.state_dict(),
     'critic2_optim_state_dict': policy.critic2_optim.state_dict(),
     'alpha_optim_state_dict': policy.alpha_optim.state_dict(),
-    'epoch': result['epoch'],
-    'env_step': result['env_step'],
-    'gradient_step': result['gradient_step']
 }, final_checkpoint_path)
 
 buffer.save_hdf5(final_buffer_path)

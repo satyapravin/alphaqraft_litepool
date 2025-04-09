@@ -254,7 +254,7 @@ class CustomSACPolicy(SACPolicy):
         new_q = new_q_dist.mean(dim=1)  # Average over quantiles for stability
 
         # Stabilized losses
-        alpha_loss = -(self.log_alpha.clamp(-10, 10) * (log_prob.detach() + self.target_entropy)).mean()
+        alpha_loss = -(self.log_alpha * (log_prob.detach() + self.target_entropy)).mean()
         critic_loss = (quantile_huber_loss(current_q1, flat_target, taus, taus, kappa=1.0) +
                        quantile_huber_loss(current_q2, flat_target, taus, taus, kappa=1.0))
         actor_loss = (self.get_alpha.detach() * log_prob - new_q).mean()
@@ -274,6 +274,7 @@ class CustomSACPolicy(SACPolicy):
         self.alpha_optim.zero_grad()
 
         total_loss.backward()
+        alpha_loss.backward()
 
         self.critic1_optim.step()
         self.critic2_optim.step()

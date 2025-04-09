@@ -47,8 +47,8 @@ class RecurrentActor(nn.Module):
         self.mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Linear(hidden_dim, action_dim)
 
-        self.log_std.weight.data.uniform_(-1, 0)
-        self.log_std.bias.data.uniform_(-1, 0)
+        self.log_std.weight.data.uniform_(-1, 1)
+        self.log_std.bias.data.uniform_(-1, 1)
 
     def forward(self, obs, state=None):
         if isinstance(obs, Batch):

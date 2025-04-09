@@ -35,50 +35,34 @@ class SequentialReplayBuffer(VectorReplayBuffer):
         for buf_idx in buffer_ids:
             buf = self.buffers[buf_idx]
             idx = buf._index % self._size
-            steps = min(self.seq_len, buf.max_size - buf._reserved)
+            steps = self.seq_len  # Always write a full sequence
 
-            if steps <= 0:
-                print(f"Warning: steps={steps}, skipping add for buffer {buf_idx}")
-                continue
+            # Store vectorized data (overwriting if necessary)
+            for key in ['obs', 'act', 'rew', 'done', 'terminated', 'truncated', 'obs_next']:
+                data = batch[key][buf_idx][:steps]
+                buf.data[key][idx, :steps] = data
 
-            try:
-                # Store vectorized data
-                for key in ['obs', 'act', 'rew', 'done', 'terminated', 'truncated', 'obs_next']:
+            # Store hidden states
+            for key in self._meta_keys:
+                if key in batch and batch[key] is not None:
                     data = batch[key][buf_idx][:steps]
                     buf.data[key][idx, :steps] = data
 
-                # Store hidden states
-                for key in self._meta_keys:
-                    if key in batch and batch[key] is not None:
-                        data = batch[key][buf_idx][:steps]
-                        buf.data[key][idx, :steps] = data
+            # Handle info (simplified for brevity)
+            start_idx = idx * self.seq_len
+            end_idx = start_idx + steps
+            if isinstance(batch.info, dict):
+                for k, v in batch.info.items():
+                    if k not in buf.data:
+                        buf.data[k] = [None] * (self._size * self.seq_len)
+                    buf.data[k][start_idx:end_idx] = v[buf_idx][:steps]
 
-                # Handle info
-                start_idx = idx * self.seq_len
-                end_idx = start_idx + steps
-                if isinstance(batch.info, dict):
-                    for k in batch.info.keys():
-                        if k not in buf.data:
-                            buf.data[k] = [None] * (self._size * self.seq_len)
-                    for k, v in batch.info.items():
-                        data = v[buf_idx][:steps]
-                        buf.data[k][start_idx:end_idx] = data
-                else:
-                    if 'info' not in buf.data:
-                        buf.data['info'] = [None] * (self._size * self_seq_len)
-                    buf.data['info'][start_idx:end_idx] = batch.info[buf_idx][:steps]
-
-                # Update pointers
-                old_reserved = buf._reserved
-                buf._index += 1
-                buf._reserved = min(buf._reserved + steps, buf.max_size)
-
-                ep_rew = batch.rew[buf_idx].sum()
-                ep_len = steps
-                ptrs.append((idx, ep_rew, ep_len, buf_idx))
-            except Exception as e:
-                print(f"Error in buffer {buf_idx}: {e}")
-                raise
+            # Update pointers
+            buf._index += 1
+            buf._reserved = min(buf._reserved + steps, buf.max_size)  # Still caps _reserved, but allows overwriting
+            ep_rew = batch.rew[buf_idx].sum()
+            ep_len = steps
+            ptrs.append((idx, ep_rew, ep_len, buf_idx))
 
         return ptrs
 
