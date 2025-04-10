@@ -25,7 +25,7 @@ env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
     num_threads=num_of_envs, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
-    maker_fee=0.0000, taker_fee=0.0005, foldername="./train_files/",
+    maker_fee=-0.0001, taker_fee=0.0005, foldername="./train_files/",
     balance=1.0, start=3601 * 10, max=7200 * 10
 )
 
@@ -150,7 +150,7 @@ if final_buffer_path.exists():
         print(f"Loaded buffer config: {buffer_config}")
     else:
         buffer_config = {
-            'buffer_num': num_of_envs * 6000,  # Total buffer size
+            'buffer_num': num_of_envs * 60000,  # Total buffer size
             'seq_len': 60,              # Sequence length
             'num_envs': num_of_envs,     # Number of environments
             'device': str(device)        # Device as string for serialization
@@ -182,7 +182,7 @@ if final_buffer_path.exists():
 else:
     print(f"No buffer found at {final_buffer_path}, creating new sequential buffer")
     buffer = SequentialReplayBuffer(
-        total_size=num_of_envs * 6000,  # Total buffer size (e.g., 64 envs × 6000 steps)
+        total_size=num_of_envs * 60000,  # Total buffer size (e.g., 64 envs × 60000 steps)
         seq_len=60,                   # Length of sequences to sample
         buffer_num=num_of_envs,        # Match your environment count
         device="cpu"
@@ -210,7 +210,7 @@ trainer = OffpolicyTrainer(
     step_per_collect=600,
     episode_per_test=0,
     batch_size=64,
-    update_per_step=0.5,
+    update_per_step=0.05,
     train_fn=None,  
     test_fn=None,
     save_checkpoint_fn=save_checkpoint_fn,

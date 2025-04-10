@@ -40,21 +40,23 @@ def quantile_huber_loss(prediction, target, taus_predicted, taus_target, kappa=1
 
 def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, n_step=60, num_quantiles=32, chunk_size=16):
     batch_size = len(batch)
-    rewards = batch.rew.squeeze(-1)
-    dones = batch.done.squeeze(-1)
+    rewards = batch.rew.squeeze(-1)  # [batch_size, n_step]
+    dones = batch.done.squeeze(-1)  # [batch_size, n_step]
     
     actor_state = batch.get('state', None)
     critic1_state = batch.get('state_h1', None)
     critic2_state = batch.get('state_h2', None)
     
-    discount_factors = gamma ** torch.arange(n_step, device=device)
-    mask = 1 - dones.cumsum(dim=1).clamp(0, 1).float()
-    cumulative_rewards = (rewards * discount_factors.unsqueeze(0) * mask).sum(dim=1)
+    # Total sum of rewards over n_step for each sequence
+    total_rewards = rewards.sum(dim=1)  # [batch_size]
+    # Expand to all steps in the sequence
+    uniform_rewards = total_rewards.unsqueeze(1).expand(-1, n_step)  # [batch_size, n_step]
     
     with torch.no_grad():
-        obs_next = batch.obs_next
-        flat_obs = obs_next.reshape(batch_size * n_step, -1)
+        obs_next = batch.obs_next  # [batch_size, n_step, 2420]
+        flat_obs = obs_next.reshape(batch_size * n_step, -1)  # [batch_size * n_step, 2420]
         
+        # Actor forward pass
         actor_state = actor_state.transpose(0, 1).reshape(actor.num_layers, -1, actor.gru_hidden_dim).contiguous()
         loc, scale, _, _ = actor(flat_obs, state=actor_state)
         dist = Independent(Normal(loc, scale), 1)
@@ -64,24 +66,28 @@ def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, 
         correction = torch.log(1 - actions.pow(2) + 1e-6).sum(dim=-1)
         log_prob = raw_log_prob - correction
         
-        actions = actions.reshape(batch_size, n_step, -1)
-        log_prob = log_prob.reshape(batch_size, n_step)
+        actions = actions.reshape(batch_size, n_step, -1)  # [batch_size, n_step, 3]
+        log_prob = log_prob.reshape(batch_size, n_step)   # [batch_size, n_step]
         
-        flat_actions = actions.reshape(batch_size * n_step, -1)
-        taus = torch.rand(batch_size * n_step, num_quantiles, device=device)
+        flat_actions = actions.reshape(batch_size * n_step, -1)  # [batch_size * n_step, 3]
+        taus = torch.rand(batch_size * n_step, num_quantiles, device=device)  # [batch_size * n_step, 32]
         
+        # Critic forward pass
         critic1_state = critic1_state.transpose(0, 1).reshape(critic1.num_layers, -1, critic1.gru_hidden_dim).contiguous()
         critic2_state = critic2_state.transpose(0, 1).reshape(critic2.num_layers, -1, critic2.gru_hidden_dim).contiguous()
-            
-        q1, _ = critic1(flat_obs, flat_actions, taus, state_h=critic1_state)
-        q2, _ = critic2(flat_obs, flat_actions, taus, state_h=critic2_state)
-        q = torch.min(q1, q2).reshape(batch_size, n_step, num_quantiles)
         
-        target_q = q - alpha * log_prob.unsqueeze(-1)
+        q1, _ = critic1(flat_obs, flat_actions, taus, state_h=critic1_state)  # [batch_size * n_step, 32]
+        q2, _ = critic2(flat_obs, flat_actions, taus, state_h=critic2_state)  # [batch_size * n_step, 32]
+        q = torch.min(q1, q2).reshape(batch_size, n_step, num_quantiles)  # [batch_size, n_step, 32]
+        
+        target_q = q - alpha * log_prob.unsqueeze(-1)  # [batch_size, n_step, 32]
     
-    not_done = 1 - dones.any(dim=1).float().view(batch_size, 1, 1)
-    final_targets = cumulative_rewards.unsqueeze(1).unsqueeze(2) + not_done * (gamma ** n_step) * target_q
+    # Check if episode ended within n_step
+    not_done = 1 - dones.any(dim=1).float().view(batch_size, 1, 1)  # [batch_size, 1, 1]
+    # Assign total reward to each step, add bootstrapped Q only if not done
+    final_targets = uniform_rewards.unsqueeze(-1) + not_done * (gamma ** n_step) * target_q  # [batch_size, n_step, 32]
     
+    # Debug output
     print("\n=== compute_n_step_return Debug ===")
     print(f"Actor Loc Mean: {loc.mean().item():.4f}, Min: {loc.min().item():.4f}, Max: {loc.max().item():.4f}")
     print(f"Actor Scale Mean: {scale.mean().item():.4f}, Min: {scale.min().item():.4f}, Max: {scale.max().item():.4f}")
@@ -92,7 +98,7 @@ def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, 
     print(f"Final Targets Mean: {final_targets.mean().item():.4f}, Min: {final_targets.min().item():.4f}, Max: {final_targets.max().item():.4f}")
     print("="*35 + "\n")
     
-    return final_targets.reshape(batch_size * n_step, num_quantiles)
+    return final_targets.reshape(batch_size * n_step, num_quantiles)  # [batch_size * n_step, 32]
 
 @dataclass
 class SACSummary:
