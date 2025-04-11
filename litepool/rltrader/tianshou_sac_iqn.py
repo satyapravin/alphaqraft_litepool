@@ -146,13 +146,19 @@ if final_buffer_path.exists():
 
     if metadata_path.exists():
         metadata = torch.load(metadata_path)
-        buffer_config = metadata['config']
+        print(metadata)
+        buffer_config = {
+            'total_size': metadata['total_size'],
+            'seq_len': metadata['seq_len'],
+            'buffer_num': metadata['buffer_num'],
+            'device': metadata['device']
+        }
         print(f"Loaded buffer config: {buffer_config}")
     else:
         buffer_config = {
-            'buffer_num': num_of_envs * 60000,  # Total buffer size
+            'total_size': num_of_envs * 600,  # Total buffer size
             'seq_len': 60,              # Sequence length
-            'num_envs': num_of_envs,     # Number of environments
+            'buffer_num': num_of_envs,     # Number of environments
             'device': str(device)        # Device as string for serialization
         }
 
@@ -168,21 +174,21 @@ if final_buffer_path.exists():
     temp_buffer = VectorReplayBuffer.load_hdf5(final_buffer_path)
     
     # Transfer data to our sequential buffer
-    buffer._meta = temp_buffer._meta
-    buffer._index = temp_buffer._index
-    buffer._size = temp_buffer._size
+    #buffer._meta = temp_buffer._meta
+    #buffer._index = temp_buffer._index
+    #buffer._size = temp_buffer._size
     
     # Verify segment size matches
-    expected_segment = buffer_config['total_size'] // buffer_config['buffer_num']
-    if buffer.env_segment_size != expected_segment:
-        print(f"Adjusting env_segment_size from {buffer.env_segment_size} to {expected_segment}")
-        buffer.env_segment_size = expected_segment
+    #expected_segment = buffer_config['total_size'] // buffer_config['buffer_num']
+    #if buffer.env_segment_size != expected_segment:
+    #    print(f"Adjusting env_segment_size from {buffer.env_segment_size} to {expected_segment}")
+    #    buffer.env_segment_size = expected_segment
 
-    print(f"Buffer loaded with {len(buffer)} transitions (max sequence length: {buffer.seq_len})")
+    #print(f"Buffer loaded with {len(buffer)} transitions (max sequence length: {buffer.seq_len})")
 else:
     print(f"No buffer found at {final_buffer_path}, creating new sequential buffer")
     buffer = SequentialReplayBuffer(
-        total_size=num_of_envs * 60000,  # Total buffer size (e.g., 64 envs × 60000 steps)
+        total_size=num_of_envs * 600,  # Total buffer size (e.g., 64 envs × 60000 steps)
         seq_len=60,                   # Length of sequences to sample
         buffer_num=num_of_envs,        # Match your environment count
         device="cpu"
@@ -234,7 +240,7 @@ torch.save({
 buffer.save_hdf5(final_buffer_path)
 torch.save({
     'buffer_type': 'StackedVectorReplayBuffer',
-    'total_size': num_of_envs * 900,
+    'total_size': num_of_envs * 600,
     'buffer_num': num_of_envs,
     'seq_len': 60,
     'device': 'cpu'
