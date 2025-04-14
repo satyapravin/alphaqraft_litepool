@@ -23,7 +23,7 @@ void Strategy::reset() {
 	this->exchange.reset();
 	double initQty = 0;
 	double avgPrice = 0;
-	this->exchange.fetchPosition(initQty, avgPrice);
+	this->exchange.fetchPosition(initQty, avgPrice, false);
         std::cout << "initial quantity=" << initQty << std::endl;
         std::cout << "initial price=" << avgPrice << std::endl;
 	this->position.reset(initQty, avgPrice);
@@ -42,12 +42,51 @@ void Strategy::quote(const double& bid_spread,
 	auto posInfo = position.getPositionInfo(bid_prices[0], ask_prices[0]);
 	auto leverage = posInfo.leverage;
         auto initBalance = position.getInitialBalance();
-	auto mid_price = (bid_prices[1] + ask_prices[1]) * 0.5;
+        	
+	auto mid_price = (bid_prices[2] + ask_prices[2]) * 0.5;
+	
 	auto q_range = (quote_range + 1) / 20000;
         auto bid_price = mid_price * (1 - q_range * (bid_spread + 1.0));
         auto ask_price = mid_price * (1 + q_range * (ask_spread + 1.0));
 
-        auto bid_price_0 = std::floor(bid_price / tick_size) * tick_size;
+	if (std::abs(leverage) > 0.5) {
+	    auto skew = leverage * 10 * tick_size;
+            bid_price -= skew;
+            ask_price -= skew;	
+        } 
+
+	double spot_position = 0;
+	double spot_avg_price = 0;
+
+	this->exchange.fetchPosition(spot_position, spot_avg_price, true);
+        double spotLeverage = spot_position / initBalance / mid_price;
+
+	if (std::isnan(spotLeverage) || std::isinf(spotLeverage)) return; // safety check
+									    
+	double diffLeverage = spotLeverage + leverage;
+	std::cout << "Hedge position: " <<  spot_position 
+		  << "\t Hedge leverage: " << spotLeverage 
+		  << "\t Diff leverage: " << diffLeverage << std::endl;
+
+
+	if (!exchange.isDummy() && std::abs(diffLeverage) >= 0.05) {
+	    double new_spot = 0;
+	    this->exchange.cancelOrders();
+	    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	    this->exchange.fetchPosition(new_spot, spot_avg_price, true);
+
+	    if (std::abs(new_spot - spot_position) > 0.5) return;
+
+	    auto spotSize = std::abs(diffLeverage) * initBalance;
+            auto spotSide = diffLeverage > 0 ? OrderSide::SELL : OrderSide::BUY;
+	    auto hedge_price = std::floor(mid_price / 2.5) * 2.5;
+	    auto amount = instrument.getTradeAmount(spotSize, hedge_price);
+	    std::cout << "New hedging leverage= " << std::abs(diffLeverage) << "\t side= "  << spotSide 
+		      << "\t price= " << hedge_price << "\t size= " << amount << std::endl;
+	    this->exchange.market(std::to_string(++order_id), spotSide, hedge_price, amount, true); 
+	}
+
+	auto bid_price_0 = std::floor(bid_price / tick_size) * tick_size;
 	auto ask_price_0 = std::ceil(ask_price / tick_size) * tick_size;
 
 	if (bid_price > bid_prices[0]) bid_price = bid_prices[0];
@@ -56,16 +95,13 @@ void Strategy::quote(const double& bid_spread,
         auto bid_size_0 = 0.01 * initBalance;
         auto ask_size_0 = 0.01 * initBalance;
 
-	if (leverage > 0.5) bid_size_0 = 0;
-	if (leverage < -0.5) ask_size_0 = 0;
+	if (leverage > 2.5) bid_size_0 = 0;
+	if (leverage < -2.5) ask_size_0 = 0;
 	
-	// if (exchange.isDummy()) exchange.cancelOrders();
+
         exchange.cancelOrders();
-	//std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        //std::cout << bid_price << "\t" << ask_price << "\t" << bid_size << "\t" << ask_size << std::endl;
-
-
-	for (int ii=0; ii < 5; ++ii) {
+	
+	for (int ii=0; ii < 3; ++ii) {
 	    bid_price = bid_price_0 - 8 * tick_size * ii;
 	    ask_price = ask_price_0 + 8 * tick_size * ii;
 	    auto bid_size = instrument.getTradeAmount(bid_size_0 * (1 + 0.2 * ii), bid_price_0);

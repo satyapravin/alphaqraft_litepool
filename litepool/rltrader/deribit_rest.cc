@@ -169,7 +169,6 @@ std::string get_bearer_token(const std::string& client_id, const std::string& cl
         };
 
         std::string response = send_post_request("/api/v2/public/auth", auth_json.dump());
-        std::cout << "API Auth Response: " << response << std::endl;
 
         if (response.empty()) {
             throw std::runtime_error("Empty response received from server");
@@ -193,10 +192,9 @@ void DeribitREST::fetch_position(const std::string& symbol, double& amount, doub
         if (bearer_token.empty()) {
             throw std::runtime_error("Failed to obtain bearer token");
         }
-
+       
         std::string query = "/api/v2/private/get_position?instrument_name=" + symbol;
         std::string response = send_get_request(query, bearer_token);
-        std::cout << "Position API Response for " << symbol << ": " << response << std::endl;
 
         if (response.empty()) {
             throw std::runtime_error("Empty response from server");

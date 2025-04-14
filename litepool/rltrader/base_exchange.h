@@ -23,7 +23,7 @@ namespace RLTrader {
         virtual void toBook(const std::unordered_map<std::string, double>& lob, OrderBook &book) = 0;
 
         // fetches the current position from exchange
-        virtual void fetchPosition(double& posAmount, double& avgPrice) = 0;
+        virtual void fetchPosition(double& posAmount, double& avgPrice, bool is_hedge) = 0;
 
         // Returns executed orders and clears them
         virtual std::vector<Order> getFills() = 0;
@@ -41,6 +41,6 @@ namespace RLTrader {
 
         virtual void quote(std::string order_id, OrderSide side, const double& price, const double& amount) = 0;
 
-        virtual void market(std::string order_id, OrderSide side, const double& price, const double& amount) = 0;
+        virtual void market(std::string order_id, OrderSide side, const double& price, const double& amount, bool hedge) = 0;
     };
 }

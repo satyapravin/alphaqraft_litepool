@@ -10,7 +10,7 @@ namespace RLTrader {
     class DeribitExchange final : public BaseExchange {
     public:
         // Constructor
-        DeribitExchange(const std::string& symbol, const std::string& api_key, const std::string& api_secret);
+        DeribitExchange(const std::string& symbol, const std::string& hedge_symbol, const std::string& api_key, const std::string& api_secret);
 
         // Generates an OrderBook
         void toBook(const std::unordered_map<std::string, double>& lob, OrderBook &book) override;
@@ -26,7 +26,7 @@ namespace RLTrader {
         void done_read(size_t slot) override { this->book_buffer.commit_read(slot); }
 
         // fetch dummy zero positions
-        void fetchPosition(double& posAmount, double& avgPrice) override;
+        void fetchPosition(double& posAmount, double& avgPrice, bool is_hedge) override;
 
         // Returns executed orders and clears them
         std::vector<Order> getFills() override;
@@ -48,7 +48,7 @@ namespace RLTrader {
 
         void quote(std::string order_id, OrderSide side, const double& price, const double& amount) override;
 
-        void market(std::string order_id, OrderSide side, const double& price, const double& amount) override;
+        void market(std::string order_id, OrderSide side, const double& price, const double& amount, bool is_hedge) override;
 
     private:
         void set_callbacks();
@@ -65,6 +65,7 @@ namespace RLTrader {
         double position_avg_price = 0;
         LockFreeOrderBookBuffer book_buffer;
         std::string symbol;
+        std::string hedge_symbol;
         std::mutex fill_mutex;
 	std::unordered_set<std::string> processed_trades;
         std::atomic<long> orders_count;

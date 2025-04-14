@@ -98,7 +98,7 @@ std::vector<Order> SimExchange::getUnackedOrders() const {
 	return retval;
 }
 
-void SimExchange::fetchPosition(double &posAmount, double &avgPrice) {
+void SimExchange::fetchPosition(double &posAmount, double &avgPrice, bool is_hedge) {
 	posAmount = 0;
 	avgPrice = 0;
 }
@@ -115,7 +115,7 @@ void SimExchange::quote(std::string order_id, OrderSide side, const double& pric
 	this->addToBuffer(order);
 }
 
-void SimExchange::market(std::string order_id, OrderSide side, const double &price, const double &amount) {
+void SimExchange::market(std::string order_id, OrderSide side, const double &price, const double &amount, bool is_hedge) {
 	Order order{};
 	order.is_taker = true;
 	order.microSecond = this->dataReader.getTimeStamp();

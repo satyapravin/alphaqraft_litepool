@@ -37,9 +37,10 @@ namespace RLTrader {
 
     class DeribitClient {
     public:
-        DeribitClient(std::string  api_key,
-                     std::string  api_secret,
-                     std::string  symbol);
+        DeribitClient(const std::string& api_key,
+                     const std::string& api_secret,
+                     const std::string& symbol,
+		     const std::string& hedge_symbol);
 
         ~DeribitClient();
 
@@ -56,6 +57,7 @@ namespace RLTrader {
                         double price,
                         double size,
                         const std::string& label,
+			bool is_hedge,
                         const std::string& type = "limit");
 
         void cancel_order(const std::string& order_id);
@@ -99,7 +101,7 @@ namespace RLTrader {
         std::string api_key_;
         std::string api_secret_;
         std::string symbol_;
-
+        std::string hedge_symbol_;
 
         std::unique_ptr<net::io_context> ioc_;
         std::unique_ptr<ssl::context> ctx_;

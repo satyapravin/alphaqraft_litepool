@@ -30,12 +30,14 @@ bool starts_with(const std::string& str, const std::string& prefix) {
     );
 }
 
-DeribitClient::DeribitClient(std::string  api_key,
-                           std::string  api_secret,
-                           std::string  symbol)
-    : api_key_(std::move(api_key))
-    , api_secret_(std::move(api_secret))
-    , symbol_(std::move(symbol)) {
+DeribitClient::DeribitClient(const std::string& api_key,
+                             const std::string& api_secret,
+                             const std::string& symbol,
+			     const std::string& hedge_symbol)
+    : api_key_(api_key)
+    , api_secret_(api_secret)
+    , symbol_(symbol) 
+    , hedge_symbol_(hedge_symbol) {
 }
 
 DeribitClient::~DeribitClient() {
@@ -264,7 +266,7 @@ void DeribitClient::subscribe_private_data() {
         {"method", "private/subscribe"},
         {"params", {
             {"channels", {
-                "user.trades." + symbol_ + ".raw",
+                "user.trades." + symbol_ + ".100ms",
                 "user.orders." + symbol_ + ".raw",
                 "user.portfolio." + symbol_
             }}
@@ -279,22 +281,24 @@ void DeribitClient::place_order(const std::string& side,
                               double price, 
                               double size,
                               const std::string& label,
+			      bool is_hedge,
                               const std::string& type) {
     if (!trading_connected_) {
 	    std::cout << "disconnected deribit markets!" << std::endl;
 	    return;
     }
     
+    bool post_only = !(type == "market"); 
     json order_msg = {
         {"jsonrpc", "2.0"},
         {"method", side == "buy" ? "private/buy" : "private/sell"},
         {"params", {
-            {"instrument_name", symbol_},
+            {"instrument_name", is_hedge ? hedge_symbol_ : symbol_},
             {"amount", size},
             {"type", type},
             {"price", price},
             {"label", label},
-            {"post_only", true}
+            {"post_only", post_only}
         }},
         {"id", 3}
     };
@@ -468,7 +472,7 @@ void DeribitClient::handle_trading_message(const json& msg) {
             std::cout << "Authentication successful" << std::endl;
             subscribe_private_data();
         }
-    }
+    } 
 }
 
 void DeribitClient::send_market_message(const json& msg) {

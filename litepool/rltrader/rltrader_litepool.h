@@ -45,6 +45,7 @@ class RlTraderEnvFns {
                     "api_secret"_.Bind(std::string("")),
                     "is_inverse_instr"_.Bind<bool>(true),
                     "symbol"_.Bind((std::string(""))),
+                    "hedge_symbol"_.Bind((std::string(""))),
                     "tick_size"_.Bind<double>(0.5),
                     "min_amount"_.Bind<double>(10.0),
                     "maker_fee"_.Bind<double>(-0.0001),
@@ -89,6 +90,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   std::string api_key;
   std::string api_secret;
   std::string symbol;
+  std::string hedge_symbol;
   double tick_size;
   double min_amount;
   double maker_fee;
@@ -111,6 +113,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
                                               api_key(spec.config["api_key"_]),
                                               api_secret(spec.config["api_secret"_]),
                                               symbol(spec.config["symbol"_]),
+                                              hedge_symbol(spec.config["hedge_symbol"_]),
                                               tick_size(spec.config["tick_size"_]),
                                               min_amount(spec.config["min_amount"_]),
                                               maker_fee(spec.config["maker_fee"_]),
@@ -133,7 +136,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
 
 
     if (this->is_prod) {
-      exch_raw_ptr = new RLTrader::DeribitExchange(symbol, api_key, api_secret);
+      exch_raw_ptr = new RLTrader::DeribitExchange(symbol, hedge_symbol, api_key, api_secret);
     } else {
       int idx = env_id % 64;
       std::string filename = foldername + std::to_string(idx + 1) + ".csv";

@@ -2,12 +2,22 @@
 #include <thread>
 #include <chrono>
 #include <iostream>
+#include <algorithm>
+#include <cctype>
 
 using namespace RLTrader;
 
+bool caseInsensitiveCompare(const std::string& a, const std::string& b) {
+    return a.size() == b.size() && 
+           std::equal(a.begin(), a.end(), b.begin(),
+               [](char a, char b) {
+                   return std::tolower(a) == std::tolower(b);
+               });
+}
 
-DeribitExchange::DeribitExchange(const std::string& symbol, const std::string& api_key, const std::string& api_secret)
-    :db_client(api_key, api_secret, symbol), symbol(symbol), orders_count(0), RESTApi(api_key, api_secret)
+
+DeribitExchange::DeribitExchange(const std::string& symbol, const std::string& hedge_symbol, const std::string& api_key, const std::string& api_secret)
+    :db_client(api_key, api_secret, symbol, hedge_symbol), symbol(symbol), hedge_symbol(hedge_symbol), orders_count(0), RESTApi(api_key, api_secret)
 {
 }
 
@@ -31,21 +41,26 @@ void DeribitExchange::set_callbacks() {
 }
 
 void DeribitExchange::handle_private_trade_updates (const json& json_array) {
-    const auto& data = json_array[0];
-    if (data["instrument_name"] == this->symbol) {
-        Order order;
-        order.amount = data["amount"];
-        order.is_taker = false;
-        order.price = data["price"];
-        order.side = data["direction"] == "buy" ? OrderSide::BUY : OrderSide::SELL;
-        order.state = OrderState::FILLED;
-        order.orderId = data["order_id"];
-        order.microSecond = data["timestamp"];
-        std::lock_guard<std::mutex> lock(this->fill_mutex);
-	if (processed_trades.find(order.orderId) == processed_trades.end()) {
-	    std::cout << order.amount << std::endl;
-	    processed_trades.insert(order.orderId);
-            this->executions.push_back(order);
+    for (auto ii=0; ii < json_array.size(); ++ii) {
+        const auto& data = json_array[ii];
+        if (data["instrument_name"] == this->symbol) {
+            Order order;
+            order.amount = data["amount"];
+            order.is_taker = !data["post_only"];
+            order.price = data["price"];
+            order.side = caseInsensitiveCompare(data["direction"], "buy")  ? OrderSide::BUY : OrderSide::SELL;
+            order.state = OrderState::FILLED;
+            order.orderId = data["order_id"];
+            order.microSecond = data["timestamp"];
+            std::string trade_id = data["trade_id"];
+            std::cout << data["amount"] << "\t" << data["direction"] << "\t" << data["trade_id"] << std::endl;
+            std::lock_guard<std::mutex> lock(this->fill_mutex);
+            if (processed_trades.find(trade_id) == processed_trades.end()) {
+    	        processed_trades.insert(trade_id);
+                this->executions.push_back(order);
+            }
+        } else {
+	    std::cout << "invalid instrument: " << data["instrument_name"] << std::endl;
 	}
     }
 }
@@ -94,8 +109,11 @@ bool DeribitExchange::next_read(size_t& slot, OrderBook& book) {
     return true;
 }
 
-void DeribitExchange::fetchPosition(double &posAmount, double &avgPrice) {
-    RESTApi.fetch_position(symbol, posAmount, avgPrice);
+void DeribitExchange::fetchPosition(double &posAmount, double &avgPrice, bool is_hedge) {
+    if (is_hedge) 
+        RESTApi.fetch_position(hedge_symbol, posAmount, avgPrice);
+    else
+        RESTApi.fetch_position(symbol, posAmount, avgPrice);
 }
 
 void DeribitExchange::cancelOrders() {
@@ -118,11 +136,11 @@ void DeribitExchange::quote(std::string order_id, OrderSide side, const double& 
     std::string sidestr = side == OrderSide::BUY ? "buy" : "sell";
     //this->db_client.cancel_all_by_label(sidestr);
     //std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    this->db_client.place_order(sidestr, price, amount, sidestr, "limit");
+    this->db_client.place_order(sidestr, price, amount, sidestr, false, "limit");
 }
 
-void DeribitExchange::market(std::string order_id, OrderSide side, const double& price, const double& amount) {
+void DeribitExchange::market(std::string order_id, OrderSide side, const double& price, const double& amount, bool is_hedge) {
     std::string sidestr = side == OrderSide::BUY ? "buy" : "sell";
-    this->db_client.place_order(sidestr, price, amount, sidestr, "market");
+    this->db_client.place_order(sidestr, price, amount, sidestr, is_hedge, "market");
 
 }

@@ -32,7 +32,7 @@ namespace RLTrader {
         void done_read(size_t slot) override;
 
         // fetch dummy zero positions
-        void fetchPosition(double& posAmount, double& avgPrice) override;
+        void fetchPosition(double& posAmount, double& avgPrice, bool is_hedge) override;
 
 
         // Returns executed orders and clears them
@@ -49,7 +49,7 @@ namespace RLTrader {
 
          void quote(std::string order_id, OrderSide side, const double& price, const double& amount) override;
 
-         void market(std::string order_id, OrderSide side, const double& price, const double& amount) override;
+         void market(std::string order_id, OrderSide side, const double& price, const double& amount, bool hedge) override;
 
     private:
         CsvReader dataReader; // reader
