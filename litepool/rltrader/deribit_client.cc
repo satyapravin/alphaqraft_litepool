@@ -10,7 +10,7 @@
 #include <boost/beast/ssl.hpp>
 #include <nlohmann/json.hpp>
 
-using namespace RLTrader;
+namespace RLTrader {
 
 char to_lower(char c) {
     return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -20,7 +20,6 @@ bool starts_with(const std::string& str, const std::string& prefix) {
     if (str.size() < prefix.size()) {
         return false;
     }
-
     return std::equal(
         prefix.begin(), prefix.end(),
         str.begin(),
@@ -30,14 +29,16 @@ bool starts_with(const std::string& str, const std::string& prefix) {
     );
 }
 
-DeribitClient::DeribitClient(const std::string& api_key,
-                             const std::string& api_secret,
-                             const std::string& symbol,
-			     const std::string& hedge_symbol)
-    : api_key_(api_key)
-    , api_secret_(api_secret)
-    , symbol_(symbol) 
-    , hedge_symbol_(hedge_symbol) {
+DeribitClient::DeribitClient(std::string api_key,
+                             std::string api_secret,
+                             std::string symbol,
+			     std::string hedge_symbol)
+    : api_key_(std::move(api_key)),
+      api_secret_(std::move(api_secret)),
+      symbol_(std::move(symbol)),
+      hedge_symbol_(std::move(hedge_symbol)),
+      market_read_queue_(),
+      trading_read_queue_() {
 }
 
 DeribitClient::~DeribitClient() {
@@ -48,7 +49,8 @@ void DeribitClient::start() {
     if (should_run_) return;
     
     should_run_ = true;
-    ioc_ = std::make_unique<net::io_context>();
+    market_ioc_ = std::make_unique<net::io_context>();
+    trading_ioc_ = std::make_unique<net::io_context>();
     ctx_ = std::make_unique<ssl::context>(ssl::context::tlsv12_client);
     
     ctx_->set_verify_mode(ssl::verify_peer);
@@ -56,7 +58,9 @@ void DeribitClient::start() {
 
     setup_connections();
     
-    io_thread_ = std::make_unique<std::thread>([this] { run_io_context(); });
+    market_thread_ = std::make_unique<std::thread>([this] { market_ioc_->run(); });
+    trading_thread_ = std::make_unique<std::thread>([this] { trading_ioc_->run(); });
+    start_heartbeat();
 }
 
 void DeribitClient::stop() {
@@ -64,7 +68,6 @@ void DeribitClient::stop() {
     
     should_run_ = false;
 
-    // Clear message queues
     {
         std::lock_guard<std::mutex> market_lock(market_write_mutex_);
         std::queue<json>().swap(market_message_queue_);
@@ -73,50 +76,41 @@ void DeribitClient::stop() {
         std::lock_guard<std::mutex> trading_lock(trading_write_mutex_);
         std::queue<json>().swap(trading_message_queue_);
     }
+    {
+        std::lock_guard<std::mutex> market_lock(market_read_mutex_);
+        std::queue<std::string>().swap(market_read_queue_);
+    }
+    {
+        std::lock_guard<std::mutex> trading_lock(trading_read_mutex_);
+        std::queue<std::string>().swap(trading_read_queue_);
+    }
 
     if (trading_connected_) {
         cancel_all_orders();
     }
 
-    if (ioc_) {
-        ioc_->stop();
-    }
+    if (market_ioc_) market_ioc_->stop();
+    if (trading_ioc_) trading_ioc_->stop();
     
-    if (io_thread_ && io_thread_->joinable()) {
-        io_thread_->join();
+    if (market_thread_ && market_thread_->joinable()) {
+        market_thread_->join();
+    }
+    if (trading_thread_ && trading_thread_->joinable()) {
+        trading_thread_->join();
     }
 
     {
         std::lock_guard<std::mutex> market_lock(market_write_mutex_);
         market_ws_.reset();
     }
-
     {
         std::lock_guard<std::mutex> trading_lock(trading_write_mutex_);
         trading_ws_.reset();
     }
 
-    ioc_.reset();
+    market_ioc_.reset();
+    trading_ioc_.reset();
     ctx_.reset();
-}
-
-void DeribitClient::run_io_context() {
-    while (should_run_) {
-        try {
-            ioc_->run();
-            if (!should_run_) break;
-            
-            ioc_->restart();
-            
-            if (!market_connected_ || !trading_connected_) {
-                setup_connections();
-            }
-        }
-        catch (const std::exception& e) {
-            std::cerr << "IO context error: " << e.what() << std::endl;
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-    }
 }
 
 void DeribitClient::setup_connections() {
@@ -125,12 +119,12 @@ void DeribitClient::setup_connections() {
 }
 
 void DeribitClient::setup_market_connection() {
-    market_ws_ = std::make_unique<websocket::stream<beast::ssl_stream<tcp::socket>>>(*ioc_, *ctx_);
+    market_ws_ = std::make_unique<websocket::stream<beast::ssl_stream<tcp::socket>>>(*market_ioc_, *ctx_);
     do_market_connect();
 }
 
 void DeribitClient::setup_trading_connection() {
-    trading_ws_ = std::make_unique<websocket::stream<beast::ssl_stream<tcp::socket>>>(*ioc_, *ctx_);
+    trading_ws_ = std::make_unique<websocket::stream<beast::ssl_stream<tcp::socket>>>(*trading_ioc_, *ctx_);
     do_trading_connect();
 }
 
@@ -138,10 +132,9 @@ void DeribitClient::do_market_connect() {
     auto const host = "www.deribit.com";
     auto const port = "443";
 
-    tcp::resolver resolver(*ioc_);
+    tcp::resolver resolver(*market_ioc_);
     auto const results = resolver.resolve(host, port);
 
-    // Get the lowest layer (TCP socket) for connection
     auto& lowest_layer = beast::get_lowest_layer(*market_ws_);
 
     net::async_connect(
@@ -153,7 +146,6 @@ void DeribitClient::do_market_connect() {
                 return;
             }
 
-            // SSL Handshake
             market_ws_->next_layer().async_handshake(
                 ssl::stream_base::client,
                 [this](const beast::error_code& ec) {
@@ -162,7 +154,6 @@ void DeribitClient::do_market_connect() {
                         return;
                     }
 
-                    // WebSocket Handshake
                     market_ws_->async_handshake(
                         "www.deribit.com",
                         "/ws/api/v2",
@@ -184,10 +175,9 @@ void DeribitClient::do_trading_connect() {
     auto const host = "www.deribit.com";
     auto const port = "443";
 
-    tcp::resolver resolver(*ioc_);
+    tcp::resolver resolver(*trading_ioc_);
     auto const results = resolver.resolve(host, port);
 
-    // Get the lowest layer (TCP socket) for connection
     auto& lowest_layer = beast::get_lowest_layer(*trading_ws_);
 
     net::async_connect(
@@ -199,7 +189,6 @@ void DeribitClient::do_trading_connect() {
                 return;
             }
 
-            // SSL Handshake
             trading_ws_->next_layer().async_handshake(
                 ssl::stream_base::client,
                 [this](const beast::error_code& ec) {
@@ -208,7 +197,6 @@ void DeribitClient::do_trading_connect() {
                         return;
                     }
 
-                    // WebSocket Handshake
                     trading_ws_->async_handshake(
                         "www.deribit.com",
                         "/ws/api/v2",
@@ -224,6 +212,50 @@ void DeribitClient::do_trading_connect() {
                         });
                 });
         });
+}
+
+void DeribitClient::start_heartbeat() {
+    market_timer_ = std::make_unique<net::steady_timer>(*market_ioc_);
+    trading_timer_ = std::make_unique<net::steady_timer>(*trading_ioc_);
+    
+    json heartbeat_msg = {
+        {"jsonrpc", "2.0"},
+        {"method", "public/heartbeat"},
+        {"params", {{"type", "test_request"}}},
+        {"id", 999}
+    };
+
+    auto heartbeat = [this, heartbeat_msg](std::unique_ptr<net::steady_timer>& timer, bool is_market) {
+        timer->expires_after(std::chrono::seconds(10));
+        timer->async_wait([this, heartbeat_msg, &timer, is_market](const beast::error_code& ec) {
+            if (!ec && should_run_) {
+                if (is_market) {
+                    send_market_message(heartbeat_msg);
+                } else {
+                    send_trading_message(heartbeat_msg);
+                }
+                timer->expires_after(std::chrono::seconds(10));
+                timer->async_wait([this, heartbeat_msg, &timer, is_market](const beast::error_code& ec) {
+                    if (!ec && should_run_) {
+                        if (is_market) {
+                            send_market_message(heartbeat_msg);
+                        } else {
+                            send_trading_message(heartbeat_msg);
+                        }
+                        timer->expires_after(std::chrono::seconds(10));
+                        timer->async_wait(timer->get_executor(), timer->get_handler());
+                    }
+                });
+            }
+        });
+    };
+
+    if (market_connected_) {
+        heartbeat(market_timer_, true);
+    }
+    if (trading_connected_) {
+        heartbeat(trading_timer_, false);
+    }
 }
 
 void DeribitClient::authenticate() {
@@ -266,7 +298,7 @@ void DeribitClient::subscribe_private_data() {
         {"method", "private/subscribe"},
         {"params", {
             {"channels", {
-                "user.trades." + symbol_ + ".100ms",
+                "user.trades." + symbol_ + ".raw",
                 "user.orders." + symbol_ + ".raw",
                 "user.portfolio." + symbol_
             }}
@@ -278,17 +310,16 @@ void DeribitClient::subscribe_private_data() {
 }
 
 void DeribitClient::place_order(const std::string& side, 
-                              double price, 
-                              double size,
-                              const std::string& label,
-			      bool is_hedge,
-                              const std::string& type) {
+                                double price, 
+                                double size,
+                                const std::string& label,
+				bool is_hedge,
+                                const std::string& type) {
     if (!trading_connected_) {
-	    std::cout << "disconnected deribit markets!" << std::endl;
-	    return;
+        std::cout << "Disconnected from Deribit trading!" << std::endl;
+        return;
     }
     
-    bool post_only = !(type == "market"); 
     json order_msg = {
         {"jsonrpc", "2.0"},
         {"method", side == "buy" ? "private/buy" : "private/sell"},
@@ -298,7 +329,7 @@ void DeribitClient::place_order(const std::string& side,
             {"type", type},
             {"price", price},
             {"label", label},
-            {"post_only", post_only}
+            {"post_only", type == "limit" ? true : false}
         }},
         {"id", 3}
     };
@@ -328,13 +359,14 @@ void DeribitClient::cancel_all_by_label(const std::string& label) {
         {"jsonrpc", "2.0"},
         {"method", "private/cancel_by_label"},
         {"params", {
-                {"label", label}
+            {"label", label}
         }},
         {"id", 7}
     };
 
     send_trading_message(cancel_by_label_msg);
 }
+
 void DeribitClient::cancel_all_orders() {
     if (!trading_connected_) return;
     
@@ -397,12 +429,11 @@ void DeribitClient::do_market_read() {
             std::string msg = beast::buffers_to_string(market_buffer_.data());
             market_buffer_.consume(market_buffer_.size());
             
-            try {
-                auto j = json::parse(msg);
-                handle_market_message(j);
-            } catch (const std::exception& e) {
-                std::cerr << "Market parse error: " << e.what() << std::endl;
+            {
+                std::lock_guard<std::mutex> lock(market_read_mutex_);
+                market_read_queue_.push(msg);
             }
+            process_market_read_queue();
             
             if (should_run_) {
                 do_market_read();
@@ -422,17 +453,44 @@ void DeribitClient::do_trading_read() {
             std::string msg = beast::buffers_to_string(trading_buffer_.data());
             trading_buffer_.consume(trading_buffer_.size());
             
-            try {
-                auto j = json::parse(msg);
-                handle_trading_message(j);
-            } catch (const std::exception& e) {
-                std::cerr << "Trading parse error: " << e.what() << std::endl;
+            {
+                std::lock_guard<std::mutex> lock(trading_read_mutex_);
+                trading_read_queue_.push(msg);
             }
+            process_trading_read_queue();
             
             if (should_run_) {
                 do_trading_read();
             }
         });
+}
+
+void DeribitClient::process_market_read_queue() {
+    std::lock_guard<std::mutex> lock(market_read_mutex_);
+    while (!market_read_queue_.empty()) {
+        try {
+            auto j = json::parse(market_read_queue_.front());
+            handle_market_message(j);
+            market_read_queue_.pop();
+        } catch (const std::exception& e) {
+            std::cerr << "Market parse error: " << e.what() << std::endl;
+            market_read_queue_.pop();
+        }
+    }
+}
+
+void DeribitClient::process_trading_read_queue() {
+    std::lock_guard<std::mutex> lock(trading_read_mutex_);
+    while (!trading_read_queue_.empty()) {
+        try {
+            auto j = json::parse(trading_read_queue_.front());
+            handle_trading_message(j);
+            trading_read_queue_.pop();
+        } catch (const std::exception& e) {
+            std::cerr << "Trading parse error: " << e.what() << std::endl;
+            trading_read_queue_.pop();
+        }
+    }
 }
 
 void DeribitClient::handle_market_message(const json& msg) {
@@ -451,7 +509,8 @@ void DeribitClient::handle_trading_message(const json& msg) {
     std::lock_guard<std::mutex> lock(callback_mutex_);
     
     if (msg.contains("method") && msg["method"] == "subscription") {
-        if (const std::string& channel = msg["params"]["channel"]; starts_with(channel, "user.trades.")) {
+        const std::string& channel = msg["params"]["channel"];
+        if (starts_with(channel, "user.trades.")) {
             if (private_trade_callback_) {
                 private_trade_callback_(msg["params"]["data"]);
             }
@@ -472,7 +531,7 @@ void DeribitClient::handle_trading_message(const json& msg) {
             std::cout << "Authentication successful" << std::endl;
             subscribe_private_data();
         }
-    } 
+    }
 }
 
 void DeribitClient::send_market_message(const json& msg) {
@@ -480,86 +539,78 @@ void DeribitClient::send_market_message(const json& msg) {
         std::lock_guard<std::mutex> lock(market_write_mutex_);
         market_message_queue_.push(msg);
     }
-    if (!is_market_writing_) {
-        write_next_market_message();
-    }
+    write_next_market_message();
 }
 
-void DeribitClient::send_trading_message(const json& msg){
+void DeribitClient::send_trading_message(const json& msg) {
     {
         std::lock_guard<std::mutex> lock(trading_write_mutex_);
         trading_message_queue_.push(msg);
     }
-
-    if (!is_trading_writing_) {
-        write_next_trading_message();
-    }
+    write_next_trading_message();
 }
 
 void DeribitClient::write_next_market_message() {
-    if (market_message_queue_.empty() || is_market_writing_) {
-        return;
+    std::vector<json> messages;
+    {
+        std::lock_guard<std::mutex> lock(market_write_mutex_);
+        if (market_message_queue_.empty() || is_market_writing_ || !market_ws_ || !market_connected_) {
+            return;
+        }
+        is_market_writing_ = true;
+        while (!market_message_queue_.empty() && messages.size() < 10) {
+            messages.push_back(market_message_queue_.front());
+            market_message_queue_.pop();
+        }
     }
-
-    std::lock_guard<std::mutex> lock(market_write_mutex_);
-    if (!market_ws_ || !market_connected_) {
-        return;
+    
+    std::string combined_msg;
+    for (const auto& msg : messages) {
+        combined_msg += msg.dump() + "\n";
     }
-
-    is_market_writing_ = true;
-    auto msg = market_message_queue_.front();
-    market_message_queue_.pop();
-
+    
     market_ws_->async_write(
-        net::buffer(msg.dump()),
+        net::buffer(combined_msg),
         [this](const beast::error_code& ec, std::size_t) {
+            std::lock_guard<std::mutex> lock(market_write_mutex_);
             is_market_writing_ = false;
-
             if (ec) {
-                std::cerr << "Market write error: " << ec.message() << std::endl;
-                market_connected_ = false;
-                setup_market_connection();
+                handle_error("Market Write", ec);
                 return;
             }
-
-            // Process next message if any
-            if (!market_message_queue_.empty()) {
-                write_next_market_message();
-            }
+            write_next_market_message();
         });
 }
 
 void DeribitClient::write_next_trading_message() {
-    std::unique_lock<std::mutex> lock(trading_write_mutex_);
-
-    if (trading_message_queue_.empty() || is_trading_writing_ || !trading_ws_ || !trading_connected_) {
-        return;
+    std::vector<json> messages;
+    {
+        std::lock_guard<std::mutex> lock(trading_write_mutex_);
+        if (trading_message_queue_.empty() || is_trading_writing_ || !trading_ws_ || !trading_connected_) {
+            return;
+        }
+        is_trading_writing_ = true;
+        while (!trading_message_queue_.empty() && messages.size() < 10) {
+            messages.push_back(trading_message_queue_.front());
+            trading_message_queue_.pop();
+        }
     }
-
-    is_trading_writing_ = true;
-    auto msg = trading_message_queue_.front();
-    trading_message_queue_.pop();
-
-    // Unlock before async_write to prevent deadlock
-    lock.unlock();
-
+    
+    std::string combined_msg;
+    for (const auto& msg : messages) {
+        combined_msg += msg.dump() + "\n";
+    }
+    
     trading_ws_->async_write(
-        net::buffer(msg.dump()),
+        net::buffer(combined_msg),
         [this](const beast::error_code& ec, std::size_t) {
-            std::unique_lock<std::mutex> lock(trading_write_mutex_);
+            std::lock_guard<std::mutex> lock(trading_write_mutex_);
             is_trading_writing_ = false;
-
             if (ec) {
-                std::cerr << "Trading write error: " << ec.message() << std::endl;
-                trading_connected_ = false;
-                setup_trading_connection();
+                handle_error("Trading Write", ec);
                 return;
             }
-
-            if (!trading_message_queue_.empty()) {
-                lock.unlock();  // Unlock before recursive call
-                write_next_trading_message();
-            }
+            write_next_trading_message();
         });
 }
 
@@ -571,28 +622,14 @@ void DeribitClient::handle_error(const std::string& operation, const beast::erro
             std::lock_guard<std::mutex> lock(market_write_mutex_);
             market_connected_ = false;
         }
-
-        std::this_thread::sleep_for(std::chrono::seconds(1));  // Prevent excessive reconnection attempts
-
-        {
-            std::lock_guard<std::mutex> lock(market_write_mutex_);
-            if (!market_connected_) {
-                setup_market_connection();
-            }
-        }
+        setup_market_connection();
     } else if (starts_with(operation, "Trading")) {
         {
             std::lock_guard<std::mutex> lock(trading_write_mutex_);
             trading_connected_ = false;
         }
-
-        std::this_thread::sleep_for(std::chrono::seconds(1));  // Prevent excessive reconnection attempts
-
-        {
-            std::lock_guard<std::mutex> lock(trading_write_mutex_);
-            if (!trading_connected_) {
-                setup_trading_connection();
-            }
-        }
+        setup_trading_connection();
     }
 }
+
+} // namespace RLTrader

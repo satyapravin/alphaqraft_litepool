@@ -4,17 +4,7 @@
 #include <boost/beast/websocket.hpp>
 #include <boost/beast/ssl.hpp>
 #include <boost/asio/ssl.hpp>
-
 #include <nlohmann/json.hpp>
-
-#include <mutex>
-#include <thread>
-#include <atomic>
-#include <functional>
-#include <memory>
-#include <string>
-
-
 #include <boost/asio/ip/tcp.hpp>
 #include <mutex>
 #include <thread>
@@ -37,10 +27,11 @@ namespace RLTrader {
 
     class DeribitClient {
     public:
-        DeribitClient(const std::string& api_key,
-                     const std::string& api_secret,
-                     const std::string& symbol,
-		     const std::string& hedge_symbol);
+        DeribitClient(std::string api_key,
+                      std::string api_secret,
+                      std::string symbol,
+		      std::string hedge_symbol
+		      );
 
         ~DeribitClient();
 
@@ -54,11 +45,11 @@ namespace RLTrader {
 
         // Trading operations
         void place_order(const std::string& side,
-                        double price,
-                        double size,
-                        const std::string& label,
-			bool is_hedge,
-                        const std::string& type = "limit");
+                         double price,
+                         double size,
+                         const std::string& label,
+			 bool is_hedge,
+                         const std::string& type = "limit");
 
         void cancel_order(const std::string& order_id);
         void cancel_all_by_label(const std::string& label);
@@ -67,7 +58,7 @@ namespace RLTrader {
 
         // Callback setters
         void set_OrderBook_cb(std::function<void(const json&)> OrderBook_cb);
-        void set_private_trade_cb (std::function<void(const json&)> private_trade_cb);
+        void set_private_trade_cb(std::function<void(const json&)> private_trade_cb);
         void set_position_cb(std::function<void(const json&)> position_cb);
         void set_order_cb(std::function<void(const json&)> order_cb);
 
@@ -78,13 +69,16 @@ namespace RLTrader {
         void setup_trading_connection();
         void do_market_connect();
         void do_trading_connect();
+        void start_heartbeat();
         void authenticate();
-        void subscribe_market_data() ;
+        void subscribe_market_data();
         void subscribe_private_data();
 
         // Message handling
         void do_market_read();
         void do_trading_read();
+        void process_market_read_queue();
+        void process_trading_read_queue();
         void handle_market_message(const json& msg);
         void handle_trading_message(const json& msg);
         void send_market_message(const json& msg);
@@ -93,21 +87,17 @@ namespace RLTrader {
         void write_next_market_message();
         void write_next_trading_message();
 
-
-        // Thread management
-        void run_io_context();
-
         // Member variables
         std::string api_key_;
         std::string api_secret_;
         std::string symbol_;
-        std::string hedge_symbol_;
+	std::string hedge_symbol_;
 
-        std::unique_ptr<net::io_context> ioc_;
+        std::unique_ptr<net::io_context> market_ioc_;
+        std::unique_ptr<net::io_context> trading_ioc_;
         std::unique_ptr<ssl::context> ctx_;
         std::unique_ptr<websocket_stream> market_ws_;
         std::unique_ptr<websocket_stream> trading_ws_;
-
 
         std::atomic<bool> market_connected_{false};
         std::atomic<bool> trading_connected_{false};
@@ -116,7 +106,10 @@ namespace RLTrader {
         beast::flat_buffer market_buffer_;
         beast::flat_buffer trading_buffer_;
 
-        std::unique_ptr<std::thread> io_thread_;
+        std::unique_ptr<std::thread> market_thread_;
+        std::unique_ptr<std::thread> trading_thread_;
+        std::unique_ptr<net::steady_timer> market_timer_;
+        std::unique_ptr<net::steady_timer> trading_timer_;
 
         // Callbacks
         std::function<void(const json&)> OrderBook_callback_;
@@ -124,14 +117,17 @@ namespace RLTrader {
         std::function<void(const json&)> position_callback_;
         std::function<void(const json&)> order_callback_;
 
-        // Mutex for callback protection
+        // Queues and mutexes
         std::mutex callback_mutex_;
-
-        mutable std::mutex market_write_mutex_;
-        mutable std::mutex trading_write_mutex_;
-        mutable std::queue<json> market_message_queue_;
-        mutable std::queue<json> trading_message_queue_;
-        mutable std::atomic<bool> is_market_writing_{false};
-        mutable std::atomic<bool> is_trading_writing_{false};
+        std::mutex market_write_mutex_;
+        std::mutex trading_write_mutex_;
+        std::mutex market_read_mutex_;
+        std::mutex trading_read_mutex_;
+        std::queue<json> market_message_queue_;
+        std::queue<json> trading_message_queue_;
+        std::queue<std::string> market_read_queue_;
+        std::queue<std::string> trading_read_queue_;
+        std::atomic<bool> is_market_writing_{false};
+        std::atomic<bool> is_trading_writing_{false};
     };
-}
+} // namespace RLTrader
