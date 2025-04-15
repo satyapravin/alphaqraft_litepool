@@ -1,3 +1,4 @@
+// deribit_client.h
 #pragma once
 
 #include <boost/beast/core.hpp>
@@ -6,17 +7,15 @@
 #include <boost/asio/ssl.hpp>
 #include <nlohmann/json.hpp>
 #include <boost/asio/ip/tcp.hpp>
-#include <mutex>
-#include <thread>
+#include <boost/lockfree/spsc_queue.hpp>
 #include <atomic>
+#include <thread>
 #include <functional>
 #include <memory>
 #include <string>
-#include <queue>
 
 namespace RLTrader {
     namespace beast = boost::beast;
-    namespace http = beast::http;
     namespace websocket = beast::websocket;
     namespace net = boost::asio;
     namespace ssl = net::ssl;
@@ -28,28 +27,24 @@ namespace RLTrader {
     class DeribitClient {
     public:
         DeribitClient(std::string api_key,
-                      std::string api_secret,
-                      std::string symbol,
-		      std::string hedge_symbol
-		      );
-
+                     std::string api_secret,
+                     std::string symbol,
+                     std::string hedge_symbol = "");
         ~DeribitClient();
 
-        // Non-copyable
         DeribitClient(const DeribitClient&) = delete;
         DeribitClient& operator=(const DeribitClient&) = delete;
 
-        // Start/Stop the client
         void start();
         void stop();
 
         // Trading operations
         void place_order(const std::string& side,
-                         double price,
-                         double size,
-                         const std::string& label,
-			 bool is_hedge,
-                         const std::string& type = "limit");
+                        double price,
+                        double size,
+                        const std::string& label,
+                        bool is_hedge = false,
+                        const std::string& type = "limit");
 
         void cancel_order(const std::string& order_id);
         void cancel_all_by_label(const std::string& label);
@@ -57,13 +52,13 @@ namespace RLTrader {
         void get_position();
 
         // Callback setters
-        void set_OrderBook_cb(std::function<void(const json&)> OrderBook_cb);
-        void set_private_trade_cb(std::function<void(const json&)> private_trade_cb);
-        void set_position_cb(std::function<void(const json&)> position_cb);
-        void set_order_cb(std::function<void(const json&)> order_cb);
+        void set_OrderBook_cb(std::function<void(const json&)> cb);
+        void set_private_trade_cb(std::function<void(const json&)> cb);
+        void set_position_cb(std::function<void(const json&)> cb);
+        void set_order_cb(std::function<void(const json&)> cb);
 
     private:
-        // Internal setup methods
+        // Connection management
         void setup_connections();
         void setup_market_connection();
         void setup_trading_connection();
@@ -77,57 +72,55 @@ namespace RLTrader {
         // Message handling
         void do_market_read();
         void do_trading_read();
-        void process_market_read_queue();
-        void process_trading_read_queue();
         void handle_market_message(const json& msg);
         void handle_trading_message(const json& msg);
-        void send_market_message(const json& msg);
-        void send_trading_message(const json& msg);
-        void handle_error(const std::string& operation, const beast::error_code& ec);
+        void send_market_message(json&& msg);
+        void send_trading_message(json&& msg);
+        void handle_error(const std::string& context, const beast::error_code& ec);
+
+        // Write operations
         void write_next_market_message();
         void write_next_trading_message();
 
-        // Member variables
-        std::string api_key_;
-        std::string api_secret_;
-        std::string symbol_;
-	std::string hedge_symbol_;
+        // Configuration
+        const std::string api_key_;
+        const std::string api_secret_;
+        const std::string symbol_;
+        const std::string hedge_symbol_;
 
+        // IO and networking
         std::unique_ptr<net::io_context> market_ioc_;
         std::unique_ptr<net::io_context> trading_ioc_;
         std::unique_ptr<ssl::context> ctx_;
         std::unique_ptr<websocket_stream> market_ws_;
         std::unique_ptr<websocket_stream> trading_ws_;
 
+        // State flags
         std::atomic<bool> market_connected_{false};
         std::atomic<bool> trading_connected_{false};
-        std::atomic<bool> should_run_{false};
+        std::atomic<bool> running_{false};
+        std::atomic<bool> market_writing_{false};
+        std::atomic<bool> trading_writing_{false};
 
+        // Buffers
         beast::flat_buffer market_buffer_;
         beast::flat_buffer trading_buffer_;
 
+        // Threads and timers
         std::unique_ptr<std::thread> market_thread_;
         std::unique_ptr<std::thread> trading_thread_;
         std::unique_ptr<net::steady_timer> market_timer_;
         std::unique_ptr<net::steady_timer> trading_timer_;
 
         // Callbacks
-        std::function<void(const json&)> OrderBook_callback_;
-        std::function<void(const json&)> private_trade_callback_;
-        std::function<void(const json&)> position_callback_;
-        std::function<void(const json&)> order_callback_;
+        std::function<void(const json&)> OrderBook_cb_;
+        std::function<void(const json&)> private_trade_cb_;
+        std::function<void(const json&)> position_cb_;
+        std::function<void(const json&)> order_cb_;
 
-        // Queues and mutexes
-        std::mutex callback_mutex_;
-        std::mutex market_write_mutex_;
-        std::mutex trading_write_mutex_;
-        std::mutex market_read_mutex_;
-        std::mutex trading_read_mutex_;
-        std::queue<json> market_message_queue_;
-        std::queue<json> trading_message_queue_;
-        std::queue<std::string> market_read_queue_;
-        std::queue<std::string> trading_read_queue_;
-        std::atomic<bool> is_market_writing_{false};
-        std::atomic<bool> is_trading_writing_{false};
+        // Message queues (lock-free single-producer/single-consumer)
+        static constexpr size_t QUEUE_SIZE = 1024;
+        boost::lockfree::spsc_queue<json, boost::lockfree::capacity<QUEUE_SIZE>> market_out_queue_;
+        boost::lockfree::spsc_queue<json, boost::lockfree::capacity<QUEUE_SIZE>> trading_out_queue_;
     };
-} // namespace RLTrader
+}
