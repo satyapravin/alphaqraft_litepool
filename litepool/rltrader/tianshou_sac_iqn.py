@@ -24,9 +24,9 @@ stack_num = 60
 env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
     num_threads=num_of_envs, is_prod=False, is_inverse_instr=True, api_key="",
-    api_secret="", symbol="BTC-PERPETUAL", tick_size=0.5, min_amount=10,
+    api_secret="", symbol="BTC-PERPETUAL", hedge_symbol='BTC-18APR25', tick_size=0.5, min_amount=10,
     maker_fee=-0.0001, taker_fee=0.0005, foldername="./train_files/",
-    balance=1.0, start=3601 * 10, max=7200 * 10
+    balance=1.0, start=3601 * 10, max=14400 * 10
 )
 
 env.spec.id = 'RlTrader-v0'
@@ -98,9 +98,9 @@ results_dir.mkdir(exist_ok=True)
 # Model initialization
 torch.manual_seed(42)
 actor = RecurrentActor(device).to(device)
-critic1 = IQNCritic(action_dim=3, num_quantiles=32, hidden_dim=128, quantile_embedding_dim=32, gru_hidden_dim=128, num_layers=2).to(device)
+critic1 = IQNCritic(action_dim=4, num_quantiles=32, hidden_dim=128, quantile_embedding_dim=32, gru_hidden_dim=128, num_layers=2).to(device)
 torch.manual_seed(1221)
-critic2 = IQNCritic(action_dim=3, num_quantiles=32, hidden_dim=128, quantile_embedding_dim=32, gru_hidden_dim=128, num_layers=2).to(device)
+critic2 = IQNCritic(action_dim=4, num_quantiles=32, hidden_dim=128, quantile_embedding_dim=32, gru_hidden_dim=128, num_layers=2).to(device)
 
 critic1_optim = Adam(critic1.parameters(), lr=3e-4)
 critic2_optim = Adam(critic2.parameters(), lr=3e-4)
@@ -113,7 +113,7 @@ policy = CustomSACPolicy(
     actor_optim=Adam(actor.parameters(), lr=3e-4),
     critic1_optim=critic1_optim,
     critic2_optim=critic2_optim,
-    tau=0.01, gamma=0.99, init_alpha=5.0,
+    tau=0.05, gamma=0.99, init_alpha=1.0,
     action_space=env_action_space
 )
 
@@ -156,7 +156,7 @@ if final_buffer_path.exists():
         print(f"Loaded buffer config: {buffer_config}")
     else:
         buffer_config = {
-            'total_size': num_of_envs * 600,  # Total buffer size
+            'total_size': num_of_envs * 6000,  # Total buffer size
             'seq_len': 60,              # Sequence length
             'buffer_num': num_of_envs,     # Number of environments
             'device': str(device)        # Device as string for serialization
@@ -188,7 +188,7 @@ if final_buffer_path.exists():
 else:
     print(f"No buffer found at {final_buffer_path}, creating new sequential buffer")
     buffer = SequentialReplayBuffer(
-        total_size=num_of_envs * 600,  # Total buffer size (e.g., 64 envs × 60000 steps)
+        total_size=num_of_envs * 6000,  # Total buffer size (e.g., 64 envs × 60000 steps)
         seq_len=60,                   # Length of sequences to sample
         buffer_num=num_of_envs,        # Match your environment count
         device="cpu"
@@ -211,8 +211,8 @@ trainer = OffpolicyTrainer(
     policy=policy,
     train_collector=collector,
     test_collector=None,
-    max_epoch=10,
-    step_per_epoch=20,
+    max_epoch=100,
+    step_per_epoch=60,
     step_per_collect=600,
     episode_per_test=0,
     batch_size=64,
@@ -240,7 +240,7 @@ torch.save({
 buffer.save_hdf5(final_buffer_path)
 torch.save({
     'buffer_type': 'StackedVectorReplayBuffer',
-    'total_size': num_of_envs * 600,
+    'total_size': num_of_envs * 6000,
     'buffer_num': num_of_envs,
     'seq_len': 60,
     'device': 'cpu'

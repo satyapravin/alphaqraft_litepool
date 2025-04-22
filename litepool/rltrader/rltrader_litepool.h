@@ -73,8 +73,8 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) ActionSpec(const Config& conf) {
-    return MakeDict("action"_.Bind(Spec<float>({3}, {{-1., -1., -1.},
-				                     { 1.,  1.,  1.}})));
+    return MakeDict("action"_.Bind(Spec<float>({4}, {{-1., -1., -1., -1.},
+				                     { 1.,  1.,  1.,  1.}})));
   }
 };
 
@@ -161,9 +161,10 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   void Step(const Action& action_dict) override { 
       double bid_spread = static_cast<double>(action_dict["action"_][0]);
       double ask_spread = static_cast<double>(action_dict["action"_][1]);
-      double quote_range = static_cast<double>(action_dict["action"_][2]);
+      double bid_size = static_cast<double>(action_dict["action"_][2]);
+      double ask_size = static_cast<double>(action_dict["action"_][3]);
      
-      adaptor_ptr->quote(bid_spread, ask_spread, quote_range);
+      adaptor_ptr->quote(bid_spread, ask_spread, bid_size, ask_size);
       isDone = !adaptor_ptr->next();
       ++steps;
       WriteState();

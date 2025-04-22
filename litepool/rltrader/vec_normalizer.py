@@ -28,7 +28,7 @@ class RunningMeanStd:
 
 class VecNormalize:
     def __init__(self, env, num_envs, device, norm_obs=True, norm_reward=True, clip_obs=10.,
-                 clip_reward=10., gamma=0.99, epsilon=1e-8):
+                 clip_reward=1, gamma=0.99, epsilon=1e-8):
         self.env = env
         self.num_envs = num_envs
         self.device = device

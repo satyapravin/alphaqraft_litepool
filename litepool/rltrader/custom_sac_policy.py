@@ -22,6 +22,8 @@ def quantile_huber_loss(prediction, target, taus_predicted, taus_target, kappa=1
 
     prediction = prediction.unsqueeze(2)
     target = target.unsqueeze(1)
+    prediction = prediction.clamp(-50, 50)
+    target = target.clamp(-50, 50)
     td_error = target - prediction
 
     huber = F.smooth_l1_loss(prediction.expand(-1, -1, M), 
@@ -48,7 +50,7 @@ def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, 
     critic2_state = batch.get('state_h2', None)
     
     # Total sum of rewards over n_step for each sequence
-    total_rewards = rewards.sum(dim=1)  # [batch_size]
+    total_rewards = rewards.mean(dim=1)  # [batch_size]
     # Expand to all steps in the sequence
     uniform_rewards = total_rewards.unsqueeze(1).expand(-1, n_step)  # [batch_size, n_step]
     
@@ -62,8 +64,8 @@ def compute_n_step_return(batch, gamma, critic1, critic2, actor, alpha, device, 
         dist = Independent(Normal(loc, scale), 1)
         raw_actions = dist.rsample()
         actions = torch.tanh(raw_actions)
-        raw_log_prob = dist.log_prob(raw_actions)
-        correction = torch.log(1 - actions.pow(2) + 1e-6).sum(dim=-1)
+        raw_log_prob = dist.log_prob(raw_actions).clamp(-20, 20)
+        correction = torch.log(1 - actions.pow(2) + 1e-6).sum(dim=-1).clamp(-20, 20)
         log_prob = raw_log_prob - correction
         
         actions = actions.reshape(batch_size, n_step, -1)  # [batch_size, n_step, 3]

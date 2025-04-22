@@ -8,6 +8,7 @@
 #include <nlohmann/json.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/lockfree/spsc_queue.hpp>
+#include <boost/asio/executor_work_guard.hpp>
 #include <atomic>
 #include <thread>
 #include <functional>
@@ -64,7 +65,6 @@ namespace RLTrader {
         void setup_trading_connection();
         void do_market_connect();
         void do_trading_connect();
-        void start_heartbeat();
         void authenticate();
         void subscribe_market_data();
         void subscribe_private_data();
@@ -87,6 +87,7 @@ namespace RLTrader {
         const std::string api_secret_;
         const std::string symbol_;
         const std::string hedge_symbol_;
+        const size_t instance_id_;
 
         // IO and networking
         std::unique_ptr<net::io_context> market_ioc_;
@@ -94,6 +95,10 @@ namespace RLTrader {
         std::unique_ptr<ssl::context> ctx_;
         std::unique_ptr<websocket_stream> market_ws_;
         std::unique_ptr<websocket_stream> trading_ws_;
+        std::unique_ptr<boost::asio::executor_work_guard<net::io_context::executor_type>> market_work_;
+        std::unique_ptr<boost::asio::executor_work_guard<net::io_context::executor_type>> trading_work_;
+        std::unique_ptr<tcp::resolver> market_resolver_;
+        std::unique_ptr<tcp::resolver> trading_resolver_;
 
         // State flags
         std::atomic<bool> market_connected_{false};
@@ -118,9 +123,14 @@ namespace RLTrader {
         std::function<void(const json&)> position_cb_;
         std::function<void(const json&)> order_cb_;
 
-        // Message queues (lock-free single-producer/single-consumer)
+        // Message queues
         static constexpr size_t QUEUE_SIZE = 1024;
         boost::lockfree::spsc_queue<json, boost::lockfree::capacity<QUEUE_SIZE>> market_out_queue_;
         boost::lockfree::spsc_queue<json, boost::lockfree::capacity<QUEUE_SIZE>> trading_out_queue_;
+
+        static size_t generate_instance_id() {
+            static std::atomic<size_t> counter{0};
+            return counter++;
+        }
     };
 }

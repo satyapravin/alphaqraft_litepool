@@ -27,10 +27,12 @@ void DeribitExchange::toBook(const std::unordered_map<std::string, double>& lob,
 
 void DeribitExchange::reset() {
     db_client.stop();
+    std::this_thread::sleep_for(std::chrono::seconds(5));
     std::lock_guard<std::mutex> lock(this->fill_mutex);
     this->executions.clear();
     this->set_callbacks();
     db_client.start();
+    std::this_thread::sleep_for(std::chrono::seconds(5));
 }
 
 void DeribitExchange::set_callbacks() {

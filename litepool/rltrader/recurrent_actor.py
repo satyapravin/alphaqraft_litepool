@@ -4,7 +4,7 @@ from tianshou.data import Batch
 
 
 class RecurrentActor(nn.Module):
-    def __init__(self, device, action_dim=3, hidden_dim=64, gru_hidden_dim=128, num_layers=2, predict_steps=10):
+    def __init__(self, device, action_dim=4, hidden_dim=64, gru_hidden_dim=128, num_layers=2, predict_steps=10):
         super().__init__()
         self.gru_hidden_dim = gru_hidden_dim
         self.num_layers = num_layers
@@ -44,7 +44,7 @@ class RecurrentActor(nn.Module):
             nn.Linear(64, 1)
         )
 
-        self.mean = nn.Linear(hidden_dim, action_dim)
+        self.mean = nn.Sequential(nn.Linear(hidden_dim, action_dim), nn.Tanh())
         self.log_std = nn.Linear(hidden_dim, action_dim)
 
         self.log_std.weight.data.uniform_(-1, 1)

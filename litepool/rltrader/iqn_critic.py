@@ -6,7 +6,7 @@ import torch.nn.functional as F
 class IQNCritic(nn.Module):
     def __init__(
         self,
-        action_dim=3,
+        action_dim=4,
         hidden_dim=128,
         num_quantiles=32,  
         quantile_embedding_dim=32,  

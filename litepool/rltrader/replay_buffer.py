@@ -18,7 +18,7 @@ class SequentialReplayBuffer(VectorReplayBuffer):
         if key == 'obs' or key == 'obs_next':
             return (2420,)  # [size, 60, 2420]
         elif key == 'act':
-            return (3,)     # [size, 60, 3]
+            return (4,)     # [size, 60, 4]
         elif key in ['rew', 'done', 'terminated', 'truncated']:
             return ()
         elif key == 'state':
