@@ -204,10 +204,10 @@ class CustomSACPolicy(SACPolicy):
         new_q = torch.min(new_q1, new_q2).mean(dim=1)
 
         alpha_loss = -(self.log_alpha * (log_prob.detach() + self.target_entropy)).mean()
-        critic_loss = (quantile_huber_loss(current_q1, batch.rew.view(batch_size * n_step, self.num_quantiles),
-                                           taus, taus, kappa=1.0) +
-                       quantile_huber_loss(current_q2, batch.rew.view(batch_size * n_step, self.num_quantiles),
-                                           taus, taus, kappa=1.0))
+        reward = batch.rew.reshape(-1)  
+        target = reward.unsqueeze(-1).expand(-1, self.num_quantiles)
+        critic_loss = (quantile_huber_loss(current_q1, target, taus, taus, kappa=1.0) +
+                       quantile_huber_loss(current_q2, target, taus, taus, kappa=1.0))
         actor_loss = (self.get_alpha.detach() * log_prob - new_q).mean()
         pnl_target = batch.rew.view(batch_size, n_step).sum(dim=1).unsqueeze(1).expand(-1, n_step).reshape(-1)
         pnl_loss = F.mse_loss(predicted_pnl.squeeze(-1), pnl_target)
