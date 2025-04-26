@@ -146,11 +146,11 @@ class CustomSACPolicy(SACPolicy):
         with torch.no_grad():
             obs_seq = batch.obs
             cum_return_pred, _ = self.rudder(obs_seq)
-            redistributed_rew = torch.zeros_like(cum_return_pred)
-            redistributed_rew[:, 0] = cum_return_pred[:, 0]
-            redistributed_rew[:, 1:] = cum_return_pred[:, 1:] - cum_return_pred[:, :-1]
 
-        batch.rew = redistributed_rew.unsqueeze(-1)
+            first_step = cum_return_pred[:, 0:1]
+            later_steps = cum_return_pred[:, 1:] - cum_return_pred[:, :-1]
+            redistributed_rew = torch.cat([first_step, later_steps], dim=1)
+            batch.rew = redistributed_rew.unsqueeze(-1)
         return batch
 
     def learn(self, batch: Batch, **kwargs):
@@ -169,15 +169,15 @@ class CustomSACPolicy(SACPolicy):
         rudder_loss = self.rudder_loss_fn(pred_final, mc_return)
 
         self.rudder_optim.zero_grad()
-        rudder_loss.backward()
+        rudder_loss.backward(retain_graph=True)
         torch.nn.utils.clip_grad_norm_(self.rudder.parameters(), 1.0)
         self.rudder_optim.step()
 
         # --- Redistribute reward ---
         with torch.no_grad():
-            redistributed_rew = torch.zeros_like(pred_seq)
-            redistributed_rew[:, 0] = pred_seq[:, 0]
-            redistributed_rew[:, 1:] = pred_seq[:, 1:] - pred_seq[:, :-1]
+            first_step = pred_seq[:, 0:1]
+            later_steps = pred_seq[:, 1:] - pred_seq[:, :-1]
+            redistributed_rew = torch.cat([first_step, later_steps], dim=1)
             batch.rew = redistributed_rew.unsqueeze(-1)
 
         # --- Actor-Critic training ---
