@@ -60,6 +60,8 @@ def save_checkpoint_fn(epoch, env_step, gradient_step):
             'critic1_optim_state_dict': policy.critic1_optim.state_dict(),
             'critic2_optim_state_dict': policy.critic2_optim.state_dict(),
             'alpha_optim_state_dict': policy.alpha_optim.state_dict(),
+            'rudder_state_dict': policy.rudder.state_dict(),           
+            'rudder_optim_state_dict': policy.rudder_optim.state_dict(), 
             'buffer_config': {
                 'total_size': buffer.total_size,
                 'buffer_num': buffer.buffer_num,
@@ -89,7 +91,6 @@ def save_checkpoint_fn(epoch, env_step, gradient_step):
     except Exception as e:
         print(f"Error saving checkpoint: {e}")
         return False
-
 
 # Directory setup
 results_dir = Path("results")
@@ -127,7 +128,7 @@ start_epoch = 0
 
 if final_checkpoint_path.exists():
     print(f"Loading model from {final_checkpoint_path}")
-    saved_model = torch.load(final_checkpoint_path)
+    saved_model = torch.load(final_checkpoint_path, map_location=device)
 
     policy.load_state_dict(saved_model['policy_state_dict'])
     policy.actor_optim.load_state_dict(saved_model['actor_optim_state_dict'])
@@ -135,11 +136,20 @@ if final_checkpoint_path.exists():
     policy.critic2_optim.load_state_dict(saved_model['critic2_optim_state_dict'])
     policy.alpha_optim.load_state_dict(saved_model['alpha_optim_state_dict'])
 
+    # Load RUDDER if available
+    if 'rudder_state_dict' in saved_model:
+        policy.rudder.load_state_dict(saved_model['rudder_state_dict'])
+        policy.rudder_optim.load_state_dict(saved_model['rudder_optim_state_dict'])
+        print(f"Successfully loaded RUDDER model and optimizer.")
+    else:
+        print(f"Warning: Checkpoint does not contain RUDDER state (older format?)")
+
     start_epoch = 0
     print(f"Resumed from epoch {start_epoch}")
     print(f"Alpha value: {policy.get_alpha.item():.6f}")
 else:
     print(f"Could not find model checkpoint at {final_checkpoint_path}")
+
 
 if final_buffer_path.exists():
     print(f"Loading buffer from {final_buffer_path}")
@@ -235,6 +245,8 @@ torch.save({
     'critic1_optim_state_dict': policy.critic1_optim.state_dict(),
     'critic2_optim_state_dict': policy.critic2_optim.state_dict(),
     'alpha_optim_state_dict': policy.alpha_optim.state_dict(),
+    'rudder_state_dict': policy.rudder.state_dict(),            
+    'rudder_optim_state_dict': policy.rudder_optim.state_dict(), 
 }, final_checkpoint_path)
 
 buffer.save_hdf5(final_buffer_path)
