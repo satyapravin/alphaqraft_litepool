@@ -136,7 +136,6 @@ if final_checkpoint_path.exists():
     policy.critic2_optim.load_state_dict(saved_model['critic2_optim_state_dict'])
     policy.alpha_optim.load_state_dict(saved_model['alpha_optim_state_dict'])
 
-    # Load RUDDER if available
     if 'rudder_state_dict' in saved_model:
         policy.rudder.load_state_dict(saved_model['rudder_state_dict'])
         policy.rudder_optim.load_state_dict(saved_model['rudder_optim_state_dict'])
@@ -144,12 +143,18 @@ if final_checkpoint_path.exists():
     else:
         print(f"Warning: Checkpoint does not contain RUDDER state (older format?)")
 
+    vecnorm_path = results_dir / "vecnorm.pth"
+    if vecnorm_path.exists():
+        env.load(vecnorm_path)
+        print(f"Loaded VecNormalize stats from {vecnorm_path}")
+    else:
+        print(f"VecNormalize stats not found at {vecnorm_path}")
+
     start_epoch = 0
     print(f"Resumed from epoch {start_epoch}")
     print(f"Alpha value: {policy.get_alpha.item():.6f}")
 else:
     print(f"Could not find model checkpoint at {final_checkpoint_path}")
-
 
 if final_buffer_path.exists():
     print(f"Loading buffer from {final_buffer_path}")
@@ -248,6 +253,10 @@ torch.save({
     'rudder_state_dict': policy.rudder.state_dict(),            
     'rudder_optim_state_dict': policy.rudder_optim.state_dict(), 
 }, final_checkpoint_path)
+
+# Save VecNormalize statistics
+env.save(results_dir / "vecnorm.pth")
+print(f"Saved VecNormalize stats to {results_dir / 'vecnorm.pth'}")
 
 buffer.save_hdf5(final_buffer_path)
 torch.save({
