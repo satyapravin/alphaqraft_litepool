@@ -126,7 +126,6 @@ def train(epochs=100, rollout_len=2048, minibatch_seq_len=128, minibatch_envs=8,
 
         rollout_len, num_envs = batch['obs'].shape[:2]
 
-
         # Train policy
         for _ in range(update_epochs):
             for start_t in range(0, rollout_len, minibatch_seq_len):
@@ -139,26 +138,31 @@ def train(epochs=100, rollout_len=2048, minibatch_seq_len=128, minibatch_envs=8,
                     if end_e > num_envs:
                         break
 
-                    minibatch = Batch(
-                        obs=batch['obs'][start_t:end_t, start_e:end_e],
-                        act=batch['act'][start_t:end_t, start_e:end_e],
-                        log_prob=batch['logp'][start_t:end_t, start_e:end_e],
-                        value=batch['val'][start_t:end_t, start_e:end_e],
-                        rew=batch['rew'][start_t:end_t, start_e:end_e],
-                        done=batch['done'][start_t:end_t, start_e:end_e],
-                        adv=batch['adv'][start_t:end_t, start_e:end_e],
-                        ret=batch['ret'][start_t:end_t, start_e:end_e],
-                    )
+                    minibatch = {
+                        'obs': batch['obs'][start_t:end_t, start_e:end_e],
+                        'act': batch['act'][start_t:end_t, start_e:end_e],
+                        'logp': batch['logp'][start_t:end_t, start_e:end_e],
+                        'val': batch['val'][start_t:end_t, start_e:end_e],
+                        'rew': batch['rew'][start_t:end_t, start_e:end_e],
+                        'done': batch['done'][start_t:end_t, start_e:end_e],
+                        'adv': batch['adv'][start_t:end_t, start_e:end_e],
+                        'ret': batch['ret'][start_t:end_t, start_e:end_e],
+                    }
 
-                    minibatch.to_torch(device=device)
+                    # Move to device
+                    for key in minibatch:
+                        minibatch[key] = minibatch[key].to(device)
+
                     loss_info = policy.learn(minibatch)
 
         # === MetricLogger Integration ===
-        all_ep_rewards = [r for env_rewards in batch.ep_rewards for r in env_rewards]
-        avg_reward = np.mean(all_ep_rewards) if len(all_ep_rewards) > 0 else 0.0
+        avg_reward = 0.0
+        if hasattr(batch, 'ep_rewards') and batch['ep_rewards'] is not None:
+            all_ep_rewards = [r for env_rewards in batch['ep_rewards'] for r in env_rewards]
+            avg_reward = np.mean(all_ep_rewards) if len(all_ep_rewards) > 0 else 0.0
 
-        latest_info = batch.infos[-1] if len(batch.infos) > 0 else {}
-        rew = batch.rew[-num_of_envs:].cpu().numpy() if isinstance(batch.rew, torch.Tensor) else batch.rew[-num_of_envs:]
+        latest_info = batch['infos'][-1] if hasattr(batch, 'infos') and len(batch['infos']) > 0 else {}
+        rew = batch['rew'][-num_of_envs:].cpu().numpy() if isinstance(batch['rew'], torch.Tensor) else batch['rew'][-num_of_envs:]
 
         metric_logger.log(global_step, latest_info, rew, policy)
 
@@ -169,9 +173,10 @@ def train(epochs=100, rollout_len=2048, minibatch_seq_len=128, minibatch_envs=8,
         global_step += rollout_len
 
         # Reset episode reward tracking
-        collector.reset_episode_rewards()
+        if hasattr(collector, 'reset_episode_rewards'):
+            collector.reset_episode_rewards()
 
-    # After all epochs, save final weights
+    # Save final model
     torch.save(policy.model.state_dict(), results_dir / "final_model_inference.pth")
     env.save(results_dir / "vecnorm.pth")
     print(f"Final model for inference saved at {results_dir / 'final_model_inference.pth'}")
