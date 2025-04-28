@@ -1,9 +1,6 @@
 import numpy as np
 import torch
 
-import numpy as np
-import torch
-
 def to_scalar(value):
     if isinstance(value, torch.Tensor):
         value = value.detach().cpu().numpy()
@@ -27,46 +24,34 @@ class MetricLogger:
         self.last_print_step = step_count
 
         print(f"\nStep: {step_count}")
-        print("Env | Net_PnL   | R_PnL     | UR_PnL    | Fees       | Trades   | Drawdown | Leverage | Reward")
-        print("-" * 80)
+        print(f"{'Env':>3} | {'Net_PnL':>10} | {'Realized':>10} | {'Unrealized':>10} | {'Fees':>10} | {'Trades':>7} | {'Drawdown':>10} | {'Leverage':>10} | {'Reward':>10}")
+        print("-" * 100)
 
-        # Assuming info is a dict with keys mapping to arrays of length 64 (num_envs)
-        num_envs = 64  # Based on your setup with 64 environments
+        num_envs = len(rew) if isinstance(rew, (np.ndarray, list)) else 64
         env_ids = range(num_envs)
 
         for env_id in env_ids:
-            # Extract values directly from info dictionary for this environment
-            realized_pnl = info.get('realized_pnl', np.zeros(num_envs))[env_id]
-            unrealized_pnl = info.get('unrealized_pnl', np.zeros(num_envs))[env_id]
-            fees = info.get('fees', np.zeros(num_envs))[env_id]
-            trades = info.get('trade_count', np.zeros(num_envs))[env_id]
-            drawdown = info.get('drawdown', np.zeros(num_envs))[env_id]
-            leverage = info.get('leverage', np.zeros(num_envs))[env_id]
-            reward = rew[env_id] if isinstance(rew, (np.ndarray, list)) and len(rew) > env_id else 0.0
+            realized_pnl = to_scalar(info.get('realized_pnl', np.zeros(num_envs))[env_id])
+            unrealized_pnl = to_scalar(info.get('unrealized_pnl', np.zeros(num_envs))[env_id])
+            fees = to_scalar(info.get('fees', np.zeros(num_envs))[env_id])
+            trades = to_scalar(info.get('trade_count', np.zeros(num_envs))[env_id])
+            drawdown = to_scalar(info.get('drawdown', np.zeros(num_envs))[env_id])
+            leverage = to_scalar(info.get('leverage', np.zeros(num_envs))[env_id])
+            reward = to_scalar(rew[env_id]) if isinstance(rew, (np.ndarray, list)) and len(rew) > env_id else 0.0
 
-            # Calculate net PnL
             net_pnl = realized_pnl + unrealized_pnl - fees
-            net_pnl = to_scalar(net_pnl)
-            realized_pnl = to_scalar(realized_pnl)
-            unrealized_pnl = to_scalar(unrealized_pnl)
-            fees = to_scalar(fees)
-            trades = to_scalar(trades)
-            drawdown = to_scalar(drawdown)
-            leverage = to_scalar(leverage)
-            reward = to_scalar(reward)
 
-            # Print formatted row for this environment
-            print(f"{env_id:3d} | {net_pnl:+7.6f} | "
-                  f"{realized_pnl:+6.6f} | "
-                  f"{unrealized_pnl:+6.6f} | "
-                  f"{fees:+6.6f} | "
-                  f"{trades:8.0f} | "
-                  f"{drawdown:+8.6f} | "
-                  f"{leverage:+8.6f} | "
-                  f"{reward:+8.6f}")
+            print(f"{env_id:3d} | "
+                  f"{net_pnl:+10.6f} | "
+                  f"{realized_pnl:+10.6f} | "
+                  f"{unrealized_pnl:+10.6f} | "
+                  f"{fees:+10.6f} | "
+                  f"{int(trades):7d} | "
+                  f"{drawdown:+10.6f} | "
+                  f"{leverage:+10.6f} | "
+                  f"{reward:+10.6f}")
 
-        # Print alpha value if available
         if hasattr(policy, 'get_alpha'):
             alpha = policy.get_alpha.item() if isinstance(policy.get_alpha, torch.Tensor) else policy.get_alpha
             print(f"\nAlpha: {alpha:.6f}")
-        print("-" * 80)
+        print("-" * 100)

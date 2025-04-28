@@ -1,97 +1,90 @@
-import torch
 import numpy as np
+import torch
 
 class PPOCollector:
-    def __init__(self, env, policy, rollout_len, device):
+    def __init__(self, env, policy, buffer_size, device, gamma=0.99, gae_lambda=0.95):
         self.env = env
         self.policy = policy
-        self.rollout_len = rollout_len
         self.device = device
+        self.buffer_size = buffer_size  # Total steps per environment
+        self.n_envs = env.num_envs  # Parallel environments
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
 
     def collect(self):
-        obs_buf = []
-        act_buf = []
-        logp_buf = []
-        rew_buf = []
-        done_buf = []
-        val_buf = []
-        infos = []
-        ep_rewards = [[] for _ in range(self.env.num_envs)]
+        batch = {
+            "obs": [],
+            "actions": [],
+            "rewards": [],
+            "dones": [],
+            "log_probs": [],
+            "values": [],
+            "infos": [],
+        }
 
-        hidden_state = None
-
+        # Reset environment
         obs, _ = self.env.reset()
-        obs = np.asarray(obs, dtype=np.float32)
-        n_envs = obs.shape[0]
+        obs = np.asarray(obs)
+        hidden_state = None  # For recurrent policies (optional)
 
-        for step in range(self.rollout_len):
+        for step in range(self.buffer_size):
             with torch.no_grad():
-                obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+                obs_tensor = torch.from_numpy(obs).float().to(self.device)
                 action, log_prob, value, hidden_state = self.policy.forward(obs_tensor, hidden_state)
 
-                action = action.detach().cpu()
-                log_prob = log_prob.detach().cpu()
-                value = value.detach().cpu()
+            action_cpu = action.cpu().numpy()
 
-            action_env = action.numpy()
-            next_obs, reward, terminated, truncated, info_list = self.env.step(action_env)
+            # Step environment
+            next_obs, reward, done, truncated, info_list = self.env.step(action_cpu)
+            next_obs = np.asarray(next_obs)
 
-            done = np.logical_or(terminated, truncated)
+            # Sanity check
+            assert next_obs.shape[0] == self.n_envs, f"next_obs shape mismatch: got {next_obs.shape[0]}, expected {self.n_envs}"
+            assert reward.shape[0] == self.n_envs, f"reward shape mismatch: got {reward.shape[0]}, expected {self.n_envs}"
 
-            next_obs = np.asarray(next_obs, dtype=np.float32)
-            hidden_state = self.reset_hidden_state(hidden_state, done)
+            # Store
+            batch["obs"].append(obs)
+            batch["actions"].append(action_cpu)
+            batch["rewards"].append(reward)
+            batch["dones"].append(done)
+            batch["log_probs"].append(log_prob.cpu().numpy())
+            batch["values"].append(value.cpu().numpy())
+            batch["infos"].append(info_list)
 
-            # === Aggregate per-env infos ===
-            aggregated_info = {}
-            if isinstance(info_list, (list, tuple)):
-                aggregated_info['realized_pnl'] = np.array([info.get('realized_pnl', 0.0) for info in info_list])
-                aggregated_info['unrealized_pnl'] = np.array([info.get('unrealized_pnl', 0.0) for info in info_list])
-                aggregated_info['fees'] = np.array([info.get('fees', 0.0) for info in info_list])
-                aggregated_info['trade_count'] = np.array([info.get('trade_count', 0) for info in info_list])
-                aggregated_info['drawdown'] = np.array([info.get('drawdown', 0.0) for info in info_list])
-                aggregated_info['leverage'] = np.array([info.get('leverage', 0.0) for info in info_list])
-            else:
-                aggregated_info = info_list  # assume already aggregated
-
-            # === Store collected data ===
-            obs_buf.append(torch.as_tensor(obs, device='cpu'))
-            act_buf.append(action)
-            logp_buf.append(log_prob)
-            rew_buf.append(torch.as_tensor(reward, dtype=torch.float32))
-            done_buf.append(torch.as_tensor(done, dtype=torch.float32))
-            val_buf.append(value)
-            infos.append(aggregated_info)  # store aggregated info
-
-            # === Episode rewards ===
-            for i in range(n_envs):
-                ep_rewards[i].append(reward[i])
-                if done[i]:
-                    ep_rewards[i] = []  # reset after episode end
-
+            # Move to next
             obs = next_obs
 
-        batch = {
-            'obs': torch.stack(obs_buf),    # [rollout_len, num_envs, feature_dim]
-            'act': torch.stack(act_buf),
-            'logp': torch.stack(logp_buf),
-            'rew': torch.stack(rew_buf),
-            'done': torch.stack(done_buf),
-            'val': torch.stack(val_buf),
-            'infos': infos,
-            'ep_rewards': ep_rewards,
-        }
+        # Convert lists to arrays
+        for key in ["obs", "actions", "rewards", "dones", "log_probs", "values"]:
+            batch[key] = np.asarray(batch[key])
+
+        # Compute advantages and returns
+        batch["advantages"], batch["returns"] = self._compute_gae_values(
+            rewards=batch["rewards"],
+            dones=batch["dones"],
+            values=batch["values"]
+        )
 
         return batch
 
-    @staticmethod
-    def reset_hidden_state(hidden_state, done):
-        """Reset hidden states where episodes ended."""
-        if hidden_state is None:
-            return None
+    def _compute_gae_values(self, rewards, dones, values):
+        """
+        rewards: [T, n_envs]
+        dones: [T, n_envs]
+        values: [T, n_envs]
+        """
+        advantages = np.zeros_like(rewards)
+        returns = np.zeros_like(rewards)
 
-        done = torch.as_tensor(done, device=hidden_state.device, dtype=torch.float32).view(-1, 1)
+        # Bootstrap with the last value
+        next_value = np.zeros((self.n_envs,))
+        gae = np.zeros((self.n_envs,))
 
-        if isinstance(hidden_state, tuple):
-            return tuple(h * (1.0 - done) for h in hidden_state)
-        else:
-            return hidden_state * (1.0 - done)
+        for step in reversed(range(self.buffer_size)):
+            delta = rewards[step] + self.gamma * next_value * (1.0 - dones[step]) - values[step]
+            gae = delta + self.gamma * self.gae_lambda * (1.0 - dones[step]) * gae
+            advantages[step] = gae
+            returns[step] = advantages[step] + values[step]
+            next_value = values[step]
+
+        return advantages, returns

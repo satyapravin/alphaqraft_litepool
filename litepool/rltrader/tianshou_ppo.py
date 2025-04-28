@@ -81,7 +81,7 @@ def save_checkpoint(epoch, env_step):
     print(f"Saved checkpoint at epoch {epoch}, step {env_step}")
 
 # === PPO Collector ===
-collector = PPOCollector(env, policy, rollout_len=2048, device=device)
+collector = PPOCollector(env, policy, buffer_size=2048, device=device)
 
 # === GAE computation ===
 def compute_gae(rewards, values, dones, gamma=0.99, gae_lambda=0.95):
