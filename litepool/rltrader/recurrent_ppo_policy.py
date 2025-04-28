@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+import numpy as np
 
 class RecurrentPPOPolicy:
     def __init__(self, model, lr=3e-4, gamma=0.99, gae_lambda=0.95, clip_eps=0.2, vf_coef=0.5, ent_coef=0.01, max_grad_norm=0.5):
@@ -13,15 +14,19 @@ class RecurrentPPOPolicy:
         self.max_grad_norm = max_grad_norm
 
     def forward(self, obs, hidden_state=None):
-        logits, values = self.model.forward(obs, hidden_state)
-        dist = torch.distributions.Categorical(logits=logits)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
-        return action, log_prob, values, hidden_state
+        dist, value, new_hidden_state = self.model.forward(obs, hidden_state)
+
+        raw_action = dist.rsample()  # reparameterized sample
+        action = torch.tanh(raw_action)  # squash
+
+        log_prob = dist.log_prob(raw_action).sum(-1)
+        log_prob -= (2 * (np.log(2) - raw_action - F.softplus(-2 * raw_action))).sum(dim=-1)
+
+        return action, log_prob, value, new_hidden_state
 
     def forward_train(self, obs_seq):
-        logits, values = self.model.forward_sequence(obs_seq)
-        return logits, values
+        dist, value = self.model.forward_sequence(obs_seq)
+        return dist, value
 
     def learn(self, minibatch):
         obs = minibatch['obs']
@@ -30,11 +35,14 @@ class RecurrentPPOPolicy:
         adv = minibatch['adv']
         ret = minibatch['ret']
 
-        logits, values = self.forward_train(obs)
+        dist, values = self.forward_train(obs)
 
-        dist = torch.distributions.Categorical(logits=logits)
-        new_logp = dist.log_prob(act)
-        entropy = dist.entropy().mean()
+        # Invert tanh to get pre-squashed action
+        raw_action = torch.atanh(act.clamp(-0.999, 0.999))
+        new_logp = dist.log_prob(raw_action).sum(-1)
+        new_logp -= (2 * (np.log(2) - raw_action - F.softplus(-2 * raw_action))).sum(dim=-1)
+
+        entropy = dist.entropy().sum(-1).mean()
 
         ratio = (new_logp - old_logp).exp()
         surr1 = ratio * adv
@@ -42,7 +50,6 @@ class RecurrentPPOPolicy:
         actor_loss = -torch.min(surr1, surr2).mean()
 
         value_loss = F.mse_loss(values.flatten(), ret.flatten())
-
         loss = actor_loss + self.vf_coef * value_loss - self.ent_coef * entropy
 
         self.optimizer.zero_grad()

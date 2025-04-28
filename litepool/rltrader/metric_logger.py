@@ -4,6 +4,16 @@ import torch
 import numpy as np
 import torch
 
+def to_scalar(value):
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().numpy()
+    if isinstance(value, np.ndarray):
+        if value.size == 1:
+            return value.item()
+        else:
+            return value.mean().item()
+    return float(value)
+
 class MetricLogger:
     def __init__(self, print_interval=1000):
         self.print_interval = print_interval
@@ -36,13 +46,6 @@ class MetricLogger:
 
             # Calculate net PnL
             net_pnl = realized_pnl + unrealized_pnl - fees
-
-            # Convert to scalar if needed (in case values are tensors or arrays)
-            def to_scalar(value):
-                if isinstance(value, (torch.Tensor, np.ndarray)):
-                    return value.item() if value.size == 1 else float(value)
-                return float(value)
-
             net_pnl = to_scalar(net_pnl)
             realized_pnl = to_scalar(realized_pnl)
             unrealized_pnl = to_scalar(unrealized_pnl)

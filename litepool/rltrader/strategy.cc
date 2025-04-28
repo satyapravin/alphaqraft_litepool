@@ -24,8 +24,12 @@ void Strategy::reset() {
 	double initQty = 0;
 	double avgPrice = 0;
 	this->exchange.fetchPosition(initQty, avgPrice, false);
-        std::cout << "initial quantity=" << initQty << std::endl;
-        std::cout << "initial price=" << avgPrice << std::endl;
+
+	if (!exchange.isDummy()) {
+            std::cout << "initial quantity=" << initQty << std::endl;
+            std::cout << "initial price=" << avgPrice << std::endl;
+	}
+
 	this->position.reset(initQty, avgPrice);
 	this->order_id = 0;
 }

@@ -74,7 +74,10 @@ class PPOCollector:
         """Reset hidden states where episodes ended."""
         if hidden_state is None:
             return None
+
+        done = torch.as_tensor(done, device=hidden_state.device, dtype=torch.float32).view(-1, 1)
+
         if isinstance(hidden_state, tuple):
-            return tuple(h * (1.0 - torch.as_tensor(done, device=h.device).view(-1, 1)) for h in hidden_state)
+            return tuple(h * (1.0 - done) for h in hidden_state)
         else:
-            return hidden_state * (1.0 - torch.as_tensor(done, device=hidden_state.device).view(-1, 1))
+            return hidden_state * (1.0 - done)
