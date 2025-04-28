@@ -30,7 +30,7 @@ class MetricLogger:
         num_envs = len(rew) if isinstance(rew, (np.ndarray, list)) else 64
         env_ids = range(num_envs)
         infos = infos['infos'][-1]
-        print(rew[0])
+        rewlast = rew[-1]
 
         for env_id in env_ids:
             # Now correctly handle infos as a list of dicts
@@ -40,7 +40,7 @@ class MetricLogger:
             trades = infos['trade_count'][env_id] 
             drawdown = infos['drawdown'][env_id] 
             leverage = infos['leverage'][env_id] 
-            reward = to_scalar(rew[env_id]) if isinstance(rew, (np.ndarray, list)) and len(rew) > env_id else 0.0
+            reward = rewlast[env_id].item() if isinstance(rewlast, (torch.Tensor, np.ndarray)) else rewlast[env_id]
 
             net_pnl = realized_pnl + unrealized_pnl - fees
 
@@ -53,6 +53,16 @@ class MetricLogger:
                   f"{drawdown:+10.6f} | "
                   f"{leverage:+10.6f} | "
                   f"{reward:+10.6f}")
+
+        if isinstance(rew, torch.Tensor):
+            rew = rew.detach().cpu().numpy()
+        rew_flat = rew.flatten()
+        avg_reward = np.mean(rew_flat)
+        min_reward = np.min(rew_flat)
+        max_reward = np.max(rew_flat)
+
+        print(f"\n[Rewards] Avg: {avg_reward:+.6f} | Min: {min_reward:+.6f} | Max: {max_reward:+.6f}")
+
 
         if hasattr(policy, 'get_alpha'):
             alpha = policy.get_alpha.item() if isinstance(policy.get_alpha, torch.Tensor) else policy.get_alpha

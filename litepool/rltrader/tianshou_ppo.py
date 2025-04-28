@@ -135,7 +135,7 @@ def train(epochs=100, rollout_len=2048, minibatch_seq_len=128, minibatch_envs=8,
               f"Value Loss: {loss_info['value_loss']:.3f} | "
               f"Entropy: {loss_info['entropy_loss']:.3f}")
 
-        save_checkpoint(epoch, env_step=global_step)
+        #save_checkpoint(epoch, env_step=global_step)
 
         # Reset episode reward tracking if needed
         if hasattr(collector, 'reset_episode_rewards'):
