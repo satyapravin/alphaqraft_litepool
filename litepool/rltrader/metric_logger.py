@@ -18,7 +18,7 @@ class MetricLogger:
         self.episode_rewards = []
         self.episode_lengths = []
 
-    def log(self, step_count, info, rew, policy):
+    def log(self, step_count, infos, rew, policy):
         if step_count % self.print_interval != 0:
             return
         self.last_print_step = step_count
@@ -29,14 +29,17 @@ class MetricLogger:
 
         num_envs = len(rew) if isinstance(rew, (np.ndarray, list)) else 64
         env_ids = range(num_envs)
+        infos = infos['infos'][-1]
+        print(rew[0])
 
         for env_id in env_ids:
-            realized_pnl = to_scalar(info.get('realized_pnl', np.zeros(num_envs))[env_id])
-            unrealized_pnl = to_scalar(info.get('unrealized_pnl', np.zeros(num_envs))[env_id])
-            fees = to_scalar(info.get('fees', np.zeros(num_envs))[env_id])
-            trades = to_scalar(info.get('trade_count', np.zeros(num_envs))[env_id])
-            drawdown = to_scalar(info.get('drawdown', np.zeros(num_envs))[env_id])
-            leverage = to_scalar(info.get('leverage', np.zeros(num_envs))[env_id])
+            # Now correctly handle infos as a list of dicts
+            realized_pnl = infos['realized_pnl'][env_id]
+            unrealized_pnl = infos['unrealized_pnl'][env_id]
+            fees = infos['fees'][env_id]
+            trades = infos['trade_count'][env_id] 
+            drawdown = infos['drawdown'][env_id] 
+            leverage = infos['leverage'][env_id] 
             reward = to_scalar(rew[env_id]) if isinstance(rew, (np.ndarray, list)) and len(rew) > env_id else 0.0
 
             net_pnl = realized_pnl + unrealized_pnl - fees
