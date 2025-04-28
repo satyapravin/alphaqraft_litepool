@@ -142,7 +142,7 @@ def train(epochs=100, rollout_len=2048, minibatch_seq_len=128, minibatch_envs=8,
                     minibatch = Batch(
                         obs=batch['obs'][start_t:end_t, start_e:end_e],
                         act=batch['act'][start_t:end_t, start_e:end_e],
-                        log_prob=batch['log_prob'][start_t:end_t, start_e:end_e],
+                        log_prob=batch['logp'][start_t:end_t, start_e:end_e],
                         value=batch['val'][start_t:end_t, start_e:end_e],
                         rew=batch['rew'][start_t:end_t, start_e:end_e],
                         done=batch['done'][start_t:end_t, start_e:end_e],

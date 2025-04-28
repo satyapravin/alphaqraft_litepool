@@ -112,14 +112,14 @@ void Strategy::quote(const double& bid_spread,
 	        this->exchange.quote(std::to_string(++order_id), OrderSide::BUY, bid_price, bid_size);
 	    }
 	    else {
-		std::cout << "BIDS ARE ZERO\t" << bid_price << "\t" << bid_size_0 << std::endl;
+		//std::cout << "BIDS ARE ZERO\t" << bid_price << "\t" << bid_size_0 << std::endl;
 	    }
 	    if (ask_size > 0) {
 		//std::cout << "Asks" << "\t" << ask_price << "\t" << ask_size << std::endl;
                 this->exchange.quote(std::to_string(++order_id), OrderSide::SELL, ask_price, ask_size);
 	    }
 	    else {
-		std::cout << "ASKS ARE ZERO\t" << ask_price << "\t" << ask_size_0 << std::endl;
+		//std::cout << "ASKS ARE ZERO\t" << ask_price << "\t" << ask_size_0 << std::endl;
 	    }
 	}
 }
