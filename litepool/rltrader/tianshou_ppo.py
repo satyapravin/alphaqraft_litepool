@@ -5,7 +5,7 @@ from pathlib import Path
 import litepool
 from tianshou.data import Batch
 from vec_normalizer import VecNormalize
-from metric_logger import MetricLogger  # <-- NEW
+from metric_logger import MetricLogger
 from datetime import datetime
 
 from recurrent_actor_critic import RecurrentActorCritic
@@ -49,7 +49,7 @@ model = RecurrentActorCritic(
 
 policy = RecurrentPPOPolicy(
     model=model,
-    action_space=env_action_space,
+    #action_space=env_action_space,
     lr=3e-4,
     gamma=0.99,
     gae_lambda=0.95,
@@ -64,7 +64,7 @@ results_dir = Path("results")
 results_dir.mkdir(exist_ok=True)
 
 # === Metric Logger ===
-metric_logger = MetricLogger(print_interval=6400)  # 6400 steps (100 episodes if avg 64 envs done)
+metric_logger = MetricLogger(print_interval=6400)
 
 # === Checkpoint saving ===
 def save_checkpoint(epoch, env_step):
@@ -81,48 +81,99 @@ def save_checkpoint(epoch, env_step):
     print(f"Saved checkpoint at epoch {epoch}, step {env_step}")
 
 # === PPO Collector ===
-collector = PPOCollector(env, policy, rollout_len=2048)
+collector = PPOCollector(env, policy, rollout_len=2048, device=device)
+
+# === GAE computation ===
+def compute_gae(rewards, values, dones, gamma=0.99, gae_lambda=0.95):
+    rollout_len, num_envs = rewards.shape
+    advantages = torch.zeros_like(rewards)
+    last_advantage = torch.zeros(num_envs, device=rewards.device)
+
+    for t in reversed(range(rollout_len)):
+        if t == rollout_len - 1:
+            next_value = torch.zeros(num_envs, device=rewards.device)
+            next_done = torch.ones(num_envs, device=rewards.device)
+        else:
+            next_value = values[t + 1]
+            next_done = dones[t + 1]
+
+        delta = rewards[t] + gamma * next_value * (1.0 - next_done) - values[t]
+        advantages[t] = last_advantage = delta + gamma * gae_lambda * (1.0 - next_done) * last_advantage
+
+    returns = advantages + values
+    return advantages, returns
 
 # === PPO Training Loop ===
-def train(epochs=100, rollout_len=2048, batch_size=64, update_epochs=4):
+def train(epochs=100, rollout_len=2048, minibatch_seq_len=128, minibatch_envs=8, update_epochs=4):
     global_step = 0
     for epoch in range(epochs):
         batch = collector.collect()
 
-        advantages, returns = policy.compute_gae(batch.rew, batch.value, batch.done)
-        batch.advantages = advantages
-        batch.returns = returns
+        # Compute advantages
+        advantages, returns = compute_gae(
+            rewards=batch['rew'],
+            values=batch['val'],
+            dones=batch['done'],
+            gamma=policy.gamma,
+            gae_lambda=policy.gae_lambda
+        )
+        batch['adv'] = advantages
+        batch['ret'] = returns
 
-        dataset_size = len(batch.obs)
-        indices = np.arange(dataset_size)
+        # Normalize advantages
+        adv_flat = batch['adv'].view(-1)
+        batch['adv'] = (batch['adv'] - adv_flat.mean()) / (adv_flat.std() + 1e-8)
 
+        rollout_len, num_envs = batch['obs'].shape[:2]
+
+
+        # Train policy
         for _ in range(update_epochs):
-            np.random.shuffle(indices)
-            for start in range(0, dataset_size, batch_size):
-                end = start + batch_size
-                minibatch = Batch(
-                    obs=batch.obs[indices[start:end]],
-                    act=batch.act[indices[start:end]],
-                    log_prob=batch.log_prob[indices[start:end]],
-                    value=batch.value[indices[start:end]],
-                    advantages=batch.advantages[indices[start:end]],
-                    returns=batch.returns[indices[start:end]]
-                )
-                loss_info = policy.learn(minibatch)
+            for start_t in range(0, rollout_len, minibatch_seq_len):
+                end_t = start_t + minibatch_seq_len
+                if end_t > rollout_len:
+                    break
+
+                for start_e in range(0, num_envs, minibatch_envs):
+                    end_e = start_e + minibatch_envs
+                    if end_e > num_envs:
+                        break
+
+                    minibatch = Batch(
+                        obs=batch['obs'][start_t:end_t, start_e:end_e],
+                        act=batch['act'][start_t:end_t, start_e:end_e],
+                        log_prob=batch['log_prob'][start_t:end_t, start_e:end_e],
+                        value=batch['val'][start_t:end_t, start_e:end_e],
+                        rew=batch['rew'][start_t:end_t, start_e:end_e],
+                        done=batch['done'][start_t:end_t, start_e:end_e],
+                        adv=batch['adv'][start_t:end_t, start_e:end_e],
+                        ret=batch['ret'][start_t:end_t, start_e:end_e],
+                    )
+
+                    minibatch.to_torch(device=device)
+                    loss_info = policy.learn(minibatch)
 
         # === MetricLogger Integration ===
-        latest_info = batch.infos[-1] if len(batch.infos) > 0 else {}  # Use last infos
+        all_ep_rewards = [r for env_rewards in batch.ep_rewards for r in env_rewards]
+        avg_reward = np.mean(all_ep_rewards) if len(all_ep_rewards) > 0 else 0.0
+
+        latest_info = batch.infos[-1] if len(batch.infos) > 0 else {}
         rew = batch.rew[-num_of_envs:].cpu().numpy() if isinstance(batch.rew, torch.Tensor) else batch.rew[-num_of_envs:]
+
         metric_logger.log(global_step, latest_info, rew, policy)
 
-        print(f"Epoch {epoch+1} | Loss: {loss_info['loss']:.3f} | Policy Loss: {loss_info['policy_loss']:.3f} | Value Loss: {loss_info['value_loss']:.3f} | Entropy: {loss_info['entropy']:.3f}")
+        print(f"Epoch {epoch+1} | Loss: {loss_info['loss']:.3f} | Policy Loss: {loss_info['actor_loss']:.3f} | Value Loss: {loss_info['value_loss']:.3f} | Entropy: {loss_info['entropy_loss']:.3f} | Avg Reward: {avg_reward:.2f}")
 
         save_checkpoint(epoch, env_step=global_step)
 
         global_step += rollout_len
 
-    # After all epochs, save final model for inference
+        # Reset episode reward tracking
+        collector.reset_episode_rewards()
+
+    # After all epochs, save final weights
     torch.save(policy.model.state_dict(), results_dir / "final_model_inference.pth")
+    env.save(results_dir / "vecnorm.pth")
     print(f"Final model for inference saved at {results_dir / 'final_model_inference.pth'}")
 
 # === Run training ===

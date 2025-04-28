@@ -1,13 +1,23 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Normal, Independent
 
-class RecurrentPPOPolicy:
-    def __init__(self, model, action_space, lr=3e-4, gamma=0.99, gae_lambda=0.95,
-                 clip_eps=0.2, vf_coef=0.5, ent_coef=0.01, max_grad_norm=0.5):
-        self.model = model
-        self.device = model.device
-        self.action_space = action_space
+class RecurrentPPOPolicy(nn.Module):
+    def __init__(
+        self,
+        model,
+        lr=3e-4,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_eps=0.2,
+        vf_coef=0.5,
+        ent_coef=0.01,
+        max_grad_norm=0.5,
+    ):
+        super().__init__()
+
+        self.model = model  # <-- Your custom RecurrentActorCritic
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
 
         self.gamma = gamma
         self.gae_lambda = gae_lambda
@@ -16,54 +26,37 @@ class RecurrentPPOPolicy:
         self.ent_coef = ent_coef
         self.max_grad_norm = max_grad_norm
 
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+    def forward(self, obs, hidden_state):
+        """Forward single step for collector."""
+        return self.model(obs, hidden_state)
 
-    def forward(self, obs, state=None):
-        mean, std, value, new_state = self.model(obs, state)
-        dist = Independent(Normal(mean, std), 1)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
-        return action, log_prob, value.squeeze(-1), new_state
+    def forward_train(self, obs_seq):
+        """Forward full sequence for training."""
+        return self.model.forward_sequence(obs_seq)
 
-    def compute_gae(self, rewards, values, dones):
-        rewards = rewards.cpu().numpy()
-        values = values.cpu().numpy()
-        dones = dones.cpu().numpy()
+    def learn(self, minibatch):
+        """Update policy using PPO clipped loss."""
+        obs = minibatch.obs
+        act = minibatch.act
+        old_logp = minibatch.log_prob
+        adv = minibatch.adv
+        ret = minibatch.ret
 
-        advantages = []
-        gae = 0
-        next_value = 0
+        logits, values = self.forward_train(obs)
+        dist = torch.distributions.Categorical(logits=logits)
+        new_logp = dist.log_prob(act)
+        entropy = dist.entropy()
 
-        for step in reversed(range(len(rewards))):
-            delta = rewards[step] + self.gamma * (1 - dones[step]) * next_value - values[step]
-            gae = delta + self.gamma * self.gae_lambda * (1 - dones[step]) * gae
-            advantages.insert(0, gae)
-            next_value = values[step]
+        ratio = (new_logp - old_logp).exp()
+        surr1 = ratio * adv
+        surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
+        actor_loss = -torch.min(surr1, surr2).mean()
 
-        advantages = torch.tensor(advantages, dtype=torch.float32, device=self.device)
-        returns = advantages + torch.tensor(values, dtype=torch.float32, device=self.device)
-        return advantages, returns
+        value_loss = F.mse_loss(values, ret)
 
-    def learn(self, batch):
-        obs = batch.obs.to(self.device)
-        act = batch.act.to(self.device)
-        old_log_prob = batch.log_prob.to(self.device)
-        advantages = batch.advantages.to(self.device)
-        returns = batch.returns.to(self.device)
+        entropy_loss = -entropy.mean()
 
-        mean, std, value, _ = self.model(obs)
-        dist = Independent(Normal(mean, std), 1)
-        log_prob = dist.log_prob(act)
-        entropy = dist.entropy().mean()
-
-        ratio = (log_prob - old_log_prob).exp()
-        surrogate1 = ratio * advantages
-        surrogate2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages
-        policy_loss = -torch.min(surrogate1, surrogate2).mean()
-
-        value_loss = F.mse_loss(value.squeeze(-1), returns)
-
-        loss = policy_loss + self.vf_coef * value_loss - self.ent_coef * entropy
+        loss = actor_loss + self.vf_coef * value_loss + self.ent_coef * entropy_loss
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -72,7 +65,27 @@ class RecurrentPPOPolicy:
 
         return {
             "loss": loss.item(),
-            "policy_loss": policy_loss.item(),
+            "actor_loss": actor_loss.item(),
             "value_loss": value_loss.item(),
-            "entropy": entropy.item()
+            "entropy_loss": entropy_loss.item(),
         }
+
+    def compute_gae(self, rewards, values, dones):
+        """Compute GAE."""
+        rollout_len, num_envs = rewards.shape
+        advantages = torch.zeros_like(rewards)
+        last_advantage = torch.zeros(num_envs, device=rewards.device)
+
+        for t in reversed(range(rollout_len)):
+            if t == rollout_len - 1:
+                next_value = torch.zeros(num_envs, device=rewards.device)
+                next_done = torch.ones(num_envs, device=rewards.device)
+            else:
+                next_value = values[t + 1]
+                next_done = dones[t + 1]
+
+            delta = rewards[t] + self.gamma * next_value * (1.0 - next_done) - values[t]
+            advantages[t] = last_advantage = delta + self.gamma * self.gae_lambda * (1.0 - next_done) * last_advantage
+
+        returns = advantages + values
+        return advantages, returns

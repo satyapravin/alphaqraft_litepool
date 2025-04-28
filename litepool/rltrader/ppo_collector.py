@@ -1,53 +1,102 @@
-import torch
 import numpy as np
-from tianshou.data import Batch
+import torch
+
+def flatten_obs(obs):
+    """Flatten a single observation into a flat float32 numpy array."""
+    if isinstance(obs, (tuple, list)):
+        obs = np.concatenate([np.asarray(part, dtype=np.float32).flatten() for part in obs], axis=0)
+    else:
+        obs = np.asarray(obs, dtype=np.float32)
+    return obs
+
+def reset_hidden_state(hidden_state, done):
+    """Reset hidden states where the episode is done."""
+    if hidden_state is None:
+        return None
+
+    done_tensor = torch.as_tensor(done, dtype=torch.bool, device=hidden_state[0].device if isinstance(hidden_state, tuple) else hidden_state.device)
+
+    if isinstance(hidden_state, tuple):
+        # For LSTM (h, c)
+        return tuple(
+            h.masked_fill(done_tensor.view(1, -1, 1), 0.0)
+            for h in hidden_state
+        )
+    else:
+        # For GRU or RNN (single tensor)
+        return hidden_state.masked_fill(done_tensor.view(1, -1, 1), 0.0)
 
 class PPOCollector:
-    def __init__(self, env, policy, rollout_len):
+    def __init__(self, env, policy, rollout_len, device='cpu'):
+        """
+        env: Vectorized environment (e.g., EnvPool or gym.vector)
+        policy: Your recurrent policy model
+        rollout_len: Number of steps to collect (per environment)
+        device: 'cpu' or 'cuda'
+        """
         self.env = env
         self.policy = policy
         self.rollout_len = rollout_len
-        self.device = policy.device
-        self.obs, _ = env.reset()
-        self.done = np.zeros(env.num_envs, dtype=bool)
-        self.num_envs = env.num_envs
-        self.state = torch.zeros(policy.model.gru.num_layers, self.num_envs, policy.model.gru.hidden_size, device=self.device)
+        self.device = device
 
     def collect(self):
-        obs_buf, act_buf, logp_buf, val_buf, rew_buf, done_buf, info_buf = [], [], [], [], [], [], []
+        obs_buf = []
+        act_buf = []
+        logp_buf = []
+        rew_buf = []
+        done_buf = []
+        val_buf = []
 
-        for _ in range(self.rollout_len):
-            obs_tensor = torch.tensor(self.obs, dtype=torch.float32, device=self.device)
-            action, log_prob, value, new_state = self.policy.forward(obs_tensor, self.state)
+        hidden_state = None
+
+        obs, _ = self.env.reset()
+        obs = flatten_obs(obs)
+        if len(obs.shape) == 1:
+            obs = np.expand_dims(obs, axis=0)  # Ensure batch dimension if single env
+
+        n_envs = obs.shape[0]
+
+        for step in range(self.rollout_len):
+            with torch.no_grad():
+                obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+                action, log_prob, value, hidden_state = self.policy.forward(obs_tensor, hidden_state)
+
+                # Detach outputs to CPU
+                action = action.detach().cpu()
+                log_prob = log_prob.detach().cpu()
+                value = value.detach().cpu()
 
             # Step environment
-            next_obs, reward, terminated, truncated, infos = self.env.step(action.cpu().numpy())
+            action_env = action.numpy()
+            next_obs, reward, terminated, truncated, info = self.env.step(action_env)
+            
             done = np.logical_or(terminated, truncated)
 
-            obs_buf.append(self.obs)
-            act_buf.append(action.cpu().numpy())
-            logp_buf.append(log_prob.cpu().detach().numpy())
-            val_buf.append(value.cpu().detach().numpy())
-            rew_buf.append(reward)
-            done_buf.append(done)
-            info_buf.append(infos)  # <-- Save info at each step
+            next_obs = flatten_obs(next_obs)
+            if len(next_obs.shape) == 1:
+                next_obs = np.expand_dims(next_obs, axis=0)
 
-            # Reset GRU hidden state for finished environments
-            for env_idx, done_flag in enumerate(done):
-                if done_flag:
-                    new_state[:, env_idx, :] = 0.0
+            # Reset hidden states where episodes ended
+            hidden_state = reset_hidden_state(hidden_state, done)
 
-            self.obs = next_obs
-            self.done = done
-            self.state = new_state
+            # Save rollout step
+            obs_buf.append(torch.as_tensor(obs, device='cpu'))  # (n_envs, feature_dim)
+            act_buf.append(action)                              # (n_envs, action_dim)
+            logp_buf.append(log_prob)                           # (n_envs, 1) or (n_envs,)
+            rew_buf.append(torch.as_tensor(reward, dtype=torch.float32))  # (n_envs,)
+            done_buf.append(torch.as_tensor(done, dtype=torch.float32))   # (n_envs,)
+            val_buf.append(value)                               # (n_envs, 1)
 
-        batch = Batch(
-            obs=torch.tensor(np.array(obs_buf), dtype=torch.float32).reshape(-1, *obs_buf[0].shape[2:]),
-            act=torch.tensor(np.array(act_buf), dtype=torch.float32).reshape(-1, *act_buf[0].shape[2:]),
-            log_prob=torch.tensor(np.array(logp_buf), dtype=torch.float32).reshape(-1),
-            value=torch.tensor(np.array(val_buf), dtype=torch.float32).reshape(-1),
-            rew=torch.tensor(np.array(rew_buf), dtype=torch.float32).reshape(-1),
-            done=torch.tensor(np.array(done_buf), dtype=torch.float32).reshape(-1),
-            infos=info_buf  # <-- Include all info dicts
-        )
+            obs = next_obs
+
+        # Stack rollout buffers
+        batch = {
+            'obs': torch.stack(obs_buf),    # (rollout_len, n_envs, feature_dim)
+            'act': torch.stack(act_buf),    # (rollout_len, n_envs, action_dim)
+            'logp': torch.stack(logp_buf),  # (rollout_len, n_envs)
+            'rew': torch.stack(rew_buf),    # (rollout_len, n_envs)
+            'done': torch.stack(done_buf),  # (rollout_len, n_envs)
+            'val': torch.stack(val_buf),    # (rollout_len, n_envs)
+        }
+
         return batch
