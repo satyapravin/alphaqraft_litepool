@@ -21,6 +21,7 @@ class PPOCollector:
         batch_values = []
         batch_rewards = []
         batch_dones = []
+        batch_infos = []
 
         # Initialize per-env hidden states
         hidden_state = self.policy.init_hidden_state(batch_size=n_envs)
@@ -41,6 +42,7 @@ class PPOCollector:
             batch_values.append(value.detach().cpu())
             batch_rewards.append(torch.as_tensor(reward, dtype=torch.float32))
             batch_dones.append(torch.as_tensor(done, dtype=torch.float32))
+            batch_infos.append(info)
 
             # Reset hidden states and obs for envs that finished
             finished = np.logical_or(done, truncated)
@@ -101,6 +103,7 @@ class PPOCollector:
             "dones": batch_dones.to(self.device),
             "advantages": advantages.to(self.device),
             "returns": returns.to(self.device),
+            "infos": batch_infos,
         }
 
         return batch

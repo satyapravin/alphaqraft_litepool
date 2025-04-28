@@ -90,16 +90,12 @@ def train(epochs=100, rollout_len=2048, minibatch_seq_len=128, minibatch_envs=8,
         
         # === Compute advantages ===
         advantages, returns = batch["advantages"], batch["returns"]
-
+        
         # Normalize advantages
-        advantages = torch.tensor(advantages, device=device)
+        advantages = advantages.to(device)
         adv_flat = advantages.view(-1)
         advantages = (advantages - adv_flat.mean()) / (adv_flat.std() + 1e-8)
-
-        # Save back normalized advantages to batch
-        batch["advantages"] = advantages.cpu().detach().numpy()
-
-        rollout_len, num_envs = batch["obs"].shape[:2]
+        batch["advantages"] = advantages
 
         # === Train policy ===
         for _ in range(update_epochs):
@@ -108,18 +104,18 @@ def train(epochs=100, rollout_len=2048, minibatch_seq_len=128, minibatch_envs=8,
                 if end_t > rollout_len:
                     break
 
-                for start_e in range(0, num_envs, minibatch_envs):
+                for start_e in range(0, num_of_envs, minibatch_envs):
                     end_e = start_e + minibatch_envs
-                    if end_e > num_envs:
+                    if end_e > num_of_envs:
                         break
 
                     minibatch = {
-                        'obs': torch.tensor(batch['obs'][start_t:end_t, start_e:end_e]).to(device),
-                        'act': torch.tensor(batch['actions'][start_t:end_t, start_e:end_e]).to(device),
-                        'logp': torch.tensor(batch['log_probs'][start_t:end_t, start_e:end_e]).to(device),
-                        'val': torch.tensor(batch['values'][start_t:end_t, start_e:end_e]).to(device),
-                        'adv': torch.tensor(batch['advantages'][start_t:end_t, start_e:end_e]).to(device),
-                        'ret': torch.tensor(batch['returns'][start_t:end_t, start_e:end_e]).to(device),
+                        'obs': batch['obs'][start_t:end_t, start_e:end_e].to(device),
+                        'act': batch['actions'][start_t:end_t, start_e:end_e].to(device),
+                        'logp': batch['log_probs'][start_t:end_t, start_e:end_e].to(device),
+                        'val': batch['values'][start_t:end_t, start_e:end_e].to(device),
+                        'adv': batch['advantages'][start_t:end_t, start_e:end_e].to(device),
+                        'ret': batch['returns'][start_t:end_t, start_e:end_e].to(device),
                     }
 
                     loss_info = policy.learn(minibatch)
@@ -128,24 +124,16 @@ def train(epochs=100, rollout_len=2048, minibatch_seq_len=128, minibatch_envs=8,
         global_step += rollout_len
 
         # === MetricLogger Integration ===
-        flat_infos = [info for infos_per_step in batch["infos"] for info in infos_per_step]
-        avg_realized_pnl = np.mean([info.get('realized_pnl', 0.0) for info in flat_infos])
-        total_fees = np.sum([info.get('fees', 0.0) for info in flat_infos])
-        avg_trade_count = np.mean([info.get('trade_count', 0) for info in flat_infos])
-
         rew = batch["rewards"][-num_of_envs:]
 
         metric_logger.log(global_step, {
-            "realized_pnl": avg_realized_pnl,
-            "fees": total_fees,
-            "trade_count": avg_trade_count
+            "infos": batch["infos"][-num_of_envs:],
         }, rew, policy)
 
         print(f"Epoch {epoch+1} | Loss: {loss_info['loss']:.3f} | "
               f"Policy Loss: {loss_info['actor_loss']:.3f} | "
               f"Value Loss: {loss_info['value_loss']:.3f} | "
-              f"Entropy: {loss_info['entropy_loss']:.3f} | "
-              f"Avg Realized PnL: {avg_realized_pnl:.4f}")
+              f"Entropy: {loss_info['entropy_loss']:.3f}")
 
         save_checkpoint(epoch, env_step=global_step)
 
