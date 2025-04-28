@@ -64,7 +64,7 @@ results_dir = Path("results")
 results_dir.mkdir(exist_ok=True)
 
 # === Metric Logger ===
-metric_logger = MetricLogger(print_interval=6400)
+metric_logger = MetricLogger(print_interval=512)
 
 # === Checkpoint saving ===
 def save_checkpoint(epoch, env_step):
@@ -109,7 +109,7 @@ def train(epochs=100, rollout_len=2048, minibatch_seq_len=128, minibatch_envs=8,
     for epoch in range(epochs):
         batch = collector.collect()
 
-        # Compute advantages
+        # === Compute advantages ===
         advantages, returns = compute_gae(
             rewards=batch['rew'],
             values=batch['val'],
@@ -126,7 +126,7 @@ def train(epochs=100, rollout_len=2048, minibatch_seq_len=128, minibatch_envs=8,
 
         rollout_len, num_envs = batch['obs'].shape[:2]
 
-        # Train policy
+        # === Train policy ===
         for _ in range(update_epochs):
             for start_t in range(0, rollout_len, minibatch_seq_len):
                 end_t = start_t + minibatch_seq_len
@@ -149,11 +149,14 @@ def train(epochs=100, rollout_len=2048, minibatch_seq_len=128, minibatch_envs=8,
                         'ret': batch['ret'][start_t:end_t, start_e:end_e],
                     }
 
-                    # Move to device
+                    # Move minibatch to device
                     for key in minibatch:
                         minibatch[key] = minibatch[key].to(device)
 
                     loss_info = policy.learn(minibatch)
+
+        # === Update global step BEFORE logging ===
+        global_step += rollout_len
 
         # === MetricLogger Integration ===
         avg_reward = 0.0
@@ -166,11 +169,13 @@ def train(epochs=100, rollout_len=2048, minibatch_seq_len=128, minibatch_envs=8,
 
         metric_logger.log(global_step, latest_info, rew, policy)
 
-        print(f"Epoch {epoch+1} | Loss: {loss_info['loss']:.3f} | Policy Loss: {loss_info['actor_loss']:.3f} | Value Loss: {loss_info['value_loss']:.3f} | Entropy: {loss_info['entropy_loss']:.3f} | Avg Reward: {avg_reward:.2f}")
+        print(f"Epoch {epoch+1} | Loss: {loss_info['loss']:.3f} | "
+              f"Policy Loss: {loss_info['actor_loss']:.3f} | "
+              f"Value Loss: {loss_info['value_loss']:.3f} | "
+              f"Entropy: {loss_info['entropy_loss']:.3f} | "
+              f"Avg Reward: {avg_reward:.2f}")
 
         save_checkpoint(epoch, env_step=global_step)
-
-        global_step += rollout_len
 
         # Reset episode reward tracking
         if hasattr(collector, 'reset_episode_rewards'):

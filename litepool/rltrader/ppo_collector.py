@@ -34,25 +34,39 @@ class PPOCollector:
                 value = value.detach().cpu()
 
             action_env = action.numpy()
-            next_obs, reward, terminated, truncated, info = self.env.step(action_env)
+            next_obs, reward, terminated, truncated, info_list = self.env.step(action_env)
 
             done = np.logical_or(terminated, truncated)
 
             next_obs = np.asarray(next_obs, dtype=np.float32)
             hidden_state = self.reset_hidden_state(hidden_state, done)
 
+            # === Aggregate per-env infos ===
+            aggregated_info = {}
+            if isinstance(info_list, (list, tuple)):
+                aggregated_info['realized_pnl'] = np.array([info.get('realized_pnl', 0.0) for info in info_list])
+                aggregated_info['unrealized_pnl'] = np.array([info.get('unrealized_pnl', 0.0) for info in info_list])
+                aggregated_info['fees'] = np.array([info.get('fees', 0.0) for info in info_list])
+                aggregated_info['trade_count'] = np.array([info.get('trade_count', 0) for info in info_list])
+                aggregated_info['drawdown'] = np.array([info.get('drawdown', 0.0) for info in info_list])
+                aggregated_info['leverage'] = np.array([info.get('leverage', 0.0) for info in info_list])
+            else:
+                aggregated_info = info_list  # assume already aggregated
+
+            # === Store collected data ===
             obs_buf.append(torch.as_tensor(obs, device='cpu'))
             act_buf.append(action)
             logp_buf.append(log_prob)
             rew_buf.append(torch.as_tensor(reward, dtype=torch.float32))
             done_buf.append(torch.as_tensor(done, dtype=torch.float32))
             val_buf.append(value)
-            infos.append(info)
+            infos.append(aggregated_info)  # store aggregated info
 
+            # === Episode rewards ===
             for i in range(n_envs):
                 ep_rewards[i].append(reward[i])
                 if done[i]:
-                    ep_rewards[i] = []
+                    ep_rewards[i] = []  # reset after episode end
 
             obs = next_obs
 
@@ -64,7 +78,7 @@ class PPOCollector:
             'done': torch.stack(done_buf),
             'val': torch.stack(val_buf),
             'infos': infos,
-            'ep_rewards': ep_rewards
+            'ep_rewards': ep_rewards,
         }
 
         return batch
