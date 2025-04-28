@@ -63,3 +63,7 @@ class RecurrentPPOPolicy:
             'value_loss': value_loss.item(),
             'entropy_loss': entropy.item()
         }
+
+    def init_hidden_state(self, batch_size=1):
+        """Initialize the RNN hidden state for a batch of environments."""
+        return self.model.init_hidden_state(batch_size)

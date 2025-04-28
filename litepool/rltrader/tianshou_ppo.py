@@ -3,7 +3,7 @@ import torch
 from torch.optim import Adam
 from pathlib import Path
 import litepool
-from tianshou.data import Batch
+from tianshou.data import Batch  # Not used now but kept
 from vec_normalizer import VecNormalize
 from metric_logger import MetricLogger
 from datetime import datetime
@@ -49,7 +49,6 @@ model = RecurrentActorCritic(
 
 policy = RecurrentPPOPolicy(
     model=model,
-    #action_space=env_action_space,
     lr=3e-4,
     gamma=0.99,
     gae_lambda=0.95,
@@ -81,50 +80,26 @@ def save_checkpoint(epoch, env_step):
     print(f"Saved checkpoint at epoch {epoch}, step {env_step}")
 
 # === PPO Collector ===
-collector = PPOCollector(env, policy, buffer_size=2048, device=device)
-
-# === GAE computation ===
-def compute_gae(rewards, values, dones, gamma=0.99, gae_lambda=0.95):
-    rollout_len, num_envs = rewards.shape
-    advantages = torch.zeros_like(rewards)
-    last_advantage = torch.zeros(num_envs, device=rewards.device)
-
-    for t in reversed(range(rollout_len)):
-        if t == rollout_len - 1:
-            next_value = torch.zeros(num_envs, device=rewards.device)
-            next_done = torch.ones(num_envs, device=rewards.device)
-        else:
-            next_value = values[t + 1]
-            next_done = dones[t + 1]
-
-        delta = rewards[t] + gamma * next_value * (1.0 - next_done) - values[t]
-        advantages[t] = last_advantage = delta + gamma * gae_lambda * (1.0 - next_done) * last_advantage
-
-    returns = advantages + values
-    return advantages, returns
+collector = PPOCollector(env, policy, n_steps=2048)
 
 # === PPO Training Loop ===
 def train(epochs=100, rollout_len=2048, minibatch_seq_len=128, minibatch_envs=8, update_epochs=4):
     global_step = 0
     for epoch in range(epochs):
         batch = collector.collect()
-
+        
         # === Compute advantages ===
-        advantages, returns = compute_gae(
-            rewards=batch['rew'],
-            values=batch['val'],
-            dones=batch['done'],
-            gamma=policy.gamma,
-            gae_lambda=policy.gae_lambda
-        )
-        batch['adv'] = advantages
-        batch['ret'] = returns
+        advantages, returns = batch["advantages"], batch["returns"]
 
         # Normalize advantages
-        adv_flat = batch['adv'].view(-1)
-        batch['adv'] = (batch['adv'] - adv_flat.mean()) / (adv_flat.std() + 1e-8)
+        advantages = torch.tensor(advantages, device=device)
+        adv_flat = advantages.view(-1)
+        advantages = (advantages - adv_flat.mean()) / (adv_flat.std() + 1e-8)
 
-        rollout_len, num_envs = batch['obs'].shape[:2]
+        # Save back normalized advantages to batch
+        batch["advantages"] = advantages.cpu().detach().numpy()
+
+        rollout_len, num_envs = batch["obs"].shape[:2]
 
         # === Train policy ===
         for _ in range(update_epochs):
@@ -139,19 +114,13 @@ def train(epochs=100, rollout_len=2048, minibatch_seq_len=128, minibatch_envs=8,
                         break
 
                     minibatch = {
-                        'obs': batch['obs'][start_t:end_t, start_e:end_e],
-                        'act': batch['act'][start_t:end_t, start_e:end_e],
-                        'logp': batch['logp'][start_t:end_t, start_e:end_e],
-                        'val': batch['val'][start_t:end_t, start_e:end_e],
-                        'rew': batch['rew'][start_t:end_t, start_e:end_e],
-                        'done': batch['done'][start_t:end_t, start_e:end_e],
-                        'adv': batch['adv'][start_t:end_t, start_e:end_e],
-                        'ret': batch['ret'][start_t:end_t, start_e:end_e],
+                        'obs': torch.tensor(batch['obs'][start_t:end_t, start_e:end_e]).to(device),
+                        'act': torch.tensor(batch['actions'][start_t:end_t, start_e:end_e]).to(device),
+                        'logp': torch.tensor(batch['log_probs'][start_t:end_t, start_e:end_e]).to(device),
+                        'val': torch.tensor(batch['values'][start_t:end_t, start_e:end_e]).to(device),
+                        'adv': torch.tensor(batch['advantages'][start_t:end_t, start_e:end_e]).to(device),
+                        'ret': torch.tensor(batch['returns'][start_t:end_t, start_e:end_e]).to(device),
                     }
-
-                    # Move minibatch to device
-                    for key in minibatch:
-                        minibatch[key] = minibatch[key].to(device)
 
                     loss_info = policy.learn(minibatch)
 
@@ -159,25 +128,28 @@ def train(epochs=100, rollout_len=2048, minibatch_seq_len=128, minibatch_envs=8,
         global_step += rollout_len
 
         # === MetricLogger Integration ===
-        avg_reward = 0.0
-        if hasattr(batch, 'ep_rewards') and batch['ep_rewards'] is not None:
-            all_ep_rewards = [r for env_rewards in batch['ep_rewards'] for r in env_rewards]
-            avg_reward = np.mean(all_ep_rewards) if len(all_ep_rewards) > 0 else 0.0
+        flat_infos = [info for infos_per_step in batch["infos"] for info in infos_per_step]
+        avg_realized_pnl = np.mean([info.get('realized_pnl', 0.0) for info in flat_infos])
+        total_fees = np.sum([info.get('fees', 0.0) for info in flat_infos])
+        avg_trade_count = np.mean([info.get('trade_count', 0) for info in flat_infos])
 
-        latest_info = batch['infos'][-1] if hasattr(batch, 'infos') and len(batch['infos']) > 0 else {}
-        rew = batch['rew'][-num_of_envs:].cpu().numpy() if isinstance(batch['rew'], torch.Tensor) else batch['rew'][-num_of_envs:]
+        rew = batch["rewards"][-num_of_envs:]
 
-        metric_logger.log(global_step, latest_info, rew, policy)
+        metric_logger.log(global_step, {
+            "realized_pnl": avg_realized_pnl,
+            "fees": total_fees,
+            "trade_count": avg_trade_count
+        }, rew, policy)
 
         print(f"Epoch {epoch+1} | Loss: {loss_info['loss']:.3f} | "
               f"Policy Loss: {loss_info['actor_loss']:.3f} | "
               f"Value Loss: {loss_info['value_loss']:.3f} | "
               f"Entropy: {loss_info['entropy_loss']:.3f} | "
-              f"Avg Reward: {avg_reward:.2f}")
+              f"Avg Realized PnL: {avg_realized_pnl:.4f}")
 
         save_checkpoint(epoch, env_step=global_step)
 
-        # Reset episode reward tracking
+        # Reset episode reward tracking if needed
         if hasattr(collector, 'reset_episode_rewards'):
             collector.reset_episode_rewards()
 

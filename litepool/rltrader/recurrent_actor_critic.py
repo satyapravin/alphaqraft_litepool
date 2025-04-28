@@ -143,3 +143,7 @@ class RecurrentActorCritic(nn.Module):
         value = self.value_head(critic_feat).squeeze(-1)
 
         return dist, value
+
+    def init_hidden_state(self, batch_size):
+        """Initialize GRU hidden state for a batch."""
+        return torch.zeros(self.gru.num_layers, batch_size, self.gru.hidden_size, device=self.device)
