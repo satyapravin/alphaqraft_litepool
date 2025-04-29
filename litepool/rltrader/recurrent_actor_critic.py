@@ -65,11 +65,14 @@ class RecurrentActorCritic(nn.Module):
         self.to(self.device)
 
     def kl_loss(self):
-        """Calculate total KL divergence for all Bayesian layers"""
+        """Debug-friendly KL calculation"""
         total_kl = 0.0
-        for module in self.modules():
-            if hasattr(module, 'variational_kl_divergence'):  # Correct blitz attribute
-                total_kl += module.variational_kl_divergence()
+        print("\nKL Components:")
+        for name, module in self.named_modules():
+            if isinstance(module, BayesianLinear):
+                layer_kl = module.variational_kl_divergence()
+                print(f"{name:20}: {layer_kl.item():.6f}")
+                total_kl += layer_kl
         return total_kl
 
     def forward(self, obs, state=None):
