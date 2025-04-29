@@ -54,7 +54,7 @@ policy = RecurrentPPOPolicy(
     gae_lambda=0.95,
     clip_eps=0.2,
     vf_coef=0.5,
-    ent_coef=0.01,
+    ent_coef=0.001,
     max_grad_norm=0.5
 )
 
@@ -83,7 +83,7 @@ def save_checkpoint(epoch, env_step):
 collector = PPOCollector(env, policy, n_steps=2048)
 
 # === PPO Training Loop ===
-def train(epochs=100, rollout_len=2048, minibatch_seq_len=128, minibatch_envs=8, update_epochs=4):
+def train(epochs=100, rollout_len=2048, minibatch_seq_len=256, minibatch_envs=64, update_epochs=16):
     global_step = 0
     for epoch in range(epochs):
         batch = collector.collect()

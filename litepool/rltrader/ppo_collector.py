@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+from tqdm import tqdm
 
 class PPOCollector:
     def __init__(self, env, policy, n_steps, gamma=0.99, gae_lambda=0.95, device="cuda"):
@@ -27,7 +28,7 @@ class PPOCollector:
         hidden_state = self.policy.init_hidden_state(batch_size=n_envs)
         hidden_state = self._to_device(hidden_state)  # move hidden_state to correct device if needed
 
-        for _ in range(self.n_steps):
+        for _ in tqdm(range(self.n_steps)):
             # Policy forward
             obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
             action, log_prob, value, next_hidden_state = self.policy.forward(obs_tensor, hidden_state)
