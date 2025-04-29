@@ -13,7 +13,6 @@ class PPOCollector:
 
     def collect(self):
         obs, info = self.env.reset()
-
         n_envs = self.env.num_envs
 
         batch_obs = []
@@ -26,7 +25,7 @@ class PPOCollector:
 
         # Initialize per-env hidden states
         hidden_state = self.policy.init_hidden_state(batch_size=n_envs)
-        hidden_state = self._to_device(hidden_state)  # move hidden_state to correct device if needed
+        hidden_state = self._to_device(hidden_state)
 
         for _ in tqdm(range(self.n_steps)):
             # Policy forward
@@ -37,7 +36,7 @@ class PPOCollector:
             next_obs, reward, done, truncated, info = self.env.step(action_np)
 
             # Save batch data
-            batch_obs.append(obs_tensor.cpu())  # always store CPU tensor for stacking
+            batch_obs.append(obs_tensor.cpu())
             batch_actions.append(action.detach().cpu())
             batch_log_probs.append(log_prob.detach().cpu())
             batch_values.append(value.detach().cpu())
@@ -51,20 +50,34 @@ class PPOCollector:
                 if finished[env_id]:
                     reset_obs, reset_info = self.env.reset(env_id)
                     next_obs[env_id] = reset_obs
-                    # Reset hidden state for that env
-                    if isinstance(hidden_state, tuple):
-                        # LSTM: (h, c)
+
+                    # Handle tuple of 3 GRUs (market, position, trade)
+                    if isinstance(hidden_state, tuple) and len(hidden_state) == 3:
+                        hidden_state = tuple(h.detach().clone() for h in hidden_state)
+                        next_hidden_state = tuple(h.detach().clone() for h in next_hidden_state)
+                        for i in range(3):
+                            hidden_state[i][:, env_id] = 0.0
+                            next_hidden_state[i][:, env_id] = 0.0
+
+                    # Handle LSTM: (h, c)
+                    elif isinstance(hidden_state, tuple):
                         hidden_state = (
                             hidden_state[0].detach().clone(),
                             hidden_state[1].detach().clone()
+                        )
+                        next_hidden_state = (
+                            next_hidden_state[0].detach().clone(),
+                            next_hidden_state[1].detach().clone()
                         )
                         hidden_state[0][:, env_id] = 0.0
                         hidden_state[1][:, env_id] = 0.0
                         next_hidden_state[0][:, env_id] = 0.0
                         next_hidden_state[1][:, env_id] = 0.0
+
+                    # Handle single GRU
                     else:
-                        # GRU or simple RNN
                         hidden_state = hidden_state.detach().clone()
+                        next_hidden_state = next_hidden_state.detach().clone()
                         hidden_state[:, env_id] = 0.0
                         next_hidden_state[:, env_id] = 0.0
 
@@ -128,9 +141,9 @@ class PPOCollector:
         returns = advantages + values
         return advantages, returns
 
+
     def _to_device(self, hidden_state):
-        """Helper: move hidden state to self.device"""
         if isinstance(hidden_state, tuple):
-            return (hidden_state[0].to(self.device), hidden_state[1].to(self.device))
+            return tuple(h.to(self.device) for h in hidden_state)
         else:
             return hidden_state.to(self.device)

@@ -92,10 +92,10 @@ def load_latest_checkpoint():
     return checkpoint['epoch'], checkpoint['env_step']
 
 # === PPO Collector ===
-collector = PPOCollector(env, policy, n_steps=2048)
+collector = PPOCollector(env, policy, n_steps=1024)
 
 # === PPO Training Loop ===
-def train(epochs=100, rollout_len=2048, minibatch_seq_len=256, minibatch_envs=64, update_epochs=16):
+def train(epochs=500, rollout_len=1024, minibatch_seq_len=256, minibatch_envs=64, update_epochs=16):
     # === Try to resume from checkpoint ===
     resume_info = load_latest_checkpoint()
     if resume_info:
