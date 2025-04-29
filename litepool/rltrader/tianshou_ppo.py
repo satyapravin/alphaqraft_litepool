@@ -153,7 +153,8 @@ def train(epochs=500, rollout_len=1024, minibatch_seq_len=256, minibatch_envs=64
         print(f"Epoch {epoch+1} | Loss: {loss_info['loss']:.3f} | "
               f"Policy Loss: {loss_info['actor_loss']:.3f} | "
               f"Value Loss: {loss_info['value_loss']:.3f} | "
-              f"Entropy: {loss_info['entropy_loss']:.3f}")
+              f"Entropy: {loss_info['entropy_loss']:.3f} | "
+              f"KL: {loss_info['kl_loss']:.6f}")
 
         # Save checkpoint after each epoch
         save_checkpoint(epoch, env_step=global_step)

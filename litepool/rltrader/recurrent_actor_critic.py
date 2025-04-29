@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from blitz.modules import BayesianLinear
+from blitz.utils import variational_estimator
 
+@variational_estimator
 class RecurrentActorCritic(nn.Module):
     def __init__(self, action_dim=4, hidden_dim=128, gru_hidden_dim=128, num_layers=2, n_heads=4):
         super().__init__()
@@ -54,8 +57,8 @@ class RecurrentActorCritic(nn.Module):
             nn.ReLU(),
             nn.LayerNorm(hidden_dim)
         )
-
-        self.mean = nn.Linear(hidden_dim, action_dim)
+        
+        self.mean = BayesianLinear(hidden_dim, action_dim)
         self.log_std = nn.Linear(hidden_dim, action_dim)
         self.value_head = nn.Linear(hidden_dim, 1)
 

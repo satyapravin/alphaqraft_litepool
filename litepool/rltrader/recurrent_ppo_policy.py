@@ -32,36 +32,48 @@ class RecurrentPPOPolicy:
         obs = minibatch['obs']
         act = minibatch['act']
         old_logp = minibatch['logp']
+        val = minibatch['val']
         adv = minibatch['adv']
         ret = minibatch['ret']
-        state = minibatch.get('state', None)
+        state = minibatch['state']
 
-        dist, values, _ = self.forward_train(obs, state)
-
-        raw_action = torch.atanh(act.clamp(-0.999, 0.999))
-        new_logp = dist.log_prob(raw_action).sum(-1)
-        new_logp -= (2 * (np.log(2) - raw_action - F.softplus(-2 * raw_action))).sum(dim=-1)
-
+        self.model.train()
+        dist, values, _ = self.model(obs, state)
+        logp = dist.log_prob(act).sum(-1)
         entropy = dist.entropy().sum(-1).mean()
 
-        ratio = (new_logp - old_logp).exp()
+        ratio = torch.exp(logp - old_logp)
         surr1 = ratio * adv
         surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
-        actor_loss = -torch.min(surr1, surr2).mean()
+        policy_loss = -torch.min(surr1, surr2).mean()
 
-        value_loss = F.mse_loss(values.flatten(), ret.flatten())
-        loss = actor_loss + self.vf_coef * value_loss - self.ent_coef * entropy
+        value_loss = F.mse_loss(values, ret)
+
+        # === KL Regularization from Bayesian Layers ===
+        kl_loss = self.model.kl_loss()  # Blitz handles all BayesianLinear layers
+
+        # Tune this coefficient
+        kl_coef = 1e-4
+
+        # === Total Loss with KL ===
+        total_loss = (
+            policy_loss +
+            self.vf_coef * value_loss -
+            self.ent_coef * entropy +
+            kl_coef * kl_loss
+        )
 
         self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+        total_loss.backward()
+        nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
         self.optimizer.step()
 
         return {
-            'loss': loss.item(),
-            'actor_loss': actor_loss.item(),
-            'value_loss': value_loss.item(),
-            'entropy_loss': entropy.item()
+            "loss": total_loss.item(),
+            "actor_loss": policy_loss.item(),
+            "value_loss": value_loss.item(),
+            "entropy_loss": entropy.item(),
+            "kl_loss": kl_loss.item()
         }
 
     def init_hidden_state(self, batch_size=1):

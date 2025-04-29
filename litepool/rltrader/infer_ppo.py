@@ -8,7 +8,7 @@ from recurrent_actor_critic import RecurrentActorCritic
 from recurrent_ppo_policy import RecurrentPPOPolicy
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-num_of_envs = 1  # Usually 1 env for production
+num_of_envs = 1  # Production = 1 env
 
 # === Environment setup ===
 env = litepool.make(
@@ -16,7 +16,7 @@ env = litepool.make(
     num_threads=1, is_prod=True, is_inverse_instr=True, api_key="", api_secret="",
     symbol="BTC-PERPETUAL", hedge_symbol='BTC-18APR25', tick_size=0.5, min_amount=10,
     maker_fee=-0.0001, taker_fee=0.0005, foldername="./prod_files/",
-    balance=1.0, start=0, max=int(1e9)  # Large max for continuous
+    balance=1.0, start=0, max=int(1e9)
 )
 env.spec.id = 'RlTrader-v0'
 
@@ -37,7 +37,7 @@ model = RecurrentActorCritic(
 # === Load trained model weights ===
 model_path = Path("results/final_model_inference.pth")
 model.load_state_dict(torch.load(model_path, map_location=device))
-model.eval()
+model.train()  # Important: keep Bayesian layers in sampling mode
 
 # === Policy ===
 policy = RecurrentPPOPolicy(model=model)
@@ -51,17 +51,33 @@ hidden_state = policy._to_device(hidden_state)
 step_count = 0
 cumulative_reward = 0.0
 
-print(f"\n=== Starting Continuous Inference ===\n")
+print(f"\n=== Starting Continuous Bayesian Inference ===\n")
 
+# === Helper for Bayesian sampling ===
+@torch.no_grad()
+def sample_bayesian_action(model, obs_tensor, hidden_state, n_samples=20):
+    model.train()  # Ensure stochastic sampling is active (BayesianLinear)
+    samples = []
+    for _ in range(n_samples):
+        dist, _, _ = model(obs_tensor, hidden_state)
+        action = dist.sample()
+        samples.append(action)
+    all_samples = torch.stack(samples)  # [n_samples, batch, action_dim]
+    mean_action = all_samples.mean(dim=0)
+    std_action = all_samples.std(dim=0)
+    return mean_action, std_action
+
+# === Main loop ===
 while True:
     obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device)
-    with torch.no_grad():
-        action, _, _, hidden_state = policy.forward(obs_tensor, hidden_state)
 
-    action_np = action.cpu().numpy()
+    # === Bayesian Action Inference ===
+    mean_action, std_action = sample_bayesian_action(model, obs_tensor, hidden_state, n_samples=20)
+    action_np = mean_action.cpu().numpy()
+
     next_obs, reward, terminated, truncated, info = env.step(action_np)
 
-    # Handle reset if needed (for safety)
+    # Handle reset
     if np.logical_or(terminated, truncated).any():
         obs, info = env.reset()
         hidden_state = policy.init_hidden_state(batch_size=num_of_envs)
@@ -74,7 +90,9 @@ while True:
     cumulative_reward += reward_value
     step_count += 1
 
-    # === Print step info ===
+    # === Get uncertainty values ===
+    std_val = std_action.cpu().numpy()[0] if std_action is not None else np.zeros_like(action_np[0])
+
     if isinstance(info, list) and len(info) > 0:
         env_info = info[0]
         realized_pnl = env_info.get('realized_pnl', [0.0])[0]
@@ -85,5 +103,5 @@ while True:
               f"Cumulative Reward: {cumulative_reward:+.6f} | "
               f"Realized PnL: {realized_pnl:+.6f} | "
               f"Unrealized PnL: {unrealized_pnl:+.6f} | "
-              f"Leverage: {leverage:.2f}x")
-
+              f"Leverage: {leverage:.2f}x | "
+              f"Action Std: {std_val}")
