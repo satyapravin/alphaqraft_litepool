@@ -38,7 +38,7 @@ class RecurrentPPOPolicy:
         state = minibatch['state']
 
         self.model.train()
-        dist, values, _ = self.model(obs, state)
+        dist, values, _ = self.model.forward_sequence(obs, state)
         logp = dist.log_prob(act).sum(-1)
         entropy = dist.entropy().sum(-1).mean()
 
@@ -79,3 +79,5 @@ class RecurrentPPOPolicy:
     def init_hidden_state(self, batch_size=1):
         """Initialize the RNN hidden state for a batch of environments."""
         return self.model.init_hidden_state(batch_size)
+
+
