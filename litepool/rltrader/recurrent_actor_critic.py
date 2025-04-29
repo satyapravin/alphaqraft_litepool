@@ -20,49 +20,57 @@ class RecurrentActorCritic(nn.Module):
         self.input_dim = self.feature_dim * self.time_steps
         self.action_dim = action_dim
 
-        # Feature encoders
+        # Feature encoders - converted to Bayesian
         self.market_fc = nn.Sequential(
-            nn.Linear(self.market_dim, 64),
+            BayesianLinear(self.market_dim, 64, prior_sigma_1=1.0, prior_sigma_2=0.1, prior_pi=0.5),
             nn.ReLU(),
             nn.LayerNorm(64)
         )
         self.position_fc = nn.Sequential(
-            nn.Linear(self.position_dim, 32),
+            BayesianLinear(self.position_dim, 32, prior_sigma_1=1.0, prior_sigma_2=0.1, prior_pi=0.5),
             nn.ReLU(),
             nn.LayerNorm(32)
         )
         self.trade_fc = nn.Sequential(
-            nn.Linear(self.trade_dim, 32),
+            BayesianLinear(self.trade_dim, 32, prior_sigma_1=1.0, prior_sigma_2=0.1, prior_pi=0.5),
             nn.ReLU(),
             nn.LayerNorm(32)
         )
 
-        # Separate GRUs
+        # Convert GRUs to BayesianGRU
         self.market_gru = nn.GRU(input_size=64, hidden_size=gru_hidden_dim, num_layers=num_layers, batch_first=True)
         self.position_gru = nn.GRU(input_size=32, hidden_size=gru_hidden_dim, num_layers=num_layers, batch_first=True)
         self.trade_gru = nn.GRU(input_size=32, hidden_size=gru_hidden_dim, num_layers=num_layers, batch_first=True)
 
-        # Multihead Attention
+        # Multihead Attention remains standard
         self.attn_input_dim = gru_hidden_dim * 3
         self.attention = nn.MultiheadAttention(embed_dim=self.attn_input_dim, num_heads=n_heads, batch_first=True)
 
-        # Actor and Critic
+        # Actor and Critic heads - converted to Bayesian
         self.actor_fc = nn.Sequential(
-            nn.Linear(self.attn_input_dim, hidden_dim),
+            BayesianLinear(self.attn_input_dim, hidden_dim, prior_sigma_1=1.0, prior_sigma_2=0.1, prior_pi=0.5),
             nn.ReLU(),
             nn.LayerNorm(hidden_dim)
         )
         self.critic_fc = nn.Sequential(
-            nn.Linear(self.attn_input_dim, hidden_dim),
+            BayesianLinear(self.attn_input_dim, hidden_dim, prior_sigma_1=1.0, prior_sigma_2=0.1, prior_pi=0.5),
             nn.ReLU(),
             nn.LayerNorm(hidden_dim)
         )
         
-        self.mean = BayesianLinear(hidden_dim, action_dim)
+        self.mean = BayesianLinear(hidden_dim, action_dim, prior_sigma_1=1.0, prior_sigma_2=0.1, prior_pi=0.5)
         self.log_std = nn.Linear(hidden_dim, action_dim)
-        self.value_head = nn.Linear(hidden_dim, 1)
+        self.value_head = BayesianLinear(hidden_dim, 1)
 
         self.to(self.device)
+
+    def kl_loss(self):
+        """Calculate total KL divergence for all Bayesian layers"""
+        total_kl = 0.0
+        for module in self.modules():
+            if hasattr(module, 'variational_kl_divergence'):  # Correct blitz attribute
+                total_kl += module.variational_kl_divergence()
+        return total_kl
 
     def forward(self, obs, state=None):
         obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)

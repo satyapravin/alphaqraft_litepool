@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
@@ -73,7 +74,7 @@ class RecurrentPPOPolicy:
             "actor_loss": policy_loss.item(),
             "value_loss": value_loss.item(),
             "entropy_loss": entropy.item(),
-            "kl_loss": kl_loss.item()
+            "kl_loss": kl_loss
         }
 
     def init_hidden_state(self, batch_size=1):
