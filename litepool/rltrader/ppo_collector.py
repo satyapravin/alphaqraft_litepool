@@ -100,7 +100,7 @@ class PPOCollector:
         batch_values = torch.stack(batch_values)
         batch_rewards = torch.stack(batch_rewards)
         batch_dones = torch.stack(batch_dones)
-        batch_states = tuple(torch.stack([s[i] for s in batch_states]) for i in range(len(batch_states[0])))
+        batch_states = tuple(torch.stack([s[i] for s in batch_states], dim=0) for i in range(len(batch_states[0])))
 
         # Compute advantages and returns
         advantages, returns = self._compute_gae(
