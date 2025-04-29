@@ -34,10 +34,10 @@ class RecurrentPPOPolicy:
         old_logp = minibatch['logp']
         adv = minibatch['adv']
         ret = minibatch['ret']
+        state = minibatch.get('state', None)
 
-        dist, values = self.forward_train(obs)
+        dist, values, _ = self.forward_train(obs, state)
 
-        # Invert tanh to get pre-squashed action
         raw_action = torch.atanh(act.clamp(-0.999, 0.999))
         new_logp = dist.log_prob(raw_action).sum(-1)
         new_logp -= (2 * (np.log(2) - raw_action - F.softplus(-2 * raw_action))).sum(dim=-1)

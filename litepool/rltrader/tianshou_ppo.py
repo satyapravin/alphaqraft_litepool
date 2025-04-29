@@ -136,6 +136,7 @@ def train(epochs=500, rollout_len=1024, minibatch_seq_len=256, minibatch_envs=64
                         'val': batch['values'][start_t:end_t, start_e:end_e].to(device),
                         'adv': batch['advantages'][start_t:end_t, start_e:end_e].to(device),
                         'ret': batch['returns'][start_t:end_t, start_e:end_e].to(device),
+                        'state': tuple(s[start_t, :, start_e:end_e].contiguous().to(device) for s in batch['states']),
                     }
 
                     loss_info = policy.learn(minibatch)

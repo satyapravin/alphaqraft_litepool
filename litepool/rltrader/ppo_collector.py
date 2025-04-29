@@ -44,6 +44,7 @@ class PPOCollector:
             batch_rewards.append(torch.as_tensor(reward, dtype=torch.float32))
             batch_dones.append(torch.as_tensor(done, dtype=torch.float32))
             batch_infos.append(info)
+            batch_states.append(tuple(h.clone().detach().cpu() for h in hidden_state))
 
             # Reset hidden states and obs for envs that finished
             finished = np.logical_or(done, truncated)
@@ -99,6 +100,7 @@ class PPOCollector:
         batch_values = torch.stack(batch_values)
         batch_rewards = torch.stack(batch_rewards)
         batch_dones = torch.stack(batch_dones)
+        batch_states = tuple(torch.stack([s[i] for s in batch_states]) for i in range(len(batch_states[0])))
 
         # Compute advantages and returns
         advantages, returns = self._compute_gae(
@@ -119,6 +121,7 @@ class PPOCollector:
             "advantages": advantages.to(self.device),
             "returns": returns.to(self.device),
             "infos": batch_infos,
+            "states": batch_states,
         }
 
         return batch
