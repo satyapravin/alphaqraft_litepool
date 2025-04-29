@@ -22,6 +22,7 @@ class PPOCollector:
         batch_rewards = []
         batch_dones = []
         batch_infos = []
+        batch_states = []
 
         # Initialize per-env hidden states
         hidden_state = self.policy.init_hidden_state(batch_size=n_envs)
@@ -87,7 +88,7 @@ class PPOCollector:
         # Bootstrap value for final obs
         with torch.no_grad():
             obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-            _, _, next_value, _ = self.policy.forward(obs_tensor, hidden_state)
+            _, _, next_value, state  = self.policy.forward(obs_tensor, hidden_state)
 
         next_value = next_value.detach().cpu()
 

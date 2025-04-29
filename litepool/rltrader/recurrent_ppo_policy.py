@@ -24,9 +24,9 @@ class RecurrentPPOPolicy:
 
         return action, log_prob, value, new_hidden_state
 
-    def forward_train(self, obs_seq):
-        dist, value = self.model.forward_sequence(obs_seq)
-        return dist, value
+    def forward_train(self, obs_seq, state=None):
+        dist, value, new_state = self.model.forward_sequence(obs_seq, state)
+        return dist, value, new_state
 
     def learn(self, minibatch):
         obs = minibatch['obs']

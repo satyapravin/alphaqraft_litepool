@@ -109,13 +109,12 @@ class RecurrentActorCritic(nn.Module):
         new_state = (market_h, position_h, trade_h)
         return dist, value, new_state
 
-    def forward_sequence(self, obs_seq):
+    def forward_sequence(self, obs_seq, state=None):
         """Forward pass for training with sequences using 3 separate GRUs."""
 
         seq_len, batch_size, _ = obs_seq.shape
         obs_seq = obs_seq.to(self.device)
 
-        # Reshape input: [seq_len, batch, time_steps, feature_dim]
         obs_seq = obs_seq.view(seq_len, batch_size, self.time_steps, self.feature_dim)
 
         # Split features
@@ -129,24 +128,32 @@ class RecurrentActorCritic(nn.Module):
         trade_feat = self.trade_fc(trade)
 
         # Collapse time_steps into batch for GRU input
-        market_feat = market_feat.view(seq_len * batch_size, self.time_steps, -1)
-        position_feat = position_feat.view(seq_len * batch_size, self.time_steps, -1)
-        trade_feat = trade_feat.view(seq_len * batch_size, self.time_steps, -1)
+        flat_batch = seq_len * batch_size
+        market_feat = market_feat.view(flat_batch, self.time_steps, -1)
+        position_feat = position_feat.view(flat_batch, self.time_steps, -1)
+        trade_feat = trade_feat.view(flat_batch, self.time_steps, -1)
+
+        # GRU state init
+        if state is None:
+            state = self.init_hidden_state(flat_batch)
 
         # Pass through GRUs
-        market_out, _ = self.market_gru(market_feat)
-        position_out, _ = self.position_gru(position_feat)
-        trade_out, _ = self.trade_gru(trade_feat)
+        market_out, market_h = self.market_gru(market_feat, state[0])
+        position_out, position_h = self.position_gru(position_feat, state[1])
+        trade_out, trade_h = self.trade_gru(trade_feat, state[2])
 
+        # Take last time step output and reshape
         combined = torch.cat([
-            market_out[:, -1, :],  # [batch, hidden]
+            market_out[:, -1, :],
             position_out[:, -1, :],
             trade_out[:, -1, :]
-        ], dim=-1).unsqueeze(1)  # [batch, 1, hidden*3]
+        ], dim=-1).view(seq_len, batch_size, -1)
 
-        # Multihead attention (self-attention on single token)
-        attn_out, _ = self.attention(combined, combined, combined)  # [batch, 1, dim]
-        attn_out = attn_out.squeeze(1)  # [batch, dim]
+        combined = combined.unsqueeze(1)  # Add sequence dim for attention [seq_len, 1, dim]
+
+        # Multihead attention
+        attn_out, _ = self.attention(combined, combined, combined)
+        attn_out = attn_out.squeeze(1)  # [seq_len, batch, dim]
 
         # Actor-Critic heads
         actor_feat = self.actor_fc(attn_out)
@@ -159,7 +166,8 @@ class RecurrentActorCritic(nn.Module):
         dist = torch.distributions.Normal(mean, std)
         value = self.value_head(critic_feat).squeeze(-1)
 
-        return dist, value
+        new_state = (market_h, position_h, trade_h)
+        return dist, value, new_state
 
     def init_hidden_state(self, batch_size):
         return (
