@@ -50,7 +50,7 @@ model = RecurrentActorCritic(
 policy = RecurrentPPOPolicy(
     model=model,
     lr=3e-4,
-    gamma=0.99,
+    gamma=0.999,
     gae_lambda=0.95,
     clip_eps=0.2,
     vf_coef=0.5,
@@ -61,15 +61,14 @@ policy = RecurrentPPOPolicy(
 # === Directory setup ===
 results_dir = Path("results")
 results_dir.mkdir(exist_ok=True)
+checkpoint_dir = results_dir / "checkpoints"
+checkpoint_dir.mkdir(exist_ok=True, parents=True)
 
 # === Metric Logger ===
 metric_logger = MetricLogger(print_interval=512)
 
 # === Checkpoint saving ===
 def save_checkpoint(epoch, env_step):
-    checkpoint_dir = results_dir / "checkpoints"
-    checkpoint_dir.mkdir(exist_ok=True, parents=True)
-
     torch.save({
         'epoch': epoch,
         'env_step': env_step,
@@ -79,18 +78,39 @@ def save_checkpoint(epoch, env_step):
     env.save(results_dir / "vecnorm.pth")
     print(f"Saved checkpoint at epoch {epoch}, step {env_step}")
 
+# === Checkpoint loading ===
+def load_latest_checkpoint():
+    checkpoints = sorted(checkpoint_dir.glob("checkpoint_epoch_*.pth"))
+    if not checkpoints:
+        return None
+    latest = checkpoints[-1]
+    print(f"Loading checkpoint: {latest.name}")
+    checkpoint = torch.load(latest, map_location=device)
+    policy.model.load_state_dict(checkpoint['model_state_dict'])
+    policy.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    env.load(results_dir / "vecnorm.pth")
+    return checkpoint['epoch'], checkpoint['env_step']
+
 # === PPO Collector ===
 collector = PPOCollector(env, policy, n_steps=2048)
 
 # === PPO Training Loop ===
 def train(epochs=100, rollout_len=2048, minibatch_seq_len=256, minibatch_envs=64, update_epochs=16):
-    global_step = 0
-    for epoch in range(epochs):
+    # === Try to resume from checkpoint ===
+    resume_info = load_latest_checkpoint()
+    if resume_info:
+        start_epoch, global_step = resume_info
+        start_epoch += 1  # resume from next epoch
+    else:
+        start_epoch = 0
+        global_step = 0
+
+    for epoch in range(start_epoch, epochs):
         batch = collector.collect()
-        
+
         # === Compute advantages ===
         advantages, returns = batch["advantages"], batch["returns"]
-        
+
         # Normalize advantages
         advantages = advantages.to(device)
         adv_flat = advantages.view(-1)
@@ -125,7 +145,6 @@ def train(epochs=100, rollout_len=2048, minibatch_seq_len=256, minibatch_envs=64
 
         # === MetricLogger Integration ===
         rew = batch["rewards"][-num_of_envs:]
-
         metric_logger.log(global_step, {
             "infos": batch["infos"][-num_of_envs:],
         }, rew, policy)
@@ -135,7 +154,8 @@ def train(epochs=100, rollout_len=2048, minibatch_seq_len=256, minibatch_envs=64
               f"Value Loss: {loss_info['value_loss']:.3f} | "
               f"Entropy: {loss_info['entropy_loss']:.3f}")
 
-        #save_checkpoint(epoch, env_step=global_step)
+        # Save checkpoint after each epoch
+        save_checkpoint(epoch, env_step=global_step)
 
         # Reset episode reward tracking if needed
         if hasattr(collector, 'reset_episode_rewards'):
