@@ -74,13 +74,13 @@ def save_checkpoint(epoch, env_step):
         'env_step': env_step,
         'model_state_dict': policy.model.state_dict(),
         'optimizer_state_dict': policy.optimizer.state_dict(),
-    }, checkpoint_dir / f"checkpoint_epoch_{epoch}_step_{env_step}.pth")
+    }, checkpoint_dir / f"checkpoint.pth")
     env.save(results_dir / "vecnorm.pth")
     print(f"Saved checkpoint at epoch {epoch}, step {env_step}")
 
 # === Checkpoint loading ===
 def load_latest_checkpoint():
-    checkpoints = sorted(checkpoint_dir.glob("checkpoint_epoch_*.pth"))
+    checkpoints = sorted(checkpoint_dir.glob("checkpoint.pth"))
     if not checkpoints:
         return None
     latest = checkpoints[-1]

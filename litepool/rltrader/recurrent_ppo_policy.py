@@ -51,7 +51,7 @@ class RecurrentPPOPolicy:
         value_loss = F.mse_loss(values, ret)
 
         # === KL Regularization from Bayesian Layers ===
-        kl_loss = self.model.kl_loss()  # Blitz handles all BayesianLinear layers
+        kl_loss = self.model.nn_kl_divergence() # Blitz handles all BayesianLinear layers
 
         # Tune this coefficient
         kl_coef = 1e-4

@@ -22,17 +22,17 @@ class RecurrentActorCritic(nn.Module):
 
         # Feature encoders - converted to Bayesian
         self.market_fc = nn.Sequential(
-            BayesianLinear(self.market_dim, 64, prior_sigma_1=1.0, prior_sigma_2=0.1, prior_pi=0.5),
+            BayesianLinear(self.market_dim, 64, prior_sigma_1=0.1, prior_sigma_2=0.01, prior_pi=0.5),
             nn.ReLU(),
             nn.LayerNorm(64)
         )
         self.position_fc = nn.Sequential(
-            BayesianLinear(self.position_dim, 32, prior_sigma_1=1.0, prior_sigma_2=0.1, prior_pi=0.5),
+            BayesianLinear(self.position_dim, 32, prior_sigma_1=0.1, prior_sigma_2=0.01, prior_pi=0.5),
             nn.ReLU(),
             nn.LayerNorm(32)
         )
         self.trade_fc = nn.Sequential(
-            BayesianLinear(self.trade_dim, 32, prior_sigma_1=1.0, prior_sigma_2=0.1, prior_pi=0.5),
+            BayesianLinear(self.trade_dim, 32, prior_sigma_1=0.1, prior_sigma_2=0.01, prior_pi=0.5),
             nn.ReLU(),
             nn.LayerNorm(32)
         )
@@ -48,32 +48,22 @@ class RecurrentActorCritic(nn.Module):
 
         # Actor and Critic heads - converted to Bayesian
         self.actor_fc = nn.Sequential(
-            BayesianLinear(self.attn_input_dim, hidden_dim, prior_sigma_1=1.0, prior_sigma_2=0.1, prior_pi=0.5),
+            BayesianLinear(self.attn_input_dim, hidden_dim, prior_sigma_1=0.1, prior_sigma_2=0.01, prior_pi=0.5),
             nn.ReLU(),
             nn.LayerNorm(hidden_dim)
         )
         self.critic_fc = nn.Sequential(
-            BayesianLinear(self.attn_input_dim, hidden_dim, prior_sigma_1=1.0, prior_sigma_2=0.1, prior_pi=0.5),
+            BayesianLinear(self.attn_input_dim, hidden_dim, prior_sigma_1=0.1, prior_sigma_2=0.01, prior_pi=0.5),
             nn.ReLU(),
             nn.LayerNorm(hidden_dim)
         )
         
-        self.mean = BayesianLinear(hidden_dim, action_dim, prior_sigma_1=1.0, prior_sigma_2=0.1, prior_pi=0.5)
+        self.mean = BayesianLinear(hidden_dim, action_dim, prior_sigma_1=0.1, prior_sigma_2=0.01, prior_pi=0.5)
         self.log_std = nn.Linear(hidden_dim, action_dim)
-        self.value_head = BayesianLinear(hidden_dim, 1)
+        self.value_head = BayesianLinear(hidden_dim, 1, prior_sigma_1=0.1, prior_sigma_2=0.01, prior_pi=0.5)
 
         self.to(self.device)
 
-    def kl_loss(self):
-        """Debug-friendly KL calculation"""
-        total_kl = 0.0
-        print("\nKL Components:")
-        for name, module in self.named_modules():
-            if isinstance(module, BayesianLinear):
-                layer_kl = module.variational_kl_divergence()
-                print(f"{name:20}: {layer_kl.item():.6f}")
-                total_kl += layer_kl
-        return total_kl
 
     def forward(self, obs, state=None):
         obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
