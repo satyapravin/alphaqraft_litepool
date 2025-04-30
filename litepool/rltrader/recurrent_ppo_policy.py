@@ -39,7 +39,7 @@ class RecurrentPPOPolicy:
 
     def learn(self, minibatch):
         obs = minibatch['obs']
-        act = minibatch['act']
+        act = minibatch['act']  # Squashed actions (tanh applied)
         old_logp = minibatch['logp']
         val = minibatch['val']
         adv = minibatch['adv']
@@ -48,7 +48,15 @@ class RecurrentPPOPolicy:
 
         self.model.train()
         dist, values, _ = self.model.forward_sequence(obs, state)
-        logp = dist.log_prob(act).sum(-1)
+
+        # Compute raw actions from squashed actions
+        raw_act = torch.atanh(torch.clamp(act, -0.999999, 0.999999))  # Avoid numerical issues at boundaries
+        logp = dist.log_prob(raw_act).sum(-1)
+        action_std = dist.stddev.mean().item()
+
+        # Apply tanh correction
+        logp -= (2 * (np.log(2) - raw_act - F.softplus(-2 * raw_act))).sum(dim=-1)
+
         entropy = dist.entropy().sum(-1).mean()
 
         # Normalize advantages
@@ -90,7 +98,7 @@ class RecurrentPPOPolicy:
             "value_loss": value_loss.item(),
             "entropy_loss": entropy.item(),
             "kl_loss": kl_loss.item(),
-            "kl_coef": self.kl_coef
+            "kl_coef": self.kl_coef,
+            "action_std": action_std
         }
-
 
