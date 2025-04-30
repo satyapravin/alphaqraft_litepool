@@ -1,5 +1,6 @@
+import numpy as np
 import torch
-
+from typing import Optional, Union
 
 class RunningMeanStd:
     def __init__(self, device, shape=(), epsilon=3e-4):
@@ -130,10 +131,17 @@ class VecNormalize:
 
         return obs.cpu().numpy(), rews.cpu().numpy(), terminations, truncations, infos
 
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)  # Shape: [num_envs, 2420]
-        self.returns.zero_()
+    def reset(self, env_id: Optional[Union[int, np.ndarray]] = None):
+        """Reset environments, optionally specifying which envs to reset"""
+        if env_id is None:
+            obs, info = self.env.reset()
+        else:
+            # Convert env_id to numpy array if it isn't already
+            env_id = np.array([env_id] if np.isscalar(env_id) else env_id)
+            obs, info = self.env.reset(env_id)
+    
+        obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+        self.returns[env_id] = 0.0 if env_id is not None else self.returns.zero_()
         obs = self.normalize_obs(obs)
         return obs.cpu().numpy(), info
 

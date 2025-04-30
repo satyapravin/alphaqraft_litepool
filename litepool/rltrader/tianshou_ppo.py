@@ -31,10 +31,10 @@ env = VecNormalize(
     device=device,
     num_envs=num_of_envs,
     norm_obs=True,
-    norm_reward=True,
+    norm_reward=False,
     clip_obs=10.,
     clip_reward=10.,
-    gamma=0.99
+    gamma=0.999
 )
 
 # === Model initialization ===
@@ -49,7 +49,7 @@ model = RecurrentActorCritic(
 
 policy = RecurrentPPOPolicy(
     model=model,
-    lr=3e-4,
+    lr=1e-4,
     gamma=0.999,
     gae_lambda=0.95,
     clip_eps=0.2,

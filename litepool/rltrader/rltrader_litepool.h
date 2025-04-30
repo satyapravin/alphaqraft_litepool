@@ -201,7 +201,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     pnls.push_back(current_reward);
     auto scale_pnl = std::abs(current_reward - previous_reward);
     auto leverage_penalty = std::abs(info["leverage"]) * scale_pnl;
-    state["reward"_] = (current_reward - previous_reward) - leverage_penalty;
+    state["reward"_] = ((current_reward - previous_reward) - leverage_penalty) * 1000.0;
     state["obs"_].Assign(data.begin(), data.size());
   }
 

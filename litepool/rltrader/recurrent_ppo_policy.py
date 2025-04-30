@@ -3,8 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+
 class RecurrentPPOPolicy:
-    def __init__(self, model, lr=3e-4, gamma=0.99, gae_lambda=0.95, clip_eps=0.2, vf_coef=0.5, ent_coef=0.01, max_grad_norm=0.5):
+    def __init__(self, model, lr=3e-4, gamma=0.99, gae_lambda=0.95, clip_eps=0.2, 
+                 vf_coef=0.5, ent_coef=0.01, max_grad_norm=0.5, target_kl=0.005):
         self.model = model
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         self.gamma = gamma
@@ -13,6 +15,12 @@ class RecurrentPPOPolicy:
         self.vf_coef = vf_coef
         self.ent_coef = ent_coef
         self.max_grad_norm = max_grad_norm
+        self.target_kl = target_kl
+        self.kl_coef = 1e-6 
+
+    def init_hidden_state(self, batch_size=1):
+        """Initialize the RNN hidden state for a batch of environments."""
+        return self.model.init_hidden_state(batch_size)
 
     def forward(self, obs, hidden_state=None):
         dist, value, new_hidden_state = self.model.forward(obs, hidden_state)
@@ -43,6 +51,9 @@ class RecurrentPPOPolicy:
         logp = dist.log_prob(act).sum(-1)
         entropy = dist.entropy().sum(-1).mean()
 
+        # Normalize advantages
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        
         ratio = torch.exp(logp - old_logp)
         surr1 = ratio * adv
         surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
@@ -50,18 +61,22 @@ class RecurrentPPOPolicy:
 
         value_loss = F.mse_loss(values, ret)
 
-        # === KL Regularization from Bayesian Layers ===
-        kl_loss = self.model.nn_kl_divergence() # Blitz handles all BayesianLinear layers
+        # Normalized KL divergence
+        kl_loss = self.model.nn_kl_divergence() / (obs.shape[0] * obs.shape[1])
+        
+        # Adaptive KL coefficient
+        current_kl = kl_loss.item()
+        if current_kl > 2 * self.target_kl:
+            self.kl_coef *= 1.5
+        elif current_kl < self.target_kl / 2:
+            self.kl_coef /= 1.5
+        self.kl_coef = max(min(self.kl_coef, 1e-2), 1e-6)
 
-        # Tune this coefficient
-        kl_coef = 1e-4
-
-        # === Total Loss with KL ===
         total_loss = (
             policy_loss +
             self.vf_coef * value_loss -
             self.ent_coef * entropy +
-            kl_coef * kl_loss
+            self.kl_coef * kl_loss
         )
 
         self.optimizer.zero_grad()
@@ -74,11 +89,8 @@ class RecurrentPPOPolicy:
             "actor_loss": policy_loss.item(),
             "value_loss": value_loss.item(),
             "entropy_loss": entropy.item(),
-            "kl_loss": kl_loss
+            "kl_loss": kl_loss.item(),
+            "kl_coef": self.kl_coef
         }
-
-    def init_hidden_state(self, batch_size=1):
-        """Initialize the RNN hidden state for a batch of environments."""
-        return self.model.init_hidden_state(batch_size)
 
 

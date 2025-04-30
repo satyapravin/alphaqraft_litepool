@@ -45,6 +45,7 @@ void EnvAdaptor::quote(const double& bid_spread, const double& ask_spread, const
 }
 
 void EnvAdaptor::reset() {
+    std::cout << "Reset env" << std::endl;
     max_realized_pnl = 0;
     max_unrealized_pnl = 0;
     drawdown = 0;

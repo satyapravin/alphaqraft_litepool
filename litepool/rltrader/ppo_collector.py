@@ -10,9 +10,11 @@ class PPOCollector:
         self.gamma = gamma
         self.gae_lambda = gae_lambda
         self.device = device
+        self.last_obs = None
+        self.last_hidden_state = None
+
 
     def collect(self):
-        obs, info = self.env.reset()
         n_envs = self.env.num_envs
 
         batch_obs = []
@@ -24,8 +26,14 @@ class PPOCollector:
         batch_infos = []
         batch_states = []
 
-        # Initialize per-env hidden states
-        hidden_state = self.policy.init_hidden_state(batch_size=n_envs)
+        if self.last_obs is None:
+            print("Resetting env")
+            obs, info = self.env.reset()
+            hidden_state = self.policy.init_hidden_state(batch_size=self.env.num_envs)
+        else:
+            obs = self.last_obs
+            hidden_state = self.last_hidden_state
+        
         hidden_state = self._to_device(hidden_state)
 
         for _ in tqdm(range(self.n_steps)):
@@ -35,6 +43,9 @@ class PPOCollector:
 
             action_np = action.detach().cpu().numpy()
             next_obs, reward, done, truncated, info = self.env.step(action_np)
+
+            self.last_obs = obs_tensor.detach()
+            self.last_hidden_state = tuple(h.detach() for h in next_hidden_state)
 
             # Save batch data
             batch_obs.append(obs_tensor.cpu())
@@ -123,6 +134,7 @@ class PPOCollector:
             "infos": batch_infos,
             "states": batch_states,
         }
+
 
         return batch
 
