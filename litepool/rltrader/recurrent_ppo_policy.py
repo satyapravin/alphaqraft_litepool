@@ -71,7 +71,8 @@ class RecurrentPPOPolicy:
 
         # Normalized KL divergence
         kl_loss = self.model.nn_kl_divergence() / (obs.shape[0] * obs.shape[1])
-        
+        var_penalty = 0.01 * torch.mean(dist.stddev**2)        
+
         # Adaptive KL coefficient
         current_kl = kl_loss.item()
         if current_kl > 2 * self.target_kl:
@@ -84,7 +85,8 @@ class RecurrentPPOPolicy:
             policy_loss +
             self.vf_coef * value_loss -
             self.ent_coef * entropy +
-            self.kl_coef * kl_loss
+            self.kl_coef * kl_loss +
+            var_penalty
         )
 
         self.optimizer.zero_grad()
