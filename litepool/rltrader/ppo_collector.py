@@ -265,6 +265,12 @@ class PPOCollector:
             returns[:, env] = discounted_rewards
             advantages[:, env] = discounted_rewards - env_values.to(self.device)
 
+        # Normalize advantages across all environments and time steps
+        advantages = advantages.to(self.device)
+        adv_mean = advantages.mean()
+        adv_std = advantages.std(unbiased=False)
+        advantages = (advantages - adv_mean) / (adv_std + 1e-8)
+        print(f"Advantage statistics: Mean = {adv_mean.item():.4f}, Std = {adv_std.item():.4f}")
         return advantages, returns
 
     def _compute_gae(self, rewards, values, dones, next_value):
