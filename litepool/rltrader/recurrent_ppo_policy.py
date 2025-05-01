@@ -16,7 +16,7 @@ class RecurrentPPOPolicy:
         self.ent_coef = ent_coef
         self.max_grad_norm = max_grad_norm
         self.target_kl = target_kl
-        self.kl_coef = 1e-6 
+        self.kl_coef = 1e-3 
 
     def init_hidden_state(self, batch_size=1):
         """Initialize the RNN hidden state for a batch of environments."""
@@ -79,7 +79,7 @@ class RecurrentPPOPolicy:
             self.kl_coef *= 1.5
         elif current_kl < self.target_kl / 2:
             self.kl_coef /= 1.5
-        self.kl_coef = max(min(self.kl_coef, 1e-2), 1e-6)
+        self.kl_coef = max(min(self.kl_coef, 1e-2), 1e-3)
 
         total_loss = (
             policy_loss +

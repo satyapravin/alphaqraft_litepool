@@ -190,7 +190,10 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     state["info:drawdown"_] = info["drawdown"];
     state["info:fees"_] = info["fees"];
     state["info:mid_diff"_] = info["mid_diff"];
-    auto current_reward = info["realized_pnl"] + info["unrealized_pnl"] - info["fees"];
+    auto unrealized_loss = std::min(info["unrealized_pnl"], 0.0);
+    auto unrealized_profit = std::max(info["unrealized_pnl"], 0.0);
+
+    auto current_reward = info["realized_pnl"] + 1.5 * unrealized_loss + 0.5 * unrealized_profit - info["fees"];
     double previous_reward = 0.0;
 
     if (pnls.size() >= 1) {

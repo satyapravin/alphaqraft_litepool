@@ -51,11 +51,11 @@ void Strategy::quote(const double& bid_spread,
         	
 	auto mid_price = (bid_prices[0] + ask_prices[0]) * 0.5;
 	
-        auto bid_price = bid_prices[0] - 25 * (bid_spread + 1.0) * tick_size;
-        auto ask_price = ask_prices[0] + 25 * (ask_spread + 1.0) * tick_size;
+        auto bid_price = bid_prices[0] - 5 * (bid_spread + 1.0) * tick_size;
+        auto ask_price = ask_prices[0] + 5 * (ask_spread + 1.0) * tick_size;
 
-	auto bid_size_0 = 0.005 * initBalance + (bid_size + 1.0) * 0.02 * initBalance;
-	auto ask_size_0 = 0.005 * initBalance + (ask_size + 1.0) * 0.02 * initBalance;
+	auto bid_size_0 = 0.001 * initBalance + (bid_size + 1.0) * 0.03 * initBalance;
+	auto ask_size_0 = 0.001 * initBalance + (ask_size + 1.0) * 0.03 * initBalance;
 
 	/*
 	double spot_position = 0;
@@ -92,7 +92,7 @@ void Strategy::quote(const double& bid_spread,
 	}
 	*/
 
-	auto skew = leverage * 20 * tick_size;
+	auto skew = leverage * 10 * tick_size;
 
 	bid_price -= skew;
 	ask_price -= skew;
