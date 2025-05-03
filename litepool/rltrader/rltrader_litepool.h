@@ -73,8 +73,8 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) ActionSpec(const Config& conf) {
-    return MakeDict("action"_.Bind(Spec<float>({4}, {{-1., -1., -1., -1.},
-				                     { 1.,  1.,  1.,  1.}})));
+    return MakeDict("action"_.Bind(Spec<float>({5}, {{-1., -1., -1., -1., -1.},
+				                     { 1.,  1.,  1.,  1.,  1.}})));
   }
 };
 
@@ -101,6 +101,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   int max_read = 0;
   long long steps = 0;
   std::deque<double> pnls;
+  double previous_realized_pnl = 0;
 
   std::unique_ptr<RLTrader::BaseInstrument> instr_ptr;
   std::unique_ptr<RLTrader::BaseExchange> exchange_ptr;
@@ -151,6 +152,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   }
 
   void Reset() override {
+    previous_realized_pnl = 0.0;
     steps = 0;
     pnls.clear();
     adaptor_ptr->reset();
@@ -163,8 +165,9 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
       double ask_spread = static_cast<double>(action_dict["action"_][1]);
       double bid_size = static_cast<double>(action_dict["action"_][2]);
       double ask_size = static_cast<double>(action_dict["action"_][3]);
+      double skew = static_cast<double>(action_dict["action"_][4]);
      
-      adaptor_ptr->quote(bid_spread, ask_spread, bid_size, ask_size);
+      adaptor_ptr->quote(bid_spread, ask_spread, bid_size, ask_size, skew);
       isDone = !adaptor_ptr->next();
       ++steps;
       WriteState();
@@ -193,7 +196,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     auto unrealized_loss = std::min(info["unrealized_pnl"], 0.0);
     auto unrealized_profit = std::max(info["unrealized_pnl"], 0.0);
 
-    auto current_reward = info["realized_pnl"] + 1.5 * unrealized_loss + 0.5 * unrealized_profit - info["fees"];
+    auto current_reward = info["realized_pnl"] + 0.5 * unrealized_loss + 0.5 * unrealized_profit - info["fees"];
     double previous_reward = 0.0;
 
     if (pnls.size() >= 1) {
@@ -203,8 +206,16 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
 
     pnls.push_back(current_reward);
     auto scale_pnl = std::abs(current_reward - previous_reward);
-    auto leverage_penalty = std::abs(info["leverage"]) * scale_pnl;
-    state["reward"_] = ((current_reward - previous_reward) - leverage_penalty) * 1000.0;
+    auto leverage_penalty = std::abs(info["leverage"]) * scale_pnl * 0.01;
+
+    if (steps % 60 == 0) {
+	auto realized_pnl = info["realized_pnl"] + info["fees"];
+        state["reward"_] = (realized_pnl - previous_realized_pnl) * 100;
+	previous_realized_pnl = realized_pnl;
+    } else {
+        state["reward"_] = ((current_reward - previous_reward) - leverage_penalty) * 10.0;
+    }
+
     state["obs"_].Assign(data.begin(), data.size());
   }
 

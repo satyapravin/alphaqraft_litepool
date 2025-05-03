@@ -17,6 +17,7 @@ namespace RLTrader {
 			   const double& ask_spread,
 			   const double& bid_size,
 			   const double& ask_size,
+			   const double& skew,
 		           FixedVector<double, 20>& bid_prices, 
 			   FixedVector<double, 20>& ask_prices);
 

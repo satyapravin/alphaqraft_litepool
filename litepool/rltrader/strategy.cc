@@ -38,12 +38,14 @@ void Strategy::quote(const double& bid_spread,
                      const double& ask_spread,
                      const double& bid_size,
                      const double& ask_size,
+                     const double& skew,
                      FixedVector<double, 20>& bid_prices,
                      FixedVector<double, 20>& ask_prices) {
 	assert(bid_spread >= -1.0001 && bid_spread <= 1.001);
 	assert(ask_spread >= -1.0001 && ask_spread <= 1.001);
 	assert(bid_size >= -1.0001 && bid_size <= 1.001);
 	assert(ask_size >= -1.0001 && ask_size <= 1.001);
+	assert(skew >= -1.0001 && skew <= 1.001);
 	auto tick_size = instrument.getTickSize();
 	auto posInfo = position.getPositionInfo(bid_prices[0], ask_prices[0]);
 	auto leverage = posInfo.leverage;
@@ -51,8 +53,8 @@ void Strategy::quote(const double& bid_spread,
         	
 	auto mid_price = (bid_prices[0] + ask_prices[0]) * 0.5;
 	
-        auto bid_price = bid_prices[0] - 5 * (bid_spread + 1.0) * tick_size;
-        auto ask_price = ask_prices[0] + 5 * (ask_spread + 1.0) * tick_size;
+        auto bid_price = bid_prices[0] - 25 * (bid_spread + 1.0) * tick_size;
+        auto ask_price = ask_prices[0] + 25 * (ask_spread + 1.0) * tick_size;
 
 	auto bid_size_0 = 0.001 * initBalance + (bid_size + 1.0) * 0.03 * initBalance;
 	auto ask_size_0 = 0.001 * initBalance + (ask_size + 1.0) * 0.03 * initBalance;
@@ -92,10 +94,10 @@ void Strategy::quote(const double& bid_spread,
 	}
 	*/
 
-	auto skew = leverage * 10 * tick_size;
+	auto skew_diff = leverage * (skew + 1.001) * 50 * tick_size;
 
-	bid_price -= skew;
-	ask_price -= skew;
+	bid_price -= skew_diff;
+	ask_price -= skew_diff;
 
 	auto bid_price_0 = std::floor(bid_price / tick_size) * tick_size;
 	auto ask_price_0 = std::ceil(ask_price / tick_size) * tick_size;
