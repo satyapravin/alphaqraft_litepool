@@ -196,7 +196,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     auto unrealized_loss = std::min(info["unrealized_pnl"], 0.0);
     auto unrealized_profit = std::max(info["unrealized_pnl"], 0.0);
 
-    auto current_reward = info["realized_pnl"] + 0.5 * unrealized_loss + 0.5 * unrealized_profit - info["fees"];
+    auto current_reward = info["realized_pnl"] + 0.25 * unrealized_profit + unrealized_loss - 0.25 * info["fees"];
     double previous_reward = 0.0;
 
     if (pnls.size() >= 1) {
@@ -209,8 +209,8 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     auto leverage_penalty = std::abs(info["leverage"]) * scale_pnl * 0.01;
 
     if (steps % 60 == 0) {
-	auto realized_pnl = info["realized_pnl"] + info["fees"];
-        state["reward"_] = (realized_pnl - previous_realized_pnl) * 100;
+	auto realized_pnl = info["realized_pnl"] - info["fees"];
+        state["reward"_] = (realized_pnl - previous_realized_pnl) * 200;
 	previous_realized_pnl = realized_pnl;
     } else {
         state["reward"_] = ((current_reward - previous_reward) - leverage_penalty) * 10.0;
