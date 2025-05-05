@@ -16,7 +16,7 @@ class RecurrentActorCritic(nn.Module):
         self.trade_dim = 6
 
         self.feature_dim = self.market_dim + self.position_dim + self.trade_dim
-        self.time_steps = 10
+        self.time_steps = 2
         self.input_dim = self.feature_dim * self.time_steps
         self.action_dim = action_dim
 

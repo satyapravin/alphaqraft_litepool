@@ -13,9 +13,9 @@ num_of_envs = 1  # Production = 1 env
 # === Environment setup ===
 env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
-    num_threads=1, is_prod=True, is_inverse_instr=True, api_key="", api_secret="",
-    symbol="BTC-PERPETUAL", hedge_symbol='BTC-18APR25', tick_size=0.5, min_amount=10,
-    maker_fee=-0.0001, taker_fee=0.0005, foldername="./prod_files/",
+    num_threads=1, is_prod=False, is_inverse_instr=True, api_key="", api_secret="",
+    symbol="BTC-PERPETUAL", hedge_symbol='BTC-18APR25', tick_size=0.1, min_amount=10,
+    maker_fee=-0.00005, taker_fee=0.0005, foldername="./prod_files/",
     balance=1.0, start=0, max=int(1e9)
 )
 env.spec.id = 'RlTrader-v0'

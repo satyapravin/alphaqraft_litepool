@@ -79,7 +79,7 @@ TEST(RlTraderLitePoolTest, SplitZeroAction) {
   for (int i = 0; i < num_envs; ++i) {
     EXPECT_EQ(static_cast<int>(state["info:env_id"_][i]), i);
     auto obs = state["obs"_](i);
-    EXPECT_EQ(obs.size, 242*10);
+    EXPECT_EQ(obs.size, 242*2);
   }
 }
 

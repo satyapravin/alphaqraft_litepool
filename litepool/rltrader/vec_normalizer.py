@@ -40,7 +40,7 @@ class VecNormalize:
         self.gamma = gamma
         self.epsilon = epsilon
 
-        self.time_steps = 10
+        self.time_steps = 2
         self.feature_dim = 242
         self.flat_dim = self.time_steps * self.feature_dim
 
@@ -94,7 +94,7 @@ class VecNormalize:
 
     @property
     def observation_space(self):
-        return self.env.observation_space  # Should be Box(shape=(2420,))
+        return self.env.observation_space  # Should be Box(shape=(242*2,))
 
     @property
     def action_space(self):
@@ -118,7 +118,7 @@ class VecNormalize:
     def step(self, actions):
         obs, rews, terminations, truncations, infos = self.env.step(actions)
 
-        obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)  # Shape: [num_envs, 2420]
+        obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)  # Shape: [num_envs, 242*2]
         rews = torch.as_tensor(rews, dtype=torch.float32, device=self.device)  # Shape: [num_envs]
 
         self.returns = self.returns * self.gamma + rews

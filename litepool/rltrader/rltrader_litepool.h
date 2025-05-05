@@ -58,7 +58,7 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) StateSpec(const Config& conf) {
-    return MakeDict("obs"_.Bind(Spec<double>({242*10})),
+    return MakeDict("obs"_.Bind(Spec<double>({242*2})),
                     "info:mid_price"_.Bind(Spec<double>({-1})),
                     "info:balance"_.Bind(Spec<double>({-1})),
                     "info:unrealized_pnl"_.Bind(Spec<double>({-1})),
@@ -174,12 +174,12 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   }
 
   void WriteState() {
-    std::array<double, 242*10> data;
+    std::array<double, 242*2> data;
     adaptor_ptr->getState(data);
     State state = Allocate(1);
 
     if (!isDone) {
-      assert(data.size() == 242*10);
+      assert(data.size() == 242*2);
     }
     
     std::unordered_map<std::string, double> info;
@@ -206,14 +206,14 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
 
     pnls.push_back(current_reward);
     auto scale_pnl = std::abs(current_reward - previous_reward);
-    auto leverage_penalty = std::abs(info["leverage"]) * scale_pnl * 0.01;
+    auto leverage_penalty = std::abs(info["leverage"]) * scale_pnl * 0.1;
 
-    if (steps % 60 == 0) {
+    if (steps % 300 == 0) {
 	auto realized_pnl = info["realized_pnl"] - info["fees"];
-        state["reward"_] = (realized_pnl - previous_realized_pnl) * 200;
+        state["reward"_] = (realized_pnl - previous_realized_pnl) * 2000;
 	previous_realized_pnl = realized_pnl;
     } else {
-        state["reward"_] = ((current_reward - previous_reward) - leverage_penalty) * 10.0;
+        state["reward"_] = ((current_reward - previous_reward) - leverage_penalty) * 100.0;
     }
 
     state["obs"_].Assign(data.begin(), data.size());

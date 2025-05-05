@@ -19,8 +19,8 @@ num_of_envs = 64
 env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
     num_threads=num_of_envs, is_prod=False, is_inverse_instr=True, api_key="",
-    api_secret="", symbol="BTC-PERPETUAL", hedge_symbol='BTC-18APR25', tick_size=0.5, min_amount=10,
-    maker_fee=-0.0001, taker_fee=0.0005, foldername="./train_files/",
+    api_secret="", symbol="BTC-PERPETUAL", hedge_symbol='BTC-18APR25', tick_size=0.1, min_amount=10,
+    maker_fee=-0.00005, taker_fee=0.0005, foldername="./train_files/",
     balance=1.0, start=1, max=36000 * 10
 )
 env.spec.id = 'RlTrader-v0'

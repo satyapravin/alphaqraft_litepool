@@ -210,6 +210,9 @@ class PPOCollector:
             env_values = values[:, env]    # [n_steps]
             env_dones = dones[:, env]      # [n_steps]
             env_obs = obs[:, env]          # [n_steps, obs_dim]
+            noise_scale = 0.005 * torch.std(env_obs, dim=0, keepdim=True)
+            env_obs = env_obs + torch.randn_like(env_obs) * noise_scale
+           
             # Use initial hidden state for the environment, move to device
             env_states = tuple(s[0, :, env].unsqueeze(1).to(self.device) for s in states)  # [num_layers, 1, hidden_dim]
 
