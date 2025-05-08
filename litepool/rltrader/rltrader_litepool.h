@@ -206,11 +206,11 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
 
     pnls.push_back(current_reward);
     auto scale_pnl = std::abs(current_reward - previous_reward);
-    auto leverage_penalty = std::abs(info["leverage"]) * scale_pnl * 0.1;
+    auto leverage_penalty = std::abs(info["leverage"]) * scale_pnl;
 
     if (steps % 300 == 0) {
 	auto realized_pnl = info["realized_pnl"] - info["fees"];
-        state["reward"_] = (realized_pnl - previous_realized_pnl) * 2000;
+        state["reward"_] = (realized_pnl - previous_realized_pnl - leverage_penalty) * 2000;
 	previous_realized_pnl = realized_pnl;
     } else {
         state["reward"_] = ((current_reward - previous_reward) - leverage_penalty) * 100.0;

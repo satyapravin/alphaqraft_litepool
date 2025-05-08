@@ -6,7 +6,7 @@ import numpy as np
 
 class RecurrentPPOPolicy:
     def __init__(self, model, lr=3e-4, gamma=0.99, gae_lambda=0.95, clip_eps=0.2, 
-                 vf_coef=0.5, ent_coef=0.01, max_grad_norm=0.5, target_kl=0.005, policy_kl_coef=0.1):
+                 vf_coef=0.5, ent_coef=0.01, max_grad_norm=0.5, target_kl=1, policy_kl_coef=0.1):
         self.model = model
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         self.gamma = gamma
@@ -16,7 +16,7 @@ class RecurrentPPOPolicy:
         self.ent_coef = ent_coef
         self.max_grad_norm = max_grad_norm
         self.target_kl = target_kl
-        self.bayesian_kl_coef = 1e-1  # For Bayesian layer KL divergence
+        self.bayesian_kl_coef = 10  # For Bayesian layer KL divergence
         self.policy_kl_coef = policy_kl_coef  # For policy KL divergence (old vs. new)
 
     def init_hidden_state(self, batch_size=1):
@@ -106,7 +106,7 @@ class RecurrentPPOPolicy:
             self.bayesian_kl_coef *= 1.5
         elif current_bayesian_kl < self.target_kl / 2:
             self.bayesian_kl_coef /= 1.5
-        self.bayesian_kl_coef = max(min(self.bayesian_kl_coef, 0.001), 0.01)
+        self.bayesian_kl_coef = min(self.bayesian_kl_coef, 1)
 
         current_policy_kl = policy_kl_loss.item()
         if current_policy_kl > 2 * self.target_kl:

@@ -94,7 +94,7 @@ void Strategy::quote(const double& bid_spread,
 	}
 	*/
 
-	auto skew_diff = leverage * (skew + 1.001) * 250 * tick_size;
+	auto skew_diff = leverage * (skew + 1.001) * 500 * tick_size;
 
 	bid_price -= skew_diff;
 	ask_price -= skew_diff;
@@ -113,14 +113,14 @@ void Strategy::quote(const double& bid_spread,
 	    ask_price = ask_price_0 + 8 * tick_size * ii;
 	    auto bid_size = instrument.getTradeAmount(bid_size_0 * (1 + 0.2 * ii), bid_price);
 	    auto ask_size = instrument.getTradeAmount(ask_size_0 * (1 + 0.2 * ii), ask_price);
-	    if (bid_size > 0) {
+	    if (bid_size > 0 && leverage < 1) {
 		//std::cout << "Bids" << "\t" << bid_price << "\t" << bid_size << std::endl;
 	        this->exchange.quote(std::to_string(++order_id), OrderSide::BUY, bid_price, bid_size);
 	    }
 	    else {
 		//std::cout << "BIDS ARE ZERO\t" << bid_price << "\t" << bid_size_0 << std::endl;
 	    }
-	    if (ask_size > 0) {
+	    if (ask_size > 0 && leverage > -1) {
 		//std::cout << "Asks" << "\t" << ask_price << "\t" << ask_size << std::endl;
                 this->exchange.quote(std::to_string(++order_id), OrderSide::SELL, ask_price, ask_size);
 	    }
