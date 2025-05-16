@@ -42,7 +42,7 @@ class PPOCollector:
         for _ in tqdm(range(self.n_steps)):
             # Policy forward
             obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-            action, log_prob, value, next_hidden_state = self.policy.forward(obs_tensor, hidden_state)
+            action, log_prob, value, entropy, next_hidden_state = self.policy.forward(obs_tensor, hidden_state)
 
             action_np = action.detach().cpu().numpy()
             next_obs, reward, done, truncated, info = self.env.step(action_np)
@@ -103,7 +103,7 @@ class PPOCollector:
         # Bootstrap value for final obs
         with torch.no_grad():
             obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-            _, _, next_value, state = self.policy.forward(obs_tensor, hidden_state)
+            _, _, next_value, entropy, state = self.policy.forward(obs_tensor, hidden_state)
 
         next_value = next_value.detach().cpu()
 
@@ -219,7 +219,7 @@ class PPOCollector:
             # Compute conditional action distributions
             with torch.no_grad():
                 start_time = time.time()
-                dist, _, _ = self.policy.forward_train(env_obs.unsqueeze(1), env_states)  # [n_steps, 1, action_dim]
+                dist, _, _, _ = self.policy.forward_train(env_obs.unsqueeze(1), env_states)  # [n_steps, 1, action_dim]
                 print(f"Policy forward for env {env} took {time.time() - start_time:.2f} seconds")
                 mean = dist.mean.squeeze(1)  # [n_steps, action_dim]
                 std = dist.stddev.squeeze(1)  # [n_steps, action_dim]

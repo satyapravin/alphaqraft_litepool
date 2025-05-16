@@ -20,7 +20,7 @@ env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
     num_threads=num_of_envs, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", hedge_symbol='BTC-18APR25', tick_size=0.1, min_amount=10,
-    maker_fee=-0.00005, taker_fee=0.0005, foldername="./train_files/",
+    maker_fee=-0.000005, taker_fee=0.0005, foldername="./train_files/",
     balance=1.0, start=1, max=36000 * 10
 )
 env.spec.id = 'RlTrader-v0'
@@ -92,10 +92,11 @@ def load_latest_checkpoint():
     return checkpoint['epoch'], checkpoint['env_step']
 
 # === PPO Collector ===
+policy.ent_coef = 0.001
 collector = PPOCollector(env, policy, n_steps=1024)
 
 # === PPO Training Loop ===
-def train(epochs=4000, rollout_len=1024, minibatch_seq_len=512, minibatch_envs=64, update_epochs=16):
+def train(epochs=8000, rollout_len=1024, minibatch_seq_len=512, minibatch_envs=64, update_epochs=16):
     # === Try to resume from checkpoint ===
     resume_info = load_latest_checkpoint()
     if resume_info:

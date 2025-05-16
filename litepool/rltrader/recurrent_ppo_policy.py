@@ -24,19 +24,20 @@ class RecurrentPPOPolicy:
         return self.model.init_hidden_state(batch_size)
 
     def forward(self, obs, hidden_state=None):
-        dist, value, new_hidden_state = self.model.forward(obs, hidden_state)
-
-        raw_action = dist.rsample()  # reparameterized sample
-        action = torch.tanh(raw_action)  # squash
-
+        dist, value, entropy, new_hidden_state = self.model.forward(obs, hidden_state)
+    
+        raw_action = dist.rsample()
+        action = torch.tanh(raw_action)
+    
         log_prob = dist.log_prob(raw_action).sum(-1)
-        log_prob -= (2 * (np.log(2) - raw_action - F.softplus(-2 * raw_action))).sum(dim=-1)
+        log_prob -= 2*(np.log(2) - raw_action - F.softplus(-2*raw_action)).sum(dim=-1)
+    
+        return action, log_prob, value, entropy, new_hidden_state
 
-        return action, log_prob, value, new_hidden_state
 
     def forward_train(self, obs_seq, state=None):
-        dist, value, new_state = self.model.forward_sequence(obs_seq, state)
-        return dist, value, new_state
+        dist, value, entropy, new_state = self.model.forward_sequence(obs_seq, state)
+        return dist, value, entropy, new_state
 
     def compute_policy_kl(self, dist_new, raw_act, old_logp):
         """
@@ -66,7 +67,9 @@ class RecurrentPPOPolicy:
         state = minibatch['state']
 
         self.model.train()
-        dist, values, _ = self.model.forward_sequence(obs, state)
+        dist, values, entropy, _ = self.model.forward_sequence(obs, state)
+        entropy_loss = entropy.mean()
+
 
         # Compute raw actions from squashed actions
         raw_act = torch.atanh(torch.clamp(act, -0.999999, 0.999999))  # Avoid numerical issues at boundaries
@@ -75,8 +78,6 @@ class RecurrentPPOPolicy:
 
         # Apply tanh correction
         logp -= (2 * (np.log(2) - raw_act - F.softplus(-2 * raw_act))).sum(dim=-1)
-
-        entropy = dist.entropy().sum(-1).mean()
 
         # Normalize advantages
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
@@ -119,7 +120,7 @@ class RecurrentPPOPolicy:
         total_loss = (
             policy_loss +
             self.vf_coef * value_loss -
-            self.ent_coef * entropy +
+            self.ent_coef * entropy_loss +
             self.bayesian_kl_coef * bayesian_kl_loss +
             self.policy_kl_coef * policy_kl_loss +
             var_penalty
@@ -132,7 +133,7 @@ class RecurrentPPOPolicy:
                 "loss": total_loss.item(),
                 "actor_loss": policy_loss.item(),
                 "value_loss": value_loss.item(),
-                "entropy_loss": entropy.item(),
+                "entropy_loss": entropy_loss.item(),
                 "bayesian_kl_loss": bayesian_kl_loss.item(),
                 "policy_kl_loss": policy_kl_loss.item(),
                 "bayesian_kl_coef": self.bayesian_kl_coef,
@@ -150,7 +151,7 @@ class RecurrentPPOPolicy:
             "loss": total_loss.item(),
             "actor_loss": policy_loss.item(),
             "value_loss": value_loss.item(),
-            "entropy_loss": entropy.item(),
+            "entropy_loss": entropy_loss.item(),
             "bayesian_kl_loss": bayesian_kl_loss.item(),
             "policy_kl_loss": policy_kl_loss.item(),
             "bayesian_kl_coef": self.bayesian_kl_coef,

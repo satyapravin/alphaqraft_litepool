@@ -104,14 +104,16 @@ class RecurrentActorCritic(nn.Module):
         critic_feat = self.critic_fc(attn_out)
 
         mean = self.mean(actor_feat)
-        log_std = self.log_std(actor_feat).clamp(-10, 2)
-        std = log_std.exp()
-
+        log_std = self.log_std(actor_feat).clamp(-5, 2)  # Better clamping range
+        std = log_std.exp() + 1e-6  # Prevent σ → 0
+    
         dist = torch.distributions.Normal(mean, std)
         value = self.value_head(critic_feat).squeeze(-1)
+    
+        entropy = dist.entropy().sum(-1)  
 
         new_state = (market_h, position_h, trade_h)
-        return dist, value, new_state
+        return dist, value, entropy, new_state
 
     def forward_sequence(self, obs_seq, state=None):
         """
@@ -163,18 +165,20 @@ class RecurrentActorCritic(nn.Module):
         # Actor-Critic heads
         actor_feat = self.actor_fc(attn_out)  # [seq_len, batch, hidden]
         critic_feat = self.critic_fc(attn_out)
-
+        
         mean = self.mean(actor_feat)          # [seq_len, batch, action_dim]
-        log_std = self.log_std(actor_feat).clamp(-10, 2)
-        std = log_std.exp()
+        log_std = self.log_std(actor_feat).clamp(-5, 2)
+        std = log_std.exp() + 1e-6
 
         dist = torch.distributions.Normal(mean, std)
         value = self.value_head(critic_feat).squeeze(-1)  # [seq_len, batch]
 
+        # Compute entropy for each timestep (sum over action dims)
+        entropy = dist.entropy().sum(-1)  # [seq_len, batch]
         # Pack final hidden states (only last, not expanded)
         new_state = (market_h, position_h, trade_h)
 
-        return dist, value, new_state
+        return dist, value, entropy, new_state
 
 
     def init_hidden_state(self, batch_size):
