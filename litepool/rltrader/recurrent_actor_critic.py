@@ -103,9 +103,9 @@ class RecurrentActorCritic(nn.Module):
         position_feat = position_feat.transpose(0, 1)
         trade_feat = trade_feat.transpose(0, 1)
 
-        market_out, market_h = self.market_gru(market_feat, state[0])
-        position_out, position_h = self.position_gru(position_feat, state[1])
-        trade_out, trade_h = self.trade_gru(trade_feat, state[2])
+        market_out, market_h = self.market_gru(market_feat, state[0].contiguous())
+        position_out, position_h = self.position_gru(position_feat, state[1].contiguous())
+        trade_out, trade_h = self.trade_gru(trade_feat, state[2].contiguous())
 
         # Transpose back to [batch, time_steps, features]
         market_out = market_out.transpose(0, 1)
@@ -183,9 +183,9 @@ class RecurrentActorCritic(nn.Module):
         trade_feat = trade_feat.transpose(0, 1)
 
         # Run GRUs
-        market_out, market_h = self.market_gru(market_feat, expanded_state[0])  # [time_steps, flat_batch, hidden]
-        position_out, position_h = self.position_gru(position_feat, expanded_state[1])
-        trade_out, trade_h = self.trade_gru(trade_feat, expanded_state[2])
+        market_out, market_h = self.market_gru(market_feat, expanded_state[0].contiguous())  # [time_steps, flat_batch, hidden]
+        position_out, position_h = self.position_gru(position_feat, expanded_state[1].contiguous())
+        trade_out, trade_h = self.trade_gru(trade_feat, expanded_state[2].contiguous())
 
         # Transpose back to [batch, time_steps, features]
         market_out = market_out.transpose(0, 1).view(seq_len, batch_size, -1)
