@@ -94,7 +94,7 @@ void Strategy::quote(const double& bid_spread,
 	}
 	*/
 
-	auto skew_diff = leverage * (skew + 1.001) * 500 * tick_size;
+	auto skew_diff = leverage * (skew + 1.001) * 250 * tick_size;
 
 	bid_price -= skew_diff;
 	ask_price -= skew_diff;

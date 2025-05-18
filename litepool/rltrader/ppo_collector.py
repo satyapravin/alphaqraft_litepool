@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import time
 
 class PPOCollector:
-    def __init__(self, env, policy, n_steps, gamma=0.99, gae_lambda=0.95, device="cuda", use_ot=True, ot_reg=0.01):
+    def __init__(self, env, policy, n_steps, gamma=0.99, gae_lambda=0.95, device="cuda", use_ot=False, ot_reg=0.01):
         self.env = env
         self.policy = policy
         self.n_steps = n_steps

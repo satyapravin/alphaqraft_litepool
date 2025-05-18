@@ -100,8 +100,8 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   int start_read = 0;
   int max_read = 0;
   long long steps = 0;
-  std::deque<double> pnls;
-  double previous_realized_pnl = 0;
+  double previous_reward = 0;
+  double previous_trades = 0;
 
   std::unique_ptr<RLTrader::BaseInstrument> instr_ptr;
   std::unique_ptr<RLTrader::BaseExchange> exchange_ptr;
@@ -152,9 +152,9 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   }
 
   void Reset() override {
-    previous_realized_pnl = 0.0;
+    previous_reward = 0.0;
+    previous_trades = 0.0;
     steps = 0;
-    pnls.clear();
     adaptor_ptr->reset();
     isDone = false;
     WriteState();
@@ -195,27 +195,21 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     state["info:mid_diff"_] = info["mid_diff"];
     auto unrealized_loss = std::min(info["unrealized_pnl"], 0.0);
     auto unrealized_profit = std::max(info["unrealized_pnl"], 0.0);
+    
+    auto current_trade_count = info["trade_count"];
+    auto current_reward = info["realized_pnl"]; 
 
-    auto current_reward = info["realized_pnl"] + 0.25 * unrealized_profit + unrealized_loss - 0.25 * info["fees"];
-    double previous_reward = 0.0;
-
-    if (pnls.size() >= 1) {
-        previous_reward = pnls.front();
-	pnls.pop_front();
-    }
-
-    pnls.push_back(current_reward);
     auto scale_pnl = std::abs(current_reward - previous_reward);
     auto leverage_penalty = std::abs(info["leverage"]) * scale_pnl;
 
-    if (steps % 300 == 0) {
-	auto realized_pnl = info["realized_pnl"] - info["fees"];
-        state["reward"_] = (realized_pnl - previous_realized_pnl - leverage_penalty) * 2000;
-	previous_realized_pnl = realized_pnl;
-    } else {
-        state["reward"_] = ((current_reward - previous_reward) - leverage_penalty) * 100.0;
+    state["reward"_] = leverage_penalty * -0.1 + unrealized_profit + unrealized_loss;
+
+    if (current_trade_count >= previous_trades + 1) {
+        state["reward"_] += (current_reward - previous_reward) - info["fees"]; 
     }
 
+    previous_reward = current_reward;
+    previous_trades = current_trade_count;
     state["obs"_].Assign(data.begin(), data.size());
   }
 
