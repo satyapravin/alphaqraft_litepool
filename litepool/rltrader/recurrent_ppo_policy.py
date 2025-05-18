@@ -59,7 +59,7 @@ class RecurrentPPOPolicy:
 
     def learn(self, minibatch):
         obs = minibatch['obs']
-        act = minibatch['act']  # Squashed actions (tanh applied)
+        act = minibatch['act']
         old_logp = minibatch['logp']
         val = minibatch['val']
         adv = minibatch['adv']
@@ -70,9 +70,8 @@ class RecurrentPPOPolicy:
         dist, values, entropy, _ = self.model.forward_sequence(obs, state)
         entropy_loss = entropy.mean()
 
-
-        # Compute raw actions from squashed actions
-        raw_act = torch.atanh(torch.clamp(act, -0.999999, 0.999999))  # Avoid numerical issues at boundaries
+        # Compute raw actions
+        raw_act = torch.atanh(torch.clamp(act, -0.999999, 0.999999))
         logp = dist.log_prob(raw_act).sum(-1)
         action_std = dist.stddev.mean().item()
 
@@ -81,25 +80,22 @@ class RecurrentPPOPolicy:
 
         # Normalize advantages
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-        
-        # Clipped surrogate objective (trust region)
+
+        # Clipped surrogate objective
         ratio = torch.exp(logp - old_logp)
-        ratio = torch.clamp(ratio, 0.1, 10.0)  # Prevent extreme ratios
+        ratio = torch.clamp(ratio, 0.1, 10.0)
         surr1 = ratio * adv
         surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
         policy_loss = -torch.min(surr1, surr2).mean()
 
-        # Value loss
+        # Value loss with uncertainty penalty (already applied in forward)
         value_loss = F.mse_loss(values, ret)
 
-        # Bayesian KL divergence (from Bayesian layers)
+        # Bayesian KL divergence
         bayesian_kl_loss = self.model.nn_kl_divergence() / (obs.shape[0] * obs.shape[1])
 
-        # Policy KL divergence (old vs. new policy)
+        # Policy KL divergence
         policy_kl_loss = self.compute_policy_kl(dist, raw_act, old_logp)
-
-        # Variance penalty
-        var_penalty = 0.01 * torch.mean(dist.stddev**2)
 
         # Adaptive KL coefficients
         current_bayesian_kl = bayesian_kl_loss.item()
@@ -122,8 +118,7 @@ class RecurrentPPOPolicy:
             self.vf_coef * value_loss -
             self.ent_coef * entropy_loss +
             self.bayesian_kl_coef * bayesian_kl_loss +
-            self.policy_kl_coef * policy_kl_loss +
-            var_penalty
+            self.policy_kl_coef * policy_kl_loss
         )
 
         # Early stopping if policy KL is too high

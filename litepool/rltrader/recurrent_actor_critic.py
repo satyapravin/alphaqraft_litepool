@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from blitz.modules import BayesianLinear
+from blitz.modules import BayesianLinear, BayesianGRU
 from blitz.utils import variational_estimator
 
 @variational_estimator
@@ -14,44 +14,56 @@ class RecurrentActorCritic(nn.Module):
         self.market_dim = 218
         self.position_dim = 18
         self.trade_dim = 6
+        self.embedding_dim = 64  # Reduced embedding dimension
 
         self.feature_dim = self.market_dim + self.position_dim + self.trade_dim
         self.time_steps = 2
         self.input_dim = self.feature_dim * self.time_steps
         self.action_dim = action_dim
 
-        # Feature encoders - converted to Bayesian
+        # Feature encoders - using Bayesian layers
         self.market_fc = nn.Sequential(
-            nn.Linear(self.market_dim, 64),
+            BayesianLinear(self.market_dim, 128),
             nn.ReLU(),
-            nn.LayerNorm(64)
+            nn.LayerNorm(128),
+            BayesianLinear(128, self.embedding_dim),
+            nn.ReLU(),
+            nn.LayerNorm(self.embedding_dim)
         )
         self.position_fc = nn.Sequential(
-            nn.Linear(self.position_dim, 32),
+            BayesianLinear(self.position_dim, 64),
             nn.ReLU(),
-            nn.LayerNorm(32)
+            nn.LayerNorm(64),
+            BayesianLinear(64, self.embedding_dim),
+            nn.ReLU(),
+            nn.LayerNorm(self.embedding_dim)
         )
         self.trade_fc = nn.Sequential(
-            nn.Linear(self.trade_dim, 32),
+            BayesianLinear(self.trade_dim, 64),
             nn.ReLU(),
-            nn.LayerNorm(32)
+            nn.LayerNorm(64),
+            BayesianLinear(64, self.embedding_dim),
+            nn.ReLU(),
+            nn.LayerNorm(self.embedding_dim)
         )
 
-        # Convert GRUs to BayesianGRU
-        self.market_gru = nn.GRU(input_size=64, hidden_size=gru_hidden_dim, num_layers=num_layers, batch_first=True)
-        self.position_gru = nn.GRU(input_size=32, hidden_size=gru_hidden_dim, num_layers=num_layers, batch_first=True)
-        self.trade_gru = nn.GRU(input_size=32, hidden_size=gru_hidden_dim, num_layers=num_layers, batch_first=True)
+        # BayesianGRU initialization - note the different parameter names
+        self.market_gru = BayesianGRU(self.embedding_dim, gru_hidden_dim)
+        self.position_gru = BayesianGRU(self.embedding_dim, gru_hidden_dim)
+        self.trade_gru = BayesianGRU(self.embedding_dim, gru_hidden_dim)
 
         # Multihead Attention remains standard
         self.attn_input_dim = gru_hidden_dim * 3
         self.attention = nn.MultiheadAttention(embed_dim=self.attn_input_dim, num_heads=n_heads, batch_first=True)
 
-        # Actor and Critic heads - converted to Bayesian
+        # Actor head - Bayesian
         self.actor_fc = nn.Sequential(
-            nn.Linear(self.attn_input_dim, hidden_dim),
+            BayesianLinear(self.attn_input_dim, hidden_dim),
             nn.ReLU(),
             nn.LayerNorm(hidden_dim)
         )
+        
+        # Critic head - Deterministic with uncertainty penalty
         self.critic_fc = nn.Sequential(
             nn.Linear(self.attn_input_dim, hidden_dim),
             nn.ReLU(),
@@ -60,22 +72,24 @@ class RecurrentActorCritic(nn.Module):
         
         self.mean = BayesianLinear(hidden_dim, action_dim, prior_sigma_1=1, prior_sigma_2=0.1, prior_pi=0.5)
         self.log_std = nn.Linear(hidden_dim, action_dim)
-        self.value_head = BayesianLinear(hidden_dim, 1, prior_sigma_1=1, prior_sigma_2=0.1, prior_pi=0.5)
-
+        
+        # Deterministic value head with uncertainty estimation
+        self.value_head = nn.Linear(hidden_dim, 1)
+        self.value_uncertainty = nn.Linear(hidden_dim, 1)  # Estimates log variance
+        
         self.to(self.device)
-
 
     def forward(self, obs, state=None):
         obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
         batch_size = obs.shape[0]
         obs = obs.view(batch_size, self.time_steps, self.feature_dim)
 
-        # Split features
+        # Split and embed features
         market = obs[:, :, :self.market_dim]
         position = obs[:, :, self.market_dim:self.market_dim + self.position_dim]
         trade = obs[:, :, self.market_dim + self.position_dim:]
 
-        # Encode features
+        # Encode features with Bayesian layers
         market_feat = self.market_fc(market)
         position_feat = self.position_fc(position)
         trade_feat = self.trade_fc(trade)
@@ -84,35 +98,52 @@ class RecurrentActorCritic(nn.Module):
         if state is None:
             state = self.init_hidden_state(batch_size)
 
+        # BayesianGRU expects input shape [seq_len, batch, input_size]
+        market_feat = market_feat.transpose(0, 1)  # [time_steps, batch, features]
+        position_feat = position_feat.transpose(0, 1)
+        trade_feat = trade_feat.transpose(0, 1)
+
         market_out, market_h = self.market_gru(market_feat, state[0])
         position_out, position_h = self.position_gru(position_feat, state[1])
         trade_out, trade_h = self.trade_gru(trade_feat, state[2])
 
+        # Transpose back to [batch, time_steps, features]
+        market_out = market_out.transpose(0, 1)
+        position_out = position_out.transpose(0, 1)
+        trade_out = trade_out.transpose(0, 1)
+
         # Take last time step output from each GRU
         combined = torch.cat([
-            market_out[:, -1, :],  # [batch, hidden]
+            market_out[:, -1, :],
             position_out[:, -1, :],
             trade_out[:, -1, :]
-        ], dim=-1).unsqueeze(1)  # [batch, 1, hidden*3]
+        ], dim=-1).unsqueeze(1)
 
-        # Multihead attention (self-attention on single token)
-        attn_out, _ = self.attention(combined, combined, combined)  # [batch, 1, dim]
-        attn_out = attn_out.squeeze(1)  # [batch, dim]
+        # Multihead attention
+        attn_out, _ = self.attention(combined, combined, combined)
+        attn_out = attn_out.squeeze(1)
 
         # Actor-Critic heads
         actor_feat = self.actor_fc(attn_out)
         critic_feat = self.critic_fc(attn_out)
 
+        # Policy distribution
         mean = self.mean(actor_feat)
-        log_std = self.log_std(actor_feat).clamp(-5, 2)  # Better clamping range
-        std = log_std.exp() + 1e-6  # Prevent σ → 0
-    
+        log_std = self.log_std(actor_feat).clamp(-5, 2)
+        std = log_std.exp() + 1e-6
         dist = torch.distributions.Normal(mean, std)
+        
+        # Value with uncertainty penalty
         value = self.value_head(critic_feat).squeeze(-1)
-    
-        entropy = dist.entropy().sum(-1)  
-
+        log_var = self.value_uncertainty(critic_feat).squeeze(-1)
+        value_uncertainty = torch.exp(log_var)  # Convert to variance
+        
+        # Apply uncertainty penalty (higher variance -> lower value)
+        value = value - 0.5 * value_uncertainty  # Penalize uncertain value estimates
+        
+        entropy = dist.entropy().sum(-1)
         new_state = (market_h, position_h, trade_h)
+        
         return dist, value, entropy, new_state
 
     def forward_sequence(self, obs_seq, state=None):
@@ -146,18 +177,23 @@ class RecurrentActorCritic(nn.Module):
         # Expand hidden state across seq_len
         expanded_state = tuple(s.repeat(1, seq_len, 1) for s in state)
 
+        # BayesianGRU expects input shape [time_steps, batch, features]
+        market_feat = market_feat.transpose(0, 1)
+        position_feat = position_feat.transpose(0, 1)
+        trade_feat = trade_feat.transpose(0, 1)
+
         # Run GRUs
-        market_out, market_h = self.market_gru(market_feat, expanded_state[0])  # [flat_batch, time_steps, hidden]
+        market_out, market_h = self.market_gru(market_feat, expanded_state[0])  # [time_steps, flat_batch, hidden]
         position_out, position_h = self.position_gru(position_feat, expanded_state[1])
         trade_out, trade_h = self.trade_gru(trade_feat, expanded_state[2])
 
-        # Get last time step outputs from each GRU
-        market_last = market_out[:, -1, :].view(seq_len, batch_size, -1)    # [seq_len, batch, hidden]
-        position_last = position_out[:, -1, :].view(seq_len, batch_size, -1)
-        trade_last = trade_out[:, -1, :].view(seq_len, batch_size, -1)
+        # Transpose back to [batch, time_steps, features]
+        market_out = market_out.transpose(0, 1).view(seq_len, batch_size, -1)
+        position_out = position_out.transpose(0, 1).view(seq_len, batch_size, -1)
+        trade_out = trade_out.transpose(0, 1).view(seq_len, batch_size, -1)
 
         # Combine all last GRU outputs
-        combined = torch.cat([market_last, position_last, trade_last], dim=-1)  # [seq_len, batch, hidden*3]
+        combined = torch.cat([market_out, position_out, trade_out], dim=-1)  # [seq_len, batch, hidden*3]
 
         # Self-attention expects input shape: [seq_len, batch, dim]
         attn_out, _ = self.attention(combined, combined, combined)  # [seq_len, batch, dim]
@@ -172,6 +208,9 @@ class RecurrentActorCritic(nn.Module):
 
         dist = torch.distributions.Normal(mean, std)
         value = self.value_head(critic_feat).squeeze(-1)  # [seq_len, batch]
+        log_var = self.value_uncertainty(critic_feat).squeeze(-1)
+        value_uncertainty = torch.exp(log_var)
+        value = value - 0.5 * value_uncertainty  # Apply uncertainty penalty
 
         # Compute entropy for each timestep (sum over action dims)
         entropy = dist.entropy().sum(-1)  # [seq_len, batch]
@@ -180,12 +219,11 @@ class RecurrentActorCritic(nn.Module):
 
         return dist, value, entropy, new_state
 
-
     def init_hidden_state(self, batch_size):
         return (
-            torch.zeros(self.market_gru.num_layers, batch_size, self.market_gru.hidden_size, device=self.device),
-            torch.zeros(self.position_gru.num_layers, batch_size, self.position_gru.hidden_size, device=self.device),
-            torch.zeros(self.trade_gru.num_layers, batch_size, self.trade_gru.hidden_size, device=self.device)
+            torch.zeros(1, batch_size, self.market_gru.out_features, device=self.device),
+            torch.zeros(1, batch_size, self.position_gru.out_features, device=self.device),
+            torch.zeros(1, batch_size, self.trade_gru.out_features, device=self.device)
         )
 
     def reset_hidden_state(self, batch_size):
