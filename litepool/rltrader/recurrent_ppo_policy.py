@@ -16,7 +16,6 @@ class RecurrentPPOPolicy:
         self.ent_coef = ent_coef
         self.max_grad_norm = max_grad_norm
         self.target_kl = target_kl
-        self.bayesian_kl_coef = 10  # For Bayesian layer KL divergence
         self.policy_kl_coef = policy_kl_coef  # For policy KL divergence (old vs. new)
 
     def init_hidden_state(self, batch_size=1):
@@ -91,19 +90,9 @@ class RecurrentPPOPolicy:
         # Value loss with uncertainty penalty (already applied in forward)
         value_loss = F.mse_loss(values, ret)
 
-        # Bayesian KL divergence
-        bayesian_kl_loss = self.model.nn_kl_divergence() / (obs.shape[0] * obs.shape[1])
-
         # Policy KL divergence
         policy_kl_loss = self.compute_policy_kl(dist, raw_act, old_logp)
 
-        # Adaptive KL coefficients
-        current_bayesian_kl = bayesian_kl_loss.item()
-        if current_bayesian_kl > 2 * self.target_kl:
-            self.bayesian_kl_coef *= 1.5
-        elif current_bayesian_kl < self.target_kl / 2:
-            self.bayesian_kl_coef /= 1.5
-        self.bayesian_kl_coef = min(self.bayesian_kl_coef, 1)
 
         current_policy_kl = policy_kl_loss.item()
         if current_policy_kl > 2 * self.target_kl:
@@ -117,7 +106,6 @@ class RecurrentPPOPolicy:
             policy_loss +
             self.vf_coef * value_loss -
             self.ent_coef * entropy_loss +
-            self.bayesian_kl_coef * bayesian_kl_loss +
             self.policy_kl_coef * policy_kl_loss
         )
 
@@ -129,9 +117,7 @@ class RecurrentPPOPolicy:
                 "actor_loss": policy_loss.item(),
                 "value_loss": value_loss.item(),
                 "entropy_loss": entropy_loss.item(),
-                "bayesian_kl_loss": bayesian_kl_loss.item(),
                 "policy_kl_loss": policy_kl_loss.item(),
-                "bayesian_kl_coef": self.bayesian_kl_coef,
                 "policy_kl_coef": self.policy_kl_coef,
                 "action_std": action_std,
                 "early_stop": True
@@ -147,9 +133,7 @@ class RecurrentPPOPolicy:
             "actor_loss": policy_loss.item(),
             "value_loss": value_loss.item(),
             "entropy_loss": entropy_loss.item(),
-            "bayesian_kl_loss": bayesian_kl_loss.item(),
             "policy_kl_loss": policy_kl_loss.item(),
-            "bayesian_kl_coef": self.bayesian_kl_coef,
             "policy_kl_coef": self.policy_kl_coef,
             "action_std": action_std,
             "early_stop": False

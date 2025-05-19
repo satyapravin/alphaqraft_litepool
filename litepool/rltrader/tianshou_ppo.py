@@ -93,10 +93,10 @@ def load_latest_checkpoint():
 
 # === PPO Collector ===
 policy.ent_coef = 0.001
-collector = PPOCollector(env, policy, n_steps=2048)
+collector = PPOCollector(env, policy, n_steps=512)
 
 # === PPO Training Loop ===
-def train(epochs=8000, rollout_len=2048, minibatch_seq_len=1024, minibatch_envs=64, update_epochs=16):
+def train(epochs=8000, rollout_len=512, minibatch_seq_len=256, minibatch_envs=64, update_epochs=16):
     # === Try to resume from checkpoint ===
     resume_info = load_latest_checkpoint()
     if resume_info:
@@ -156,7 +156,6 @@ def train(epochs=8000, rollout_len=2048, minibatch_seq_len=1024, minibatch_envs=
               f"Value Loss: {loss_info['value_loss']:.3f} | "
               f"Entropy: {loss_info['entropy_loss']:.3f} | "
               f"Policy KL: {loss_info['policy_kl_loss']:.6f} | "
-              f"Bayes KL: {loss_info['bayesian_kl_loss']:.6f} | "
               f"Action Std: {loss_info['action_std']:.6f}")
 
         # Save checkpoint after each epoch
