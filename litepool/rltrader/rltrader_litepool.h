@@ -202,7 +202,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     auto scale_pnl = std::abs(current_reward - previous_reward);
     auto leverage_penalty = std::abs(info["leverage"]) * scale_pnl;
 
-    state["reward"_] = leverage_penalty * -0.05 + unrealized_profit + unrealized_loss;
+    state["reward"_] = leverage_penalty * -0.25 + unrealized_profit + unrealized_loss;
 
     if (current_trade_count >= previous_trades + 1) {
         state["reward"_] += (current_reward - previous_reward - info["fees"]); 

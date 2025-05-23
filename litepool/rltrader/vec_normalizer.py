@@ -117,7 +117,6 @@ class VecNormalize:
 
     def step(self, actions):
         obs, rews, terminations, truncations, infos = self.env.step(actions)
-
         obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)  # Shape: [num_envs, 242*2]
         rews = torch.as_tensor(rews, dtype=torch.float32, device=self.device)  # Shape: [num_envs]
 

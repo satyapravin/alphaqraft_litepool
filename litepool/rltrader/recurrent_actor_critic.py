@@ -58,7 +58,6 @@ class RecurrentActorCritic(nn.Module):
             nn.LayerNorm(hidden_dim)
         )
         
-        # Critic head - Deterministic with uncertainty penalty
         self.critic_fc = nn.Sequential(
             nn.Linear(self.attn_input_dim, hidden_dim),
             nn.ReLU(),
@@ -68,10 +67,7 @@ class RecurrentActorCritic(nn.Module):
         self.mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Linear(hidden_dim, action_dim)
         
-        # Deterministic value head with uncertainty estimation
         self.value_head = nn.Linear(hidden_dim, 1)
-        self.value_uncertainty = nn.Linear(hidden_dim, 1)  # Estimates log variance
-        
         self.to(self.device)
 
     def forward(self, obs, state=None):
@@ -127,13 +123,7 @@ class RecurrentActorCritic(nn.Module):
         std = log_std.exp() + 1e-6
         dist = torch.distributions.Normal(mean, std)
         
-        # Value with uncertainty penalty
         value = self.value_head(critic_feat).squeeze(-1)
-        log_var = self.value_uncertainty(critic_feat).squeeze(-1)
-        value_uncertainty = torch.exp(log_var)  # Convert to variance
-        
-        # Apply uncertainty penalty (higher variance -> lower value)
-        value = value - 0.5 * value_uncertainty  # Penalize uncertain value estimates
         
         entropy = dist.entropy().sum(-1)
         new_state = (market_h, position_h, trade_h)
@@ -202,9 +192,6 @@ class RecurrentActorCritic(nn.Module):
 
         dist = torch.distributions.Normal(mean, std)
         value = self.value_head(critic_feat).squeeze(-1)  # [seq_len, batch]
-        log_var = self.value_uncertainty(critic_feat).squeeze(-1)
-        value_uncertainty = torch.exp(log_var)
-        value = value - 0.5 * value_uncertainty  # Apply uncertainty penalty
 
         # Compute entropy for each timestep (sum over action dims)
         entropy = dist.entropy().sum(-1)  # [seq_len, batch]
