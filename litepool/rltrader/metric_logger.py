@@ -30,7 +30,7 @@ class MetricLogger:
         num_envs = len(rew) if isinstance(rew, (np.ndarray, list)) else 64
         env_ids = range(num_envs)
         infos = infos['infos'][-1]
-        rewlast = rew[-1]
+        rewlast = rew.sum(axis=0)
 
         for env_id in env_ids:
             # Now correctly handle infos as a list of dicts
