@@ -38,24 +38,31 @@ void Strategy::quote(const double& bid_spread,
 		     const double& ask_spread,
 		     const double& bid_size,
                      const double& ask_size,
+		     const double& bid_skew,
+                     const double& ask_skew,
                      FixedVector<double, 20>& bid_prices,
                      FixedVector<double, 20>& ask_prices) {
 	assert(bid_spread >= -1.0001 && bid_spread <= 1.001);
 	assert(ask_spread >= -1.0001 && ask_spread <= 1.001);
 	assert(ask_size >= -1.0001 && ask_size <= 1.001);
-	assert(ask_size >= -1.0001 && ask_size <= 1.001);
+	assert(bid_size >= -1.0001 && bid_size <= 1.001);
+	assert(ask_skew >= -1.0001 && ask_skew <= 1.001);
+	assert(bid_skew >= -1.0001 && bid_skew <= 1.001);
 	auto tick_size = instrument.getTickSize();
+	auto minAmount = instrument.getMinAmount();
 	auto posInfo = position.getPositionInfo(bid_prices[0], ask_prices[0]);
 	auto leverage = posInfo.leverage;
         auto initBalance = position.getInitialBalance();
         	
 	auto mid_price = (bid_prices[0] + ask_prices[0]) * 0.5;
 	
-        auto bid_price = bid_prices[0] - (1.0 + bid_spread) *  50 * tick_size;
-        auto ask_price = ask_prices[0] + (1.0 + ask_spread) *  50 * tick_size;
+	auto skew = leverage * 50 * tick_size;
+        auto bid_price = bid_prices[0] - skew - (1.0 + bid_spread) *  20 * tick_size;
+        auto ask_price = ask_prices[0] - skew + (1.0 + ask_spread) *  20 * tick_size;
 
-	auto bid_size_0 = (1.01 + bid_size) / 20.0 * initBalance;
-	auto ask_size_0 = (1.01 + ask_size) / 20.0 * initBalance;
+
+	auto bid_size_0 = (2.01 + bid_size) * 0.025 * initBalance;
+	auto ask_size_0 = (2.01 + ask_size) * 0.025 * initBalance;
 
 	auto bid_price_0 = std::floor(bid_price / tick_size) * tick_size;
 	auto ask_price_0 = std::ceil(ask_price / tick_size) * tick_size;
@@ -63,20 +70,23 @@ void Strategy::quote(const double& bid_spread,
 	if (bid_price_0 > bid_prices[0]) bid_price_0 = bid_prices[0];
 	if (ask_price_0 < ask_prices[0]) ask_price_0 = ask_prices[0];
 
+	auto bid_skew_0 = (1.01 + bid_skew) * 20;
+        auto ask_skew_0 = (1.01 + ask_skew) * 20;
+
         exchange.cancelOrders();
 
-	for (int ii=0; ii < 1; ++ii) {
-	    bid_price = bid_price_0 - 8 * tick_size * ii;
-	    ask_price = ask_price_0 + 8 * tick_size * ii;
-	    auto bid_size = instrument.getTradeAmount(bid_size_0 * (1 + 0.2 * ii), bid_price);
-	    auto ask_size = instrument.getTradeAmount(ask_size_0 * (1 + 0.2 * ii), ask_price);
-	    if (bid_size > 0) {
+	for (int ii=0; ii < 2; ++ii) {
+	    bid_price = bid_price_0 - bid_skew_0 * tick_size * ii;
+	    ask_price = ask_price_0 + ask_skew_0 * tick_size * ii;
+	    auto bid_size = instrument.getTradeAmount(bid_size_0, bid_price);
+	    auto ask_size = instrument.getTradeAmount(ask_size_0, ask_price);
+	    if (bid_size >= minAmount) {
 	        this->exchange.quote(std::to_string(++order_id), OrderSide::BUY, bid_price, bid_size);
 	    }
 	    else {
 		//std::cout << "BIDS ARE ZERO\t" << bid_price << "\t" << bid_size_0 << std::endl;
 	    }
-	    if (ask_size > 0) {
+	    if (ask_size >= minAmount) {
                 this->exchange.quote(std::to_string(++order_id), OrderSide::SELL, ask_price, ask_size);
 	    }
 	    else {

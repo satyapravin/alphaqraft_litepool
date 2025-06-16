@@ -47,8 +47,6 @@ class PPOCollector:
             action_np = action.detach().cpu().numpy()
             next_obs, reward, done, truncated, info = self.env.step(action_np)
 
-            self.last_obs = obs_tensor.detach()
-            self.last_hidden_state = tuple(h.detach() for h in next_hidden_state)
 
             # Save batch data (detached and on CPU)
             batch_obs.append(obs_tensor.detach().cpu())
@@ -97,6 +95,8 @@ class PPOCollector:
                         hidden_state[:, env_id] = 0.0
                         next_hidden_state[:, env_id] = 0.0
 
+            self.last_obs = torch.as_tensor(next_obs, dtype=torch.float32)
+            self.last_hidden_state = tuple(h.detach().clone() for h in next_hidden_state)
             obs = next_obs
             hidden_state = next_hidden_state
 

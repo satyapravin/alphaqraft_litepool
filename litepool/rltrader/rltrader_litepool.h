@@ -73,8 +73,8 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) ActionSpec(const Config& conf) {
-    return MakeDict("action"_.Bind(Spec<float>({4}, {{ -1., -1., -1., -1.},
-				                     {  1.,  1.,  1.,  1.}})));
+    return MakeDict("action"_.Bind(Spec<float>({6}, {{ -1., -1., -1., -1., -1., -1.},
+				                     {  1.,  1.,  1.,  1.,  1., -1.}})));
   }
 };
 
@@ -101,7 +101,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   int max_read = 0;
   long long steps = 0;
   double previous_reward = 0;
-  double previous_leverage = 0;
+  double max_reward = 0;
   double max_drawdown = 0;
 
   std::unique_ptr<RLTrader::BaseInstrument> instr_ptr;
@@ -154,8 +154,8 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
 
   void Reset() override {
     previous_reward = 0.0;
-    previous_leverage = 0.0;
     max_drawdown = 0.0;
+    max_reward = 0.0;
     steps = 0;
     adaptor_ptr->reset();
     isDone = false;
@@ -167,8 +167,10 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
       double ask_spread = static_cast<double>(action_dict["action"_][1]);
       double bid_size = static_cast<double>(action_dict["action"_][2]);
       double ask_size = static_cast<double>(action_dict["action"_][3]);
+      double bid_skew = static_cast<double>(action_dict["action"_][4]);
+      double ask_skew = static_cast<double>(action_dict["action"_][5]);
      
-      adaptor_ptr->quote(bid_spread, ask_spread, bid_size, ask_size);
+      adaptor_ptr->quote(bid_spread, ask_spread, bid_size, ask_size, bid_skew, ask_skew);
       isDone = !adaptor_ptr->next();
       ++steps;
       WriteState();
@@ -195,24 +197,22 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     state["info:fees"_] = info["fees"];
     state["info:mid_diff"_] = info["mid_diff"];
 
-    auto drawdown = info["realized_pnl"] + info["unrealized_pnl"];
+    auto current_reward = info["realized_pnl"] + 0.25 * info["unrealized_pnl"] - info["fees"];
+    auto net_reward = current_reward - previous_reward;
+    if (net_reward > max_reward) max_reward = net_reward;
+    auto drawdown = net_reward - max_reward;
 
-    if (drawdown < 0 && drawdown < max_drawdown) max_drawdown = drawdown;
+    if (drawdown < max_drawdown) max_reward = drawdown;
 
-    if (steps % 512 == 0) {
-        auto current_reward = info["realized_pnl"] + info["unrealized_pnl"] - info["fees"]; 
-        auto net_reward = current_reward - previous_reward;
-	state["reward"_] = net_reward + max_drawdown;
+    if (steps % 16 == 0) {
+	state["reward"_] = net_reward + 0.5 * max_drawdown;
         state["reward"_] *= 10000.0;
-	previous_reward = current_reward;
-	max_drawdown = 0;
+        previous_reward = current_reward;
+	max_reward = 0.0;
+	max_drawdown = 0.0;
+    } else {
+	state["reward"_] = 100 * info["leverage"] * (info["mid_price"] - info["average_price"]) / info["mid_price"];
     }
-    else {
-        auto leverage  = info["leverage"];
-        auto leverage_penalty = std::pow(std::abs(leverage), 1.5);
-        state["reward"_] = -leverage_penalty * 100;
-    }
-
     state["obs"_].Assign(data.begin(), data.size());
   }
 

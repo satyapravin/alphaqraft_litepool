@@ -82,7 +82,6 @@ class RecurrentPPOPolicy:
 
         # Clipped surrogate objective
         ratio = torch.exp(logp - old_logp)
-        ratio = torch.clamp(ratio, 0.1, 10.0)
         surr1 = ratio * adv
         surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
         policy_loss = -torch.min(surr1, surr2).mean()
@@ -99,7 +98,7 @@ class RecurrentPPOPolicy:
             self.policy_kl_coef *= 1.5
         elif current_policy_kl < self.target_kl / 2:
             self.policy_kl_coef /= 1.5
-        self.policy_kl_coef = max(min(self.policy_kl_coef, 1.0), 2.0)
+        self.policy_kl_coef = max(1e-3, min(self.policy_kl_coef, 2.0))
 
         # Total loss
         total_loss = (
