@@ -12,8 +12,7 @@ public:
     EnvAdaptor(Strategy& strat, BaseExchange& exch);
     ~EnvAdaptor()  = default;
     
-    void quote(const double& bid_spread, const double& ask_spread, const double& bid_size, 
-	       const double& ask_size, const double& bid_skew, const double& ask_skew);
+    void quote(const double& bid_spread, const double& ask_spread, const double& target_inv);
 
     void reset() ;
     bool next() ;

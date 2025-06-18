@@ -6,7 +6,7 @@ import numpy as np
 
 class RecurrentPPOPolicy:
     def __init__(self, model, lr=3e-4, gamma=0.99, gae_lambda=0.95, clip_eps=0.2, 
-                 vf_coef=0.5, ent_coef=0.01, max_grad_norm=0.5, target_kl=1, policy_kl_coef=0.1):
+                 vf_coef=0.5, ent_coef=0.1, max_grad_norm=0.5, target_kl=1, policy_kl_coef=0.1):
         self.model = model
         self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         self.gamma = gamma
@@ -57,6 +57,14 @@ class RecurrentPPOPolicy:
         return kl_div
 
     def learn(self, minibatch):
+        # ------------------------------------------------------------------
+        # 1A  – check parameters before any forward pass
+        for n, p in self.model.named_parameters():
+            if torch.isnan(p).any() or torch.isinf(p).any():
+                print(f"✗ NaN in parameter {n}")
+                raise RuntimeError("model parameters corrupt")
+        # ------------------------------------------------------------------
+
         obs = minibatch['obs']
         act = minibatch['act']
         old_logp = minibatch['logp']
@@ -64,7 +72,15 @@ class RecurrentPPOPolicy:
         adv = minibatch['adv']
         ret = minibatch['ret']
         state = minibatch['state']
+        ret = torch.clamp(ret, -10.0, 10.0)
 
+        # ------------------------------------------------------------------
+        # 1B – check hidden state coming from the collector
+        for i, h in enumerate(state):
+            if not torch.isfinite(h).all():
+                print(f"✗ NaN in hidden_state[{i}] incoming from collector")
+                raise RuntimeError("hidden state corrupt")
+        # ------------------------------------------------------------------
         self.model.train()
         dist, values, entropy, _ = self.model.forward_sequence(obs, state)
         entropy_loss = entropy.mean()
@@ -86,9 +102,14 @@ class RecurrentPPOPolicy:
         surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
         policy_loss = -torch.min(surr1, surr2).mean()
 
-        # Value loss with uncertainty penalty (already applied in forward)
-        value_loss = F.mse_loss(values, ret)
-
+        # replace the old value_loss line
+        v_pred = values
+        v_clip = val + (v_pred - val).clamp(-self.clip_eps, +self.clip_eps)
+        value_loss = 0.5 * torch.max(          # element-wise
+            (v_pred - ret).pow(2),
+            (v_clip - ret).pow(2)
+        ).mean()
+    
         # Policy KL divergence
         policy_kl_loss = self.compute_policy_kl(dist, raw_act, old_logp)
 
@@ -109,11 +130,11 @@ class RecurrentPPOPolicy:
         )
 
         # Early stopping if policy KL is too high
-        if current_policy_kl > 4 * self.target_kl:
+        if current_policy_kl > 8 * self.target_kl:
             print(f"Early stopping: Policy KL ({current_policy_kl:.6f}) exceeds threshold ({4 * self.target_kl:.6f})")
             return {
                 "loss": total_loss.item(),
-                "actor_loss": policy_loss.item(),
+                 "actor_loss": policy_loss.item(),
                 "value_loss": value_loss.item(),
                 "entropy_loss": entropy_loss.item(),
                 "policy_kl_loss": policy_kl_loss.item(),

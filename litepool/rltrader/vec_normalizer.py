@@ -83,6 +83,7 @@ class VecNormalize:
         mean = self.obs_rms.mean.view(1, 1, self.feature_dim)
         var = self.obs_rms.var.view(1, 1, self.feature_dim)
         normed = (obs - mean) / torch.sqrt(var + self.epsilon)
+        assert torch.isfinite(normed).all(), "NaN after obs norm"
         normed = torch.clamp(normed, -self.clip_obs, self.clip_obs)
         return normed.view(batch_size, self.flat_dim)
 
@@ -125,7 +126,8 @@ class VecNormalize:
         obs = self.normalize_obs(obs)
         rews = self.normalize_reward(rews)
 
-        dones = torch.logical_or(torch.as_tensor(terminations), torch.as_tensor(truncations))
+        dones = torch.logical_or(torch.as_tensor(terminations, device=self.device), 
+                                 torch.as_tensor(truncations, device=self.device))
         self.returns[dones] = 0.0
 
         return obs.cpu().numpy(), rews.cpu().numpy(), terminations, truncations, infos

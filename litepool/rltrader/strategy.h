@@ -15,10 +15,7 @@ namespace RLTrader {
 
 		void quote(const double& bid_spread,
 			   const double& ask_spread,
-			   const double& bid_size,
-			   const double& ask_size,
-			   const double& bid_skew,
-			   const double& ask_skew,
+			   const double& target_inv,
 		           FixedVector<double, 20>& bid_prices, 
 			   FixedVector<double, 20>& ask_prices);
 
@@ -32,5 +29,6 @@ namespace RLTrader {
 		Position position;
 		int order_id;
 		int max_ticks;
+		double target_inventory;
 	};
 }

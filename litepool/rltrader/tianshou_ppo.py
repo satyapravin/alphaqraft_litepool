@@ -20,8 +20,8 @@ env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
     num_threads=num_of_envs, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", hedge_symbol='BTC-18APR25', tick_size=0.1, min_amount=10,
-    maker_fee=-0.00000025, taker_fee=0.0005, foldername="./train_files/",
-    balance=0.1, start=1, max=3600 * 30
+    maker_fee=0.000005, taker_fee=0.0005, foldername="./train_files/",
+    balance=1., start=1, max=3600 * 400
 )
 env.spec.id = 'RlTrader-v0'
 env_action_space = env.action_space
@@ -50,11 +50,11 @@ model = RecurrentActorCritic(
 policy = RecurrentPPOPolicy(
     model=model,
     lr=3e-4,
-    gamma=0.99999995,
+    gamma=0.995,
     gae_lambda=0.99,
     clip_eps=0.1,
     vf_coef=1.0,
-    ent_coef=0.05,
+    ent_coef=0.2,
     max_grad_norm=1.0
 )
 

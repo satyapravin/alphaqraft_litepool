@@ -189,6 +189,11 @@ class RecurrentActorCritic(nn.Module):
         mean = self.mean(actor_feat)          # [seq_len, batch, action_dim]
         log_std = self.log_std(actor_feat).clamp(-5, 2)
         std = log_std.exp() + 1e-6
+        
+        if torch.isnan(mean).any() or torch.isnan(std).any():
+            print(">>> NaN detected just before Normal()")
+            torch.save({'mean': mean, 'std': std}, 'nan_dump.pt')
+            raise RuntimeError("NaN in mean/std")
 
         dist = torch.distributions.Normal(mean, std)
         value = self.value_head(critic_feat).squeeze(-1)  # [seq_len, batch]

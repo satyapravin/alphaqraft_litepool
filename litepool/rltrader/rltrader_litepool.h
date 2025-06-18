@@ -73,8 +73,8 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) ActionSpec(const Config& conf) {
-    return MakeDict("action"_.Bind(Spec<float>({6}, {{ -1., -1., -1., -1., -1., -1.},
-				                     {  1.,  1.,  1.,  1.,  1., -1.}})));
+    return MakeDict("action"_.Bind(Spec<float>({3}, {{ -1., -1., -1. },
+				                     {  1.,  1.,  1. }})));
   }
 };
 
@@ -165,12 +165,8 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   void Step(const Action& action_dict) override { 
       double bid_spread = static_cast<double>(action_dict["action"_][0]);
       double ask_spread = static_cast<double>(action_dict["action"_][1]);
-      double bid_size = static_cast<double>(action_dict["action"_][2]);
-      double ask_size = static_cast<double>(action_dict["action"_][3]);
-      double bid_skew = static_cast<double>(action_dict["action"_][4]);
-      double ask_skew = static_cast<double>(action_dict["action"_][5]);
-     
-      adaptor_ptr->quote(bid_spread, ask_spread, bid_size, ask_size, bid_skew, ask_skew);
+      double target_inv = static_cast<double>(action_dict["action"_][2]); 
+      adaptor_ptr->quote(bid_spread, ask_spread, target_inv);
       isDone = !adaptor_ptr->next();
       ++steps;
       WriteState();
@@ -204,14 +200,14 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
 
     if (drawdown < max_drawdown) max_reward = drawdown;
 
-    if (steps % 16 == 0) {
-	state["reward"_] = net_reward + 0.5 * max_drawdown;
+    if (steps % 256 == 0) {
+	state["reward"_] = net_reward;
         state["reward"_] *= 10000.0;
         previous_reward = current_reward;
 	max_reward = 0.0;
 	max_drawdown = 0.0;
     } else {
-	state["reward"_] = 100 * info["leverage"] * (info["mid_price"] - info["average_price"]) / info["mid_price"];
+	state["reward"_] = info["leverage"] * (info["mid_price"] - info["average_price"]) / (1.0 + info["mid_price"]);
     }
     state["obs"_].Assign(data.begin(), data.size());
   }
