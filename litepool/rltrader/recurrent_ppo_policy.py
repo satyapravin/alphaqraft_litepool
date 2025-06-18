@@ -86,7 +86,7 @@ class RecurrentPPOPolicy:
         entropy_loss = entropy.mean()
 
         # Compute raw actions
-        raw_act = torch.atanh(torch.clamp(act, -0.999999, 0.999999))
+        raw_act = torch.atanh(torch.clamp(act, -0.999, 0.999))
         logp = dist.log_prob(raw_act).sum(-1)
         action_std = dist.stddev.mean().item()
 

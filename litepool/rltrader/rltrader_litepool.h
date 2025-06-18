@@ -200,7 +200,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
 
     if (drawdown < max_drawdown) max_reward = drawdown;
 
-    if (steps % 256 == 0) {
+    if (steps % 64 == 0) {
 	state["reward"_] = net_reward;
         state["reward"_] *= 10000.0;
         previous_reward = current_reward;

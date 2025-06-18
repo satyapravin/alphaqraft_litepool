@@ -20,7 +20,7 @@ env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
     num_threads=num_of_envs, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", hedge_symbol='BTC-18APR25', tick_size=0.1, min_amount=10,
-    maker_fee=0.000005, taker_fee=0.0005, foldername="./train_files/",
+    maker_fee=0.000025, taker_fee=0.0005, foldername="./train_files/",
     balance=1., start=1, max=3600 * 400
 )
 env.spec.id = 'RlTrader-v0'
@@ -50,8 +50,8 @@ model = RecurrentActorCritic(
 policy = RecurrentPPOPolicy(
     model=model,
     lr=3e-4,
-    gamma=0.995,
-    gae_lambda=0.99,
+    gamma=0.985,
+    gae_lambda=0.95,
     clip_eps=0.1,
     vf_coef=1.0,
     ent_coef=0.2,
@@ -92,11 +92,11 @@ def load_latest_checkpoint():
     return checkpoint['epoch'], checkpoint['env_step']
 
 # === PPO Collector ===
-policy.ent_coef = 0.01
-collector = PPOCollector(env, policy, n_steps=512)
+policy.ent_coef = 0.0001
+collector = PPOCollector(env, policy, n_steps=2048)
 
 # === PPO Training Loop ===
-def train(epochs=20000, rollout_len=512, minibatch_seq_len=256, minibatch_envs=64, update_epochs=16):
+def train(epochs=20000, rollout_len=2048, minibatch_seq_len=512, minibatch_envs=64, update_epochs=16):
     # === Try to resume from checkpoint ===
     resume_info = load_latest_checkpoint()
     if resume_info:
@@ -160,10 +160,6 @@ def train(epochs=20000, rollout_len=512, minibatch_seq_len=256, minibatch_envs=6
 
         # Save checkpoint after each epoch
         save_checkpoint(epoch, env_step=global_step)
-
-        # Reset episode reward tracking if needed
-        if hasattr(collector, 'reset_episode_rewards'):
-            collector.reset_episode_rewards()
 
     # Save final model
     torch.save(policy.model.state_dict(), results_dir / "final_model_inference.pth")

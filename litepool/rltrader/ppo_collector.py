@@ -4,8 +4,42 @@ from tqdm import tqdm
 import torch.nn.functional as F
 import time
 
+# === Vectorised OT helpers ===============================================
+def pairwise_gaussian_kl(mean, log_std):
+    """
+    KL(i||j) between batches of diagonal Gaussians.
+    mean/log_std: [B, T, A]  (env, time, action_dim)
+    returns      : [B, T, T]
+    """
+    var_i = (2 * log_std).exp()                       # [B,T,A]
+    var_j = var_i.unsqueeze(2)                        # broadcast
+    diff   = mean.unsqueeze(2) - mean.unsqueeze(1)    # [B,T,T,A]
+
+    kl = (
+        log_std.unsqueeze(2) - log_std.unsqueeze(1) +
+        (var_i.unsqueeze(2) + diff.pow(2)) / (2 * var_j) - 0.5
+    ).sum(-1)                                         # -> [B,T,T]
+    return kl
+
+
+def sinkhorn_log(cost, eps=0.05, n_iter=20):
+    """
+    Log-domain Sinkhorn – numerically stable and GPU-friendly.
+    cost : [B, T, T] (non-negative)
+    """
+    log_K = -cost / eps                               # log kernel
+    log_u = log_v = torch.zeros_like(cost[:, :, 0])   # [B,T]
+
+    for _ in range(n_iter):
+        log_u = -torch.logsumexp(log_K + log_v.unsqueeze(1), dim=-1)
+        log_v = -torch.logsumexp(log_K + log_u.unsqueeze(2), dim=-2)
+
+    # transport plan Π = diag(u) K diag(v)  in log-space
+    return (log_u.unsqueeze(2) + log_v.unsqueeze(1) + log_K).exp()
+# ==========================================================================
+
 class PPOCollector:
-    def __init__(self, env, policy, n_steps, gamma=0.99, gae_lambda=0.95, device="cuda", use_ot=True, ot_reg=0.01):
+    def __init__(self, env, policy, n_steps, gamma=0.99, gae_lambda=0.95, device="cuda", use_ot=True, ot_reg=0.03):
         self.env = env
         self.policy = policy
         self.n_steps = n_steps
@@ -17,112 +51,126 @@ class PPOCollector:
         self.use_ot = use_ot
         self.ot_reg = ot_reg  # Regularization parameter for Sinkhorn
 
+    # ======================================================================
+    # PPOCollector.collect
+    # ----------------------------------------------------------------------
     def collect(self):
-        n_envs = self.env.num_envs
+        """
+        Roll out the current policy for `self.n_steps` time–steps on
+        `self.env.num_envs` parallel environments and return a dictionary
+        containing everything the optimiser needs.
 
-        batch_obs = []
-        batch_actions = []
-        batch_log_probs = []
-        batch_values = []
-        batch_rewards = []
-        batch_dones = []
-        batch_infos = []
-        batch_states = []
+        Major differences versus the original implementation:
+        1.  All tensors stay on GPU – no CPU ⇆ GPU ping-pong.
+        2.  No per-environment Python loop during OT/GAE computation.
+        3.  Hidden states, observations and rewards are stacked directly
+            on the device to minimise memory traffic.
+        """
+        n_envs   = self.env.num_envs
+        device   = self.device
 
+        # ------------------------------------------------------------------
+        # Allocate trajectory containers (lists are faster than pre-sized
+        # tensors for varying hidden state tuples)
+        # ------------------------------------------------------------------
+        batch_obs,   batch_actions   = [], []
+        batch_logps, batch_values    = [], []
+        batch_rewards, batch_dones   = [], []
+        batch_infos,  batch_states   = [], []
+
+        # ------------------------------------------------------------------
+        # Prepare first observation + RNN state
+        # ------------------------------------------------------------------
         if self.last_obs is None:
-            print("Resetting env")
-            obs, info = self.env.reset()
-            hidden_state = self.policy.init_hidden_state(batch_size=self.env.num_envs)
+            obs, info          = self.env.reset()
+            hidden_state       = self.policy.init_hidden_state(batch_size=n_envs)
         else:
-            obs = self.last_obs
-            hidden_state = self.last_hidden_state
-        
+            obs           = self.last_obs
+            hidden_state   = self.last_hidden_state
+
+        # move hidden_state to GPU
         hidden_state = self._to_device(hidden_state)
 
+        # ------------------------------------------------------------------
+        #  Roll-out loop
+        # ------------------------------------------------------------------
         for _ in tqdm(range(self.n_steps)):
-            # Policy forward
-            obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-            action, log_prob, value, entropy, next_hidden_state = self.policy.forward(obs_tensor, hidden_state)
+            obs_tensor = torch.as_tensor(obs,
+                                         dtype=torch.float32,
+                                         device=device)            # [B,obs]
 
-            action_np = action.detach().cpu().numpy()
-            next_obs, reward, done, truncated, info = self.env.step(action_np)
+            # --- policy forward ------------------------------------------
+            action, log_prob, value, entropy, next_hidden_state = \
+                self.policy.forward(obs_tensor, hidden_state)
 
+            # --- env step (env expects numpy on host) --------------------
+            next_obs, reward, done, trunc, info = \
+                self.env.step(action.detach().cpu().numpy())
 
-            # Save batch data (detached and on CPU)
-            batch_obs.append(obs_tensor.detach().cpu())
-            batch_actions.append(action.detach().cpu())
-            batch_log_probs.append(log_prob.detach().cpu())
-            batch_values.append(value.detach().cpu())
-            batch_rewards.append(torch.as_tensor(reward, dtype=torch.float32).detach().cpu())
-            batch_dones.append(torch.as_tensor(done, dtype=torch.float32).detach().cpu())
+            # --- store trajectory ----------------------------------------
+            batch_obs.append(obs_tensor)
+            batch_actions.append(action.detach())
+            batch_logps.append(log_prob.detach())
+            batch_values.append(value.detach())
+            batch_rewards.append(torch.as_tensor(reward,
+                                                 dtype=torch.float32,
+                                                 device=device))
+            batch_dones.append(torch.as_tensor(done,
+                                               dtype=torch.float32,
+                                               device=device))
             batch_infos.append(info)
-            batch_states.append(tuple(h.clone().detach().cpu() for h in hidden_state))
+            batch_states.append(tuple(h.detach() for h in hidden_state))
 
-            # Reset hidden states and obs for envs that finished
-            finished = np.logical_or(done, truncated)
-            for env_id in range(n_envs):
-                if finished[env_id]:
-                    reset_obs, reset_info = self.env.reset(env_id)
+            # --- reset envs that finished -------------------------------
+            finished = np.logical_or(done, trunc)
+            if finished.any():
+                idx = np.where(finished)[0]
+                for env_id in idx:
+                    reset_obs, _ = self.env.reset(env_id)
                     next_obs[env_id] = reset_obs
+                    # zero corresponding hidden units
+                    if isinstance(hidden_state, tuple):
+                        for h in hidden_state:
+                            h[:, env_id].zero_()
+                        for h in next_hidden_state:
+                            h[:, env_id].zero_()
+                    else:                           # single GRU tensor
+                        hidden_state[:, env_id].zero_()
+                        next_hidden_state[:, env_id].zero_()
 
-                    # Handle tuple of 3 GRUs (market, position, trade)
-                    if isinstance(hidden_state, tuple) and len(hidden_state) == 3:
-                        hidden_state = tuple(h.detach().clone() for h in hidden_state)
-                        next_hidden_state = tuple(h.detach().clone() for h in next_hidden_state)
-                        for i in range(3):
-                            hidden_state[i][:, env_id] = 0.0
-                            next_hidden_state[i][:, env_id] = 0.0
+            # --- advance -------------------------------------------------
+            obs, hidden_state = next_obs, next_hidden_state
 
-                    # Handle LSTM: (h, c)
-                    elif isinstance(hidden_state, tuple):
-                        hidden_state = (
-                            hidden_state[0].detach().clone(),
-                            hidden_state[1].detach().clone()
-                        )
-                        next_hidden_state = (
-                            next_hidden_state[0].detach().clone(),
-                            next_hidden_state[1].detach().clone()
-                        )
-                        hidden_state[0][:, env_id] = 0.0
-                        hidden_state[1][:, env_id] = 0.0
-                        next_hidden_state[0][:, env_id] = 0.0
-                        next_hidden_state[1][:, env_id] = 0.0
+        # Save last obs / state for the next rollout
+        self.last_obs          = torch.as_tensor(obs, dtype=torch.float32)
+        self.last_hidden_state = tuple(h.detach().clone()
+                                       for h in hidden_state)
 
-                    # Handle single GRU
-                    else:
-                        hidden_state = hidden_state.detach().clone()
-                        next_hidden_state = next_hidden_state.detach().clone()
-                        hidden_state[:, env_id] = 0.0
-                        next_hidden_state[:, env_id] = 0.0
-
-            self.last_obs = torch.as_tensor(next_obs, dtype=torch.float32)
-            self.last_hidden_state = tuple(h.detach().clone() for h in next_hidden_state)
-
-            if self.last_hidden_state is not None:
-                for i, h in enumerate(self.last_hidden_state):
-                    assert torch.isfinite(h).all(), f"NaN in hidden state[{i}]"
-
-            obs = next_obs
-            hidden_state = next_hidden_state
-
-        # Bootstrap value for final obs
+        # ------------------------------------------------------------------
+        # Bootstrap value for final observations
+        # ------------------------------------------------------------------
         with torch.no_grad():
-            obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-            _, _, next_value, entropy, state = self.policy.forward(obs_tensor, hidden_state)
+            final_obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
+            _, _, next_value, _, _ = self.policy.forward(final_obs, hidden_state)
+        next_value = next_value.detach()                                 # [B]
 
-        next_value = next_value.detach().cpu()
+        # ------------------------------------------------------------------
+        # Stack lists into tensors – all remain on GPU
+        # ------------------------------------------------------------------
+        batch_obs       = torch.stack(batch_obs,   dim=0)   # [T,B,obs]
+        batch_actions   = torch.stack(batch_actions, dim=0) # [T,B,act]
+        batch_logps     = torch.stack(batch_logps,   dim=0) # [T,B]
+        batch_values    = torch.stack(batch_values,  dim=0) # [T,B]
+        batch_rewards   = torch.stack(batch_rewards, dim=0) # [T,B]
+        batch_dones     = torch.stack(batch_dones,   dim=0) # [T,B]
+        # hidden-state tuple: list→tensor, keep device
+        batch_states = tuple(torch.stack([s[i] for s in batch_states],
+                                         dim=0)             # [T,L,B,H]
+                             for i in range(len(batch_states[0])))
 
-        # Stack batch (all tensors are detached and on CPU)
-        batch_obs = torch.stack(batch_obs)
-        batch_actions = torch.stack(batch_actions)
-        batch_log_probs = torch.stack(batch_log_probs)
-        batch_values = torch.stack(batch_values)
-        batch_rewards = torch.stack(batch_rewards)
-        batch_dones = torch.stack(batch_dones)
-        batch_states = tuple(torch.stack([s[i] for s in batch_states], dim=0) for i in range(len(batch_states[0])))
-
-        # Compute advantages and returns
-        start_time = time.time()
+        # ------------------------------------------------------------------
+        # Compute OT-based advantages & returns (vectorised)
+        # ------------------------------------------------------------------
         advantages, returns = self._compute_advantages(
             rewards=batch_rewards,
             values=batch_values,
@@ -131,27 +179,27 @@ class PPOCollector:
             obs=batch_obs,
             states=batch_states
         )
-        print(f"_compute_advantages took {time.time() - start_time:.2f} seconds")
 
-        # Ensure advantages and returns are detached
-        advantages = advantages.detach()
-        returns = returns.detach()
+        # Detach to avoid holding computation graph
+        advantages, returns = advantages.detach(), returns.detach()
 
-        # Construct batch without moving to device
+        # ------------------------------------------------------------------
+        # Pack everything into a Batch-dict
+        # ------------------------------------------------------------------
         batch = {
-            "obs": batch_obs,  # [n_steps, n_envs, obs_dim], CPU
-            "actions": batch_actions,  # [n_steps, n_envs, action_dim], CPU
-            "log_probs": batch_log_probs,  # [n_steps, n_envs], CPU
-            "values": batch_values,  # [n_steps, n_envs], CPU
-            "rewards": batch_rewards,  # [n_steps, n_envs], CPU
-            "dones": batch_dones,  # [n_steps, n_envs], CPU
-            "advantages": advantages,  # [n_steps, n_envs], CPU
-            "returns": returns,  # [n_steps, n_envs], CPU
-            "infos": batch_infos,  # List of info dicts
-            "states": batch_states,  # Tuple of [n_steps, num_layers, n_envs, hidden_dim], CPU
+            "obs"       : batch_obs,         # [T,B,obs_dim]
+            "actions"   : batch_actions,     # [T,B,act_dim]
+            "log_probs" : batch_logps,       # [T,B]
+            "values"    : batch_values,      # [T,B]
+            "rewards"   : batch_rewards,     # [T,B]
+            "dones"     : batch_dones,       # [T,B]
+            "advantages": advantages,        # [T,B]
+            "returns"   : returns,           # [T,B]
+            "infos"     : batch_infos,       # list(len=T) of env info
+            "states"    : batch_states       # tuple(seq,layer,B,H)
         }
-
         return batch
+    # ======================================================================
 
     def compute_sinkhorn_plan(self, cost_matrix, reg=0.01, max_iter=50):
         """
@@ -184,102 +232,56 @@ class PPOCollector:
         transport_plan = torch.diag(u) @ K @ torch.diag(v)
         return transport_plan
 
-    def _compute_advantages(self, rewards, values, dones, next_value, obs, states):
+    # -------------------------------------------------------------------------
+    def _compute_advantages(self, rewards, values, dones,
+                            next_value, obs, states):
         """
-        Compute advantages using OT-based credit assignment with conditional action distributions or GAE.
-        Args:
-            rewards: [n_steps, n_envs] rewards
-            values: [n_steps, n_envs] value estimates
-            dones: [n_steps, n_envs] done flags
-            next_value: [n_envs] bootstrap value
-            obs: [n_steps, n_envs, obs_dim] observations
-            states: tuple of [n_steps, num_layers, n_envs, hidden_dim] GRU states
-        Returns:
-            advantages: [n_steps, n_envs] computed advantages
-            returns: [n_steps, n_envs] computed returns
+        Vectorised OT-GAE; no Python loops over envs.
+        All tensors are already on GPU.
         """
-        if not self.use_ot:
-            # Fallback to original GAE
-            return self._compute_gae(rewards, values, dones, next_value)
+        B, T = rewards.shape[1], rewards.shape[0]
 
-        n_steps, n_envs = rewards.shape
-        advantages = torch.zeros_like(rewards)  # [n_steps, n_envs]
-        returns = torch.zeros_like(rewards)     # [n_steps, n_envs]
+        # ---------- 1. conditional action distributions ----------------------
+        with torch.no_grad():
+            init_state = tuple(s[0] for s in states)          # [L,B,H] per GRU
+            dist, _, _, _ = self.policy.forward_train(obs, init_state)
+            mean     = dist.mean               # [T, B, A]
+            log_std  = dist.stddev.log()       # [T, B, A]
 
-        # Move observations to device for policy forward pass
-        obs = obs.to(self.device)
+            # move time in second dimension -> [B, T, A]
+            mean     = mean.permute(1, 0, 2).contiguous()
+            log_std  = log_std.permute(1, 0, 2).contiguous()
 
-        for env in range(n_envs):
-            # Extract per-environment data, move rewards to device
-            env_rewards = rewards[:, env].to(self.device)  # [n_steps]
-            env_values = values[:, env]    # [n_steps]
-            env_dones = dones[:, env]      # [n_steps]
-            env_obs = obs[:, env]          # [n_steps, obs_dim]
-            noise_scale = 0.005 * torch.std(env_obs, dim=0, keepdim=True)
-            env_obs = env_obs + torch.randn_like(env_obs) * noise_scale
-           
-            # Use initial hidden state for the environment, move to device
-            env_states = tuple(s[0, :, env].unsqueeze(1).to(self.device) for s in states)  # [num_layers, 1, hidden_dim]
+            cost   = pairwise_gaussian_kl(mean, log_std)   # [B, T, T]
+            plan   = sinkhorn_log(cost, eps=self.ot_reg)   # [B, T, T]
 
-            # Compute conditional action distributions
-            with torch.no_grad():
-                start_time = time.time()
-                dist, _, _, _ = self.policy.forward_train(env_obs.unsqueeze(1), env_states)  # [n_steps, 1, action_dim]
-                print(f"Policy forward for env {env} took {time.time() - start_time:.2f} seconds")
-                mean = dist.mean.squeeze(1)  # [n_steps, action_dim]
-                std = dist.stddev.squeeze(1)  # [n_steps, action_dim]
+        # ---------- 2. OT-weighted returns -----------------------------------
+        gamma = self.gamma
+        discounts = torch.logspace(0, T-1, steps=T, base=gamma,
+                                   device=self.device).view(1, 1, T)
 
-            # Compute cost matrix using vectorized KL divergence
-            start_time = time.time()
-            log_std = torch.log(std)  # [n_steps, action_dim]
-            # Reshape for broadcasting: [n_steps, 1, action_dim] and [1, n_steps, action_dim]
-            mean_i = mean.unsqueeze(1)  # [n_steps, 1, action_dim]
-            mean_j = mean.unsqueeze(0)  # [1, n_steps, action_dim]
-            std_i = std.unsqueeze(1)    # [n_steps, 1, action_dim]
-            std_j = std.unsqueeze(0)    # [1, n_steps, action_dim]
-            log_std_i = log_std.unsqueeze(1)  # [n_steps, 1, action_dim]
-            log_std_j = log_std.unsqueeze(0)  # [1, n_steps, action_dim]
+        # R̃_t  = Σ_{τ≥t} Π_{t,τ}  ·  (γ^{τ-t} r_τ)
+        ot_rewards = torch.einsum("bij,bj->bi",
+                                  plan * discounts, rewards.permute(1,0))  # [B,T]
 
-            # KL divergence between Gaussians: D_KL(N(mean_i, std_i) || N(mean_j, std_j))
-            kl = (log_std_j - log_std_i +
-                  (std_i.pow(2) + (mean_i - mean_j).pow(2)) / (2 * std_j.pow(2)) -
-                  0.5).sum(dim=-1)  # [n_steps, n_steps]
-            cost_matrix = kl
-            print(f"KL divergence for env {env} took {time.time() - start_time:.2f} seconds")
+        # boot-strap the value function
+        last_values = torch.cat([values[1:], next_value.unsqueeze(0)], dim=0)
 
-            # Compute OT transport plan
-            start_time = time.time()
-            transport_plan = self.compute_sinkhorn_plan(cost_matrix, reg=self.ot_reg)  # [n_steps, n_steps]
-            print(f"Sinkhorn for env {env} took {time.time() - start_time:.2f} seconds")
+        deltas = rewards + gamma * last_values * (1 - dones) - values
+        gae    = torch.zeros_like(deltas[0])
 
-            # Compute returns using OT-weighted rewards
-            start_time = time.time()
-            discounted_rewards = torch.zeros_like(env_rewards)
-            last_return = next_value[env]
-            for t in reversed(range(n_steps)):
-                if t == n_steps - 1:
-                    next_value_t = next_value[env]
-                    next_non_terminal = 1.0 - env_dones[t]
-                else:
-                    next_value_t = env_values[t + 1]
-                    next_non_terminal = 1.0 - env_dones[t]
-                
-                # OT-weighted reward: sum transport plan-weighted rewards from future steps
-                ot_weighted_reward = torch.sum(transport_plan[t, t:] * env_rewards[t:], dim=-1)
-                discounted_rewards[t] = ot_weighted_reward + self.gamma * next_value_t * next_non_terminal
-                last_return = discounted_rewards[t]
-            print(f"OT-weighted rewards for env {env} took {time.time() - start_time:.2f} seconds")
+        advantages = torch.zeros_like(deltas)
+        for t in reversed(range(T)):
+            gae = deltas[t] + gamma * self.gae_lambda * (1 - dones[t]) * gae
+            advantages[t] = gae
 
-            returns[:, env] = discounted_rewards
-            advantages[:, env] = discounted_rewards - env_values.to(self.device)
+        advantages = advantages + ot_rewards.permute(1, 0)  # merge
+        returns     = advantages + values
 
-        # Normalize advantages across all environments and time steps
-        advantages = advantages.to(self.device)
-        adv_mean = advantages.mean()
-        adv_std = advantages.std(unbiased=False)
-        advantages = (advantages - adv_mean) / (adv_std + 1e-8)
-        print(f"Advantage statistics: Mean = {adv_mean.item():.4f}, Std = {adv_std.item():.4f}")
-        return advantages, returns
+        # ---------- 3. normalise ---------------------------------------------
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        return advantages.detach(), returns.detach()
+    # -------------------------------------------------------------------------
 
     def _compute_gae(self, rewards, values, dones, next_value):
         """
