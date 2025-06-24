@@ -73,8 +73,8 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) ActionSpec(const Config& conf) {
-    return MakeDict("action"_.Bind(Spec<float>({3}, {{ -1., -1., -1. },
-				                     {  1.,  1.,  1. }})));
+    return MakeDict("action"_.Bind(Spec<float>({5}, {{ -1., -1., -1., -1., -1. },
+				                     {  1.,  1.,  1.,  1.,  1. }})));
   }
 };
 
@@ -165,8 +165,10 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   void Step(const Action& action_dict) override { 
       double bid_spread = static_cast<double>(action_dict["action"_][0]);
       double ask_spread = static_cast<double>(action_dict["action"_][1]);
-      double target_inv = static_cast<double>(action_dict["action"_][2]); 
-      adaptor_ptr->quote(bid_spread, ask_spread, target_inv);
+      double bid_size   = static_cast<double>(action_dict["action"_][2]);
+      double ask_size   = static_cast<double>(action_dict["action"_][3]);
+      double target_inv = static_cast<double>(action_dict["action"_][4]);
+      adaptor_ptr->quote(bid_spread, ask_spread, bid_size, ask_size, target_inv);
       isDone = !adaptor_ptr->next();
       ++steps;
       WriteState();
@@ -193,15 +195,15 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     state["info:fees"_] = info["fees"];
     state["info:mid_diff"_] = info["mid_diff"];
 
-    auto current_reward = info["realized_pnl"] + 0.25 * info["unrealized_pnl"] - info["fees"];
+    auto current_reward = info["realized_pnl"] + info["unrealized_pnl"] - info["fees"];
     auto net_reward = current_reward - previous_reward;
     if (net_reward > max_reward) max_reward = net_reward;
     auto drawdown = net_reward - max_reward;
 
-    if (drawdown < max_drawdown) max_reward = drawdown;
+    if (drawdown < max_drawdown) max_drawdown = drawdown;
 
     if (steps % 64 == 0) {
-	state["reward"_] = net_reward;
+	state["reward"_] = net_reward + 0.1 * max_drawdown;
         state["reward"_] *= 10000.0;
         previous_reward = current_reward;
 	max_reward = 0.0;

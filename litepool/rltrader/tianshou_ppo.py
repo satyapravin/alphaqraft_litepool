@@ -11,17 +11,18 @@ from datetime import datetime
 from recurrent_actor_critic import RecurrentActorCritic
 from recurrent_ppo_policy import RecurrentPPOPolicy
 from ppo_collector import PPOCollector
+from goal_manager import NetPnlGoalManager
 
 device = torch.device("cuda")
 num_of_envs = 64
-
+goal_mgr = NetPnlGoalManager(device)
 # === Environment setup ===
 env = litepool.make(
     "RlTrader-v0", env_type="gymnasium", num_envs=num_of_envs, batch_size=num_of_envs,
     num_threads=num_of_envs, is_prod=False, is_inverse_instr=True, api_key="",
     api_secret="", symbol="BTC-PERPETUAL", hedge_symbol='BTC-18APR25', tick_size=0.1, min_amount=10,
     maker_fee=0.000025, taker_fee=0.0005, foldername="./train_files/",
-    balance=1., start=1, max=3600 * 400
+    balance=1, start=1, max=3600 * 400
 )
 env.spec.id = 'RlTrader-v0'
 env_action_space = env.action_space
@@ -93,10 +94,10 @@ def load_latest_checkpoint():
 
 # === PPO Collector ===
 policy.ent_coef = 0.0001
-collector = PPOCollector(env, policy, n_steps=2048)
+collector = PPOCollector(env, policy, n_steps=1024)
 
 # === PPO Training Loop ===
-def train(epochs=20000, rollout_len=2048, minibatch_seq_len=512, minibatch_envs=64, update_epochs=16):
+def train(epochs=20000, rollout_len=1024, minibatch_seq_len=512, minibatch_envs=64, update_epochs=16):
     # === Try to resume from checkpoint ===
     resume_info = load_latest_checkpoint()
     if resume_info:
@@ -108,6 +109,7 @@ def train(epochs=20000, rollout_len=2048, minibatch_seq_len=512, minibatch_envs=
 
     for epoch in range(start_epoch, epochs):
         batch = collector.collect()
+        goal_mgr.relabel_rewards(batch)
 
         # === Compute advantages ===
         advantages, returns = batch["advantages"], batch["returns"]
@@ -147,8 +149,9 @@ def train(epochs=20000, rollout_len=2048, minibatch_seq_len=512, minibatch_envs=
 
         # === MetricLogger Integration ===
         rew = batch["rewards"]
+        last_infos = batch["infos"][-1]
         metric_logger.log(global_step, {
-            "infos": batch["infos"][-num_of_envs:],
+            "infos": last_infos,
         }, rew, policy)
 
         print(f"Epoch {epoch+1} | Loss: {loss_info['loss']:.3f} | "

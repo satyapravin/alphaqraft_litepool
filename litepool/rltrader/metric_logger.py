@@ -12,15 +12,13 @@ def to_scalar(value):
     return float(value)
 
 class MetricLogger:
-    def __init__(self, print_interval=1000):
+    def __init__(self, print_interval=1024):
         self.print_interval = print_interval
         self.last_print_step = 0
         self.episode_rewards = []
         self.episode_lengths = []
 
     def log(self, step_count, infos, rew, policy):
-        if step_count % self.print_interval != 0:
-            return
         self.last_print_step = step_count
 
         print(f"\nStep: {step_count}")
@@ -29,7 +27,7 @@ class MetricLogger:
 
         num_envs = len(rew) if isinstance(rew, (np.ndarray, list)) else 64
         env_ids = range(num_envs)
-        infos = infos['infos'][-1]
+        infos = infos['infos']
         rewlast = rew.sum(axis=0)
 
         for env_id in env_ids:
@@ -42,7 +40,7 @@ class MetricLogger:
             leverage = infos['leverage'][env_id] 
             reward = rewlast[env_id].item() if isinstance(rewlast, (torch.Tensor, np.ndarray)) else rewlast[env_id]
 
-            net_pnl = realized_pnl + unrealized_pnl - -fees
+            net_pnl = realized_pnl + unrealized_pnl + fees
 
             print(f"{env_id:3d} | "
                   f"{net_pnl:+10.6f} | "
