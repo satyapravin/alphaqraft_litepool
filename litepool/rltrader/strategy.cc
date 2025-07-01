@@ -56,10 +56,10 @@ void Strategy::quote(const double& bid_spread,
         	
 	auto mid_price = (bid_prices[0] + ask_prices[0]) * 0.5;
 	target_inventory = 0.05 * target + 0.95 * target_inventory;
-	target_inventory = target_inventory > 0 ? std::min(target_inventory, 1.0) : std::max(target_inventory, -1.0);
-	auto skew = (leverage - target_inventory) * 20 * tick_size;
-        auto bid_price = bid_prices[0] - skew - (1.0 + bid_spread) *  20 * tick_size;
-        auto ask_price = ask_prices[0] - skew + (1.0 + ask_spread) *  20 * tick_size;
+	target_inventory = target_inventory > 0 ? std::min(target_inventory, 0.25) : std::max(target_inventory, -0.25);
+	auto skew = (leverage - target_inventory) * 300 * tick_size;
+        auto bid_price = bid_prices[0] - skew - (1.0 + bid_spread) *  50 * tick_size;
+        auto ask_price = ask_prices[0] - skew + (1.0 + ask_spread) *  50 * tick_size;
 
 	auto bid_size_0 = (1.2 + bid_size) / 100.0 * initBalance;
 	auto ask_size_0 = (1.2 + ask_size) / 100.0 * initBalance;
@@ -75,13 +75,13 @@ void Strategy::quote(const double& bid_spread,
 	for (int ii=0; ii < 1; ++ii) {
 	    auto bid_size = instrument.getTradeAmount(bid_size_0, bid_price);
 	    auto ask_size = instrument.getTradeAmount(ask_size_0, ask_price);
-	    if (bid_size >= minAmount && leverage < 1.05) {
+	    if (bid_size >= minAmount && leverage < .25) {
 	        this->exchange.quote(std::to_string(++order_id), OrderSide::BUY, bid_price, bid_size);
 	    }
 	    else {
 		//std::cout << "BIDS ARE ZERO\t" << bid_price << "\t" << bid_size_0 << std::endl;
 	    }
-	    if (ask_size >= minAmount && leverage > -1.05) {
+	    if (ask_size >= minAmount && leverage > -.25) {
                 this->exchange.quote(std::to_string(++order_id), OrderSide::SELL, ask_price, ask_size);
 	    }
 	    else {

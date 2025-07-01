@@ -1,56 +1,75 @@
-import numpy as np
+import collections
+from typing import Dict, List, Any
+
 import torch
+
 
 class NetPnlGoalManager:
     """
-    Fixed goal: reach non-negative net-PnL at the end of an episode.
-    Provides:
-        • distance()      – scalar distance to the goal
-        • relabel_rewards – HER relabelling for a whole rollout batch
+    HER-style reward shaper for the fixed goal:
+        Net-PnL (realised + unrealised − fees) ≥ 0   per EPISODE.
+
+    • Works when an episode spans many rollouts (e.g. 24 h).
+    • Keeps one scalar distance d_{t-1} for every parallel environment
+      so the distance signal is continuous across rollout boundaries.
     """
 
-    def __init__(self, device):
+    def __init__(self, device: torch.device):
         self.device = device
+        # env_id -> last distance value  (resets to 0 at episode end)
+        self.prev_dist: Dict[int, float] = collections.defaultdict(float)
 
-    # -------------------------------------------------------------
-    # distance to goal : d = max(0 , - net_pnl)
-    # -------------------------------------------------------------
-    def distance(self, net_pnl):
-        if isinstance(net_pnl, torch.Tensor):
-            net_pnl = net_pnl.detach().cpu().numpy()
-        return np.maximum(0.0, -net_pnl)
-
-    # -------------------------------------------------------------
-    # HER relabelling (called once per collect)
-    # -------------------------------------------------------------
-    def relabel_rewards(self, batch):
+    # ------------------------------------------------------------------
+    # Main entry point – call once immediately after `collector.collect`
+    # ------------------------------------------------------------------
+    def relabel_rewards(self, batch: Dict[str, Any]) -> None:
         """
-        batch keys: ['rewards', 'infos']  (shape [T, B])
-        Replaces reward of every time-step with Δ(–distance).
-        Keeps sign so that reaching 0 PnL gives   r = +distance_prev.
+        Adds shaped rewards to the existing reward tensor in-place.
+
+        batch keys used:
+            • rewards : torch.Tensor [T, B]
+            • infos   : List[ List[dict] ]  length T, inner length B
+                         each dict contains at least realised, unrealised, fees
+                         optionally 'net_pnl' and/or 'done'
         """
-        rew = batch["rewards"]                    # torch Tensor [T,B]
-        infos = batch["infos"]                    # list length T, each len B
-        T, B = rew.shape
-        # 1. compute net-PnL trajectory per env from infos
-        net_pnl = torch.zeros(T, B, device=rew.device)   # realised+unrealised-fees
-        for t in range(B):
-            pnl_step = torch.tensor(
-                [ infos[0]["realized_pnl"][t] + infos[0]["unrealized_pnl"][t] + infos[0]["fees"][t] ],
-                device=rew.device, dtype=rew.dtype
-            )
-            net_pnl[t] = pnl_step
-
-        # cumulative PnL until t (so final line is net PnL of episode)
-        cum_pnl = net_pnl.cumsum(0)               # [T,B]
-
-        # 2. distance to goal at every step
-        dist = torch.clamp(-cum_pnl, min=0.0)     # max(0, -pnl)
-
-        # 3. shaped reward  r'_t = dist_{t-1} − dist_t   (positive when dist shrinks)
+        rew   = batch["rewards"]          # [T, B]  torch tensor
+        infos = batch["infos"]            # Python list, len T
+        T, B  = rew.shape
         shaped = torch.zeros_like(rew)
-        shaped[1:] = dist[:-1] - dist[1:]
-        shaped[0] = -dist[0]                      # first step
 
-        # 4. inject into batch (appended, not replacing extrinsic reward)
+        # ------------------------------------------------------------------
+        # Loop over parallel environments, compute shaped reward separately
+        # ------------------------------------------------------------------
+        for env_id in range(B):
+            # ---- 1. extract per-step Net-PnL trajectory ------------------
+            pnl_list: List[float] = []
+            done_flags: List[bool] = []
+
+            for t in range(T):
+                net = (infos[t]["realized_pnl"][env_id] + infos[t]["unrealized_pnl"][env_id] - infos[t]["fees"][env_id])
+                pnl_list.append(float(net))
+                done_flags.append(bool(infos[t]["done"][env_id]))
+
+            pnl = torch.tensor(pnl_list, dtype=rew.dtype, device=self.device)  # [T]
+
+            # ---- 2. distance to goal at every step ------------------------
+            dist = torch.clamp(-pnl, min=0.0)                                  # d_t
+
+            # ---- 3. delta-distance shaped rewards -------------------------
+            d_prev = torch.as_tensor(self.prev_dist[env_id],
+                                     dtype=rew.dtype, device=self.device)
+
+            shaped[0, env_id]  = d_prev - dist[0]          # first step
+            shaped[1:, env_id] = dist[:-1] - dist[1:]      # rest
+
+            # ---- 4. remember last distance for next rollout ---------------
+            self.prev_dist[env_id] = dist[-1].item()
+
+            # ---- 5. reset tracker if episode ended inside this rollout ----
+            if any(done_flags):
+                self.prev_dist[env_id] = 0.0
+
+        # ------------------------------------------------------------------
+        # 6. inject shaped rewards (additive shaping)
+        # ------------------------------------------------------------------
         batch["rewards"] = rew + shaped

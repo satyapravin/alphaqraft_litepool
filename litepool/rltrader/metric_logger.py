@@ -40,7 +40,7 @@ class MetricLogger:
             leverage = infos['leverage'][env_id] 
             reward = rewlast[env_id].item() if isinstance(rewlast, (torch.Tensor, np.ndarray)) else rewlast[env_id]
 
-            net_pnl = realized_pnl + unrealized_pnl + fees
+            net_pnl = realized_pnl + unrealized_pnl - fees
 
             print(f"{env_id:3d} | "
                   f"{net_pnl:+10.6f} | "

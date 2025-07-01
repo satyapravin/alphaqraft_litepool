@@ -68,7 +68,8 @@ class RlTraderEnvFns {
                     "info:inventory_drawdown"_.Bind(Spec<double>({-1})),
                     "info:drawdown"_.Bind(Spec<double>({-1})),
                     "info:fees"_.Bind((Spec<double>({-1}))),
-                    "info:mid_diff"_.Bind((Spec<double>({-1}))));
+                    "info:mid_diff"_.Bind((Spec<double>({-1}))),
+                    "info:done"_.Bind((Spec<bool>({-1}))));
   }
 
   template <typename Config>
@@ -194,7 +195,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     state["info:drawdown"_] = info["drawdown"];
     state["info:fees"_] = info["fees"];
     state["info:mid_diff"_] = info["mid_diff"];
-
+    state["info:done"_] = isDone;
     auto current_reward = info["realized_pnl"] + info["unrealized_pnl"] - info["fees"];
     auto net_reward = current_reward - previous_reward;
     if (net_reward > max_reward) max_reward = net_reward;
