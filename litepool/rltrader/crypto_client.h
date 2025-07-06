@@ -1,4 +1,3 @@
-// crypto_client.h
 #pragma once
 
 #include <boost/beast/core.hpp>

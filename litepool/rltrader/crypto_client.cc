@@ -1,4 +1,3 @@
-// crypto_client.cc
 #include "crypto_client.h"
 #include <boost/asio/connect.hpp>
 #include <boost/asio/post.hpp>
@@ -9,8 +8,8 @@ namespace RLTrader {
 
 constexpr const char *CR_PUBLIC_HOST  = "stream.crypto.com";
 constexpr const char *CR_PRIVATE_HOST = "stream.crypto.com";
-constexpr const char *CR_PUBLIC_PATH  = "/v2/market";
-constexpr const char *CR_PRIVATE_PATH = "/v2/user";
+constexpr const char *CR_PUBLIC_PATH  = "/exchange/v1/market";
+constexpr const char *CR_PRIVATE_PATH = "/exchange/v1/user";
 constexpr const char *CR_SSL_PORT     = "443";
 
 /* --------------------------------------------------------------------- */
@@ -139,13 +138,13 @@ void CryptoClient::do_private_connect() {
 
 /* ---------------------- authentication & subs ----------------------- */
 void CryptoClient::authenticate() {
-    // Crypto.com WS login request: see official docs.
-    // signature = HMAC_SHA256(ts + "login" + api_key)
     long ts = std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::system_clock::now().time_since_epoch()).count();
+    std::string method = "public/auth";
+    std::string id = "1";
 
     std::ostringstream prehash;
-    prehash << ts << "login" << api_key_;
+    prehash << method << id << api_key_ << ts;
     unsigned char digest[32];
     HMAC(EVP_sha256(),
          api_secret_.data(), api_secret_.size(),
@@ -157,8 +156,8 @@ void CryptoClient::authenticate() {
     for (int i=0;i<32;++i) sig << std::setw(2) << static_cast<int>(digest[i]);
 
     send_private_msg({
-        {"id", 1},
-        {"method", "login"},
+        {"id", id},
+        {"method", method},
         {"api_key", api_key_},
         {"sig", sig.str()},
         {"nonce", ts}
@@ -167,20 +166,20 @@ void CryptoClient::authenticate() {
 
 void CryptoClient::subscribe_public() {
     send_public_msg({
-        {"id", 11},
+        {"id", "11"},
         {"method", "subscribe"},
-        {"params", {{"channels", {"book." + symbol_ + ".20"}}}}
+        {"params", {{"channels", {"orderbook." + symbol_ + ".20"}}}}
     });
 }
 
 void CryptoClient::subscribe_private() {
     send_private_msg({
-        {"id", 12},
+        {"id", "12"},
         {"method", "subscribe"},
         {"params", {{"channels", {
-            "user.trade."   + symbol_,
-            "user.order."   + symbol_,
-            "user.balance"
+            "trade." + symbol_,
+            "order." + symbol_,
+            "account"
         }}}}
     });
 }
@@ -249,21 +248,21 @@ void CryptoClient::do_private_read() {
 /* ---------------------- message dispatchers ------------------------- */
 void CryptoClient::handle_public_msg(const json& j) {
     if (!j.contains("method") || j["method"] != "subscribe") return;
-    const auto& data = j["params"]["data"];
+    const auto& data = j["result"]["data"];
     if (orderbook_cb_) orderbook_cb_(data);
 }
 
 void CryptoClient::handle_private_msg(const json& j) {
-    if (j.contains("method") && j["method"] == "login") {
+    if (j.contains("method") && j["method"] == "public/auth") {
         if (j.contains("code") && j["code"] == 0) subscribe_private();
         return;
     }
     if (!j.contains("method")) return;
     const std::string m = j["method"];
-    const auto& data   = j["params"]["data"];
-    if (m.rfind("user.trade",0)==0 && trade_cb_) trade_cb_(data);
-    else if (m.rfind("user.order",0)==0 && order_cb_) order_cb_(data);
-    else if (m == "user.balance"   && position_cb_) position_cb_(data);
+    const auto& data   = j["result"]["data"];
+    if (m.rfind("trade",0)==0 && trade_cb_) trade_cb_(data);
+    else if (m.rfind("order",0)==0 && order_cb_) order_cb_(data);
+    else if (m == "account"   && position_cb_) position_cb_(data);
 }
 
 /* ---------------- accessors / callbacks ----------------------------- */
@@ -276,7 +275,7 @@ void CryptoClient::set_order_cb    (std::function<void(const json&)> cb){ order_
 void CryptoClient::place_order(const std::string& side,double price,double size,
                                const std::string& client_oid,bool is_hedge,const std::string& type) {
     send_private_msg({
-        {"id", 20},
+        {"id", "20"},
         {"method", "private/create-order"},
         {"params", {
             {"instrument_name", is_hedge ? hedge_symbol_ : symbol_},
@@ -289,19 +288,29 @@ void CryptoClient::place_order(const std::string& side,double price,double size,
     });
 }
 void CryptoClient::cancel_order(const std::string& order_id) {
-    send_private_msg({ {"id",21},{"method","private/cancel-order"},{"params",{{"order_id",order_id}}} });
+    send_private_msg({ {"id","21"},{"method","private/cancel-order"},{"params",{{"order_id",order_id}}} });
 }
 void CryptoClient::cancel_all_orders() {
-    send_private_msg({ {"id",22},{"method","private/cancel-all"},{"params",{{"instrument_name",symbol_}}} });
+    send_private_msg({ {"id","22"},{"method","private/cancel-all-orders"},{"params",{{"instrument_name",symbol_}}} });
 }
 void CryptoClient::get_position() {
-    send_private_msg({ {"id",23},{"method","private/get-position"},{"params",{{"instrument_name",symbol_}}} });
+    send_private_msg({ {"id","23"},{"method","private/get-positions"},{"params",{{"instrument_name",symbol_}}} });
 }
 
 /* --------------------------- error handler -------------------------- */
 void CryptoClient::handle_error(const std::string& where, const beast::error_code& ec) {
     std::cerr << "[CryptoClient#" << instance_id_ << "] " << where << " : " << ec.message() << '\n';
-    // simple reconnect logic for brevity
+    if (ec.message() == "Too many requests") {
+        // Implement exponential backoff for rate limit errors
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        if (where.find("Public") != std::string::npos) {
+            public_timer_->expires_after(std::chrono::milliseconds(2000));
+            public_timer_->async_wait([this](auto ec){ if(!ec && running_) do_public_connect(); });
+        } else {
+            private_timer_->expires_after(std::chrono::milliseconds(2000));
+            private_timer_->async_wait([this](auto ec){ if(!ec && running_) do_private_connect(); });
+        }
+    }
 }
 
 } // namespace RLTrader

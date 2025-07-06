@@ -1,4 +1,3 @@
-// crypto_exchange.cc
 #include "crypto_exchange.h"
 #include <iostream>
 
@@ -35,14 +34,14 @@ void CryptoExchange::on_orderbook(const json& d) {
     auto& book = book_buf_.get_write_slot(slot);
     size_t i=0;
     for (const auto& bid : d["bids"]) {
-        book.bid_prices[i]=bid[0].get<double>();
-        book.bid_sizes [i]=bid[1].get<double>();
+        book.bid_prices[i]=bid["price"].get<double>();
+        book.bid_sizes [i]=bid["quantity"].get<double>();
         if (++i>=20) break;
     }
     i=0;
     for (const auto& ask : d["asks"]) {
-        book.ask_prices[i]=ask[0].get<double>();
-        book.ask_sizes [i]=ask[1].get<double>();
+        book.ask_prices[i]=ask["price"].get<double>();
+        book.ask_sizes [i]=ask["quantity"].get<double>();
         if (++i>=20) break;
     }
     book_buf_.commit_write(slot);
@@ -51,15 +50,15 @@ void CryptoExchange::on_orderbook(const json& d) {
 void CryptoExchange::on_private_trades(const json& arr) {
     std::lock_guard lk(fill_mtx_);
     for (const auto& tr : arr) {
-        std::string tid = tr["trade_id"];
+        std::string tid = tr["trade_id"].get<std::string>();
         if (seen_trades_.insert(tid).second) {
             Order o;
-            o.orderId = tr["order_id"];
-            o.amount  = tr["traded_quantity"];
-            o.price   = tr["traded_price"];
+            o.orderId = tr["order_id"].get<std::string>();
+            o.amount  = tr["quantity"].get<double>();
+            o.price   = tr["price"].get<double>();
             o.side    = tr["side"]=="BUY"?OrderSide::BUY:OrderSide::SELL;
             o.state   = OrderState::FILLED;
-            o.microSecond = tr["exec_time"];
+            o.microSecond = tr["create_time"].get<long>();
             executions_.push_back(o);
         }
     }

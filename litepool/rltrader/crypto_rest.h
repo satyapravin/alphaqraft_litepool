@@ -1,4 +1,3 @@
-// crypto_rest.h
 #pragma once
 #include <string>
 

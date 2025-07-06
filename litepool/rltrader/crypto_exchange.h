@@ -1,4 +1,3 @@
-// crypto_exchange.h
 #pragma once
 #include "base_exchange.h"
 #include "crypto_client.h"

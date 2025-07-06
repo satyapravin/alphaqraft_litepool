@@ -1,4 +1,3 @@
-// crypto_rest.cc
 #include "crypto_rest.h"
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
@@ -45,7 +44,7 @@ static std::string send_rest(const std::string& body) {
         boost::asio::connect(beast::get_lowest_layer(stream), ep);
         stream.handshake(ssl::stream_base::client);
 
-        http::request<http::string_body> req(http::verb::post,"/v2/private/get-position",11);
+        http::request<http::string_body> req(http::verb::post,"/exchange/v1/private/get-positions",11);
         req.set(http::field::host,"api.crypto.com");
         req.set(http::field::content_type,"application/json");
         req.body() = body;
@@ -66,16 +65,17 @@ static std::string send_rest(const std::string& body) {
 bool CryptoREST::fetch_position(const std::string& symbol,double& amount,double& avgPrice) {
     long nonce = std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::chrono::system_clock::now().time_since_epoch()).count();
+    std::string method = "private/get-positions";
+    std::string id = "1";
     json params = {
-        {"instrument_name",symbol},
-        {"nonce",nonce}
+        {"instrument_name",symbol}
     };
-    std::string payload = std::to_string(nonce) + "get-position" + params.dump();
+    std::string payload = method + id + api_key_ + params.dump() + std::to_string(nonce);
     std::string sig = sign_payload(payload, api_secret_);
 
     json req_body = {
-        {"id", 1},
-        {"method","private/get-position"},
+        {"id", id},
+        {"method",method},
         {"api_key", api_key_},
         {"sig", sig},
         {"nonce", nonce},
@@ -88,10 +88,15 @@ bool CryptoREST::fetch_position(const std::string& symbol,double& amount,double&
     auto j = json::parse(resp,nullptr,false);
     if (j.is_discarded() || j["code"] != 0) return false;
 
-    const auto& p = j["result"]["data"];
-    amount   = p["position_qty"].get<double>();
-    avgPrice = p["entry_price"].get<double>();
-    return true;
+    const auto& positions = j["result"]["data"];
+    for (const auto& p : positions) {
+        if (p["instrument_name"] == symbol) {
+            amount   = p["quantity"].get<double>();
+            avgPrice = p["avg_price"].get<double>();
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace RLTrader
