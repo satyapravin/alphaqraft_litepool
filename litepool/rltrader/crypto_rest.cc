@@ -1,104 +1,172 @@
 #include "crypto_rest.h"
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
-#include <boost/beast/version.hpp>
-#include <boost/asio.hpp>
+#include <boost/beast/ssl.hpp>
+#include <boost/asio/connect.hpp>
+#include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl.hpp>
 #include <openssl/hmac.h>
-#include <nlohmann/json.hpp>
+#include <openssl/evp.h>
+#include <iomanip>
 #include <iostream>
 #include <chrono>
-#include <iomanip>
-#include <sstream>
+#include <thread>
 
 namespace RLTrader {
+
 namespace beast = boost::beast;
-namespace http  = beast::http;
-namespace net   = boost::asio;
-namespace ssl   = net::ssl;
+namespace http = beast::http;
+namespace net = boost::asio;
+namespace ssl = net::ssl;
 using tcp = net::ip::tcp;
-using json = nlohmann::json;
 
-/* Helper: generate Crypto.com REST HMAC sig */
-static std::string sign_payload(const std::string& payload, const std::string& secret) {
-    unsigned char h[32];
-    HMAC(EVP_sha256(),
-         secret.data(), secret.size(),
-         reinterpret_cast<const unsigned char*>(payload.data()), payload.size(),
-         h, nullptr);
+//constexpr const char* REST_HOST = "api.crypto.com";
+constexpr const char* REST_HOST = "uat-api.3ona.co";
+constexpr const char* REST_PORT = "443";
+constexpr const char* USER_AGENT = "RLTrader/1.0 (Crypto.com V1 API Client)";
+static constexpr std::chrono::milliseconds REQUEST_DELAY{10000}; // 10s delay to avoid rate limits
 
-    std::ostringstream oss;
-    oss << std::hex << std::setfill('0');
-    for(int i=0;i<32;++i) oss << std::setw(2) << int(h[i]);
-    return oss.str();
+/* --------------------------------------------------------------------- */
+CryptoREST::CryptoREST(const std::string& api_key, const std::string& api_secret)
+    : api_key_(api_key), api_secret_(api_secret), ioc_(), ssl_ctx_(ssl::context::tlsv12_client) {
+    try {
+        ssl_ctx_.set_default_verify_paths();
+        ssl_ctx_.set_verify_mode(ssl::verify_peer);
+        std::cout << "[CryptoREST] Initialized SSL context\n";
+    } catch (const std::exception& e) {
+        std::cerr << "[CryptoREST] SSL context initialization failed: " << e.what() << '\n';
+    }
 }
 
-static std::string send_rest(const std::string& body) {
-    try {
-        net::io_context ioc;
-        ssl::context   ctx(ssl::context::tlsv12_client);
-        ctx.set_default_verify_paths();
-        tcp::resolver  res(ioc);
-        //auto const ep = res.resolve("api.crypto.com","443");
-        auto const ep = res.resolve("uat-api.3ona.co","443");
-        ssl::stream<tcp::socket> stream(ioc,ctx);
-        boost::asio::connect(beast::get_lowest_layer(stream), ep);
-        stream.handshake(ssl::stream_base::client);
+CryptoREST::~CryptoREST() {
+    boost::system::error_code ec;
+    if (socket_) {
+        socket_->next_layer().close(ec);
+        if (ec) std::cerr << "[CryptoREST] Socket close error: " << ec.message() << '\n';
+        socket_.reset();
+    }
+    std::cout << "[CryptoREST] Destroyed\n";
+}
 
-        http::request<http::string_body> req(http::verb::post,"/exchange/v1/private/get-positions",11);
-        //req.set(http::field::host,"api.crypto.com");
-        req.set(http::field::host,"uat-api.3ona.co");
-        req.set(http::field::content_type,"application/json");
-        req.body() = body;
+/* --------------------------------------------------------------------- */
+bool CryptoREST::fetch_position(const std::string& symbol, double& amount, double& avg_price) {
+    amount = avg_price = 0; // Initialize to safe defaults
+    try {
+        // Initialize socket if not already done
+        if (!socket_) {
+            socket_ = std::make_unique<ssl::stream<tcp::socket>>(ioc_, ssl_ctx_);
+            std::cout << "[CryptoREST] Created new SSL socket\n";
+        }
+
+        // Resolve host
+        tcp::resolver resolver(ioc_);
+        auto const results = resolver.resolve(REST_HOST, REST_PORT);
+        std::cout << "[CryptoREST] Resolved " << REST_HOST << ":" << REST_PORT << "\n";
+
+        // Connect
+        boost::asio::connect(socket_->next_layer(), results.begin(), results.end());
+        std::cout << "[CryptoREST] Connected to " << REST_HOST << "\n";
+
+        // Perform SSL handshake
+        socket_->handshake(ssl::stream_base::client);
+        std::cout << "[CryptoREST] SSL handshake completed\n";
+
+        // Construct request
+        long ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::system_clock::now().time_since_epoch()).count();
+        std::string method = "private/get-positions";
+        std::string id = "1";
+
+        std::ostringstream prehash;
+        prehash << method << id << api_key_ << "instrument_name" << symbol << ts;
+        unsigned char digest[32];
+        unsigned int digest_len;
+        HMAC(EVP_sha256(),
+             api_secret_.data(), api_secret_.size(),
+             reinterpret_cast<const unsigned char*>(prehash.str().data()), prehash.str().size(),
+             digest, &digest_len);
+
+        std::ostringstream sig;
+        sig << std::hex << std::setfill('0');
+        for (unsigned int i = 0; i < digest_len; ++i) sig << std::setw(2) << static_cast<int>(digest[i]);
+
+        json req_body = {
+            {"id", id},
+            {"method", method},
+            {"params", {{"instrument_name", symbol}}},
+            {"api_key", api_key_},
+            {"sig", sig.str()},
+            {"nonce", ts}
+        };
+
+        http::request<http::string_body> req{http::verb::post, "/v2/private/get-positions", 11};
+        req.set(http::field::host, REST_HOST);
+        req.set(http::field::user_agent, USER_AGENT);
+        req.set(http::field::content_type, "application/json");
+        req.body() = req_body.dump();
         req.prepare_payload();
 
-        http::write(stream,req);
-        beast::flat_buffer buf;
-        http::response<http::string_body> respo;
-        http::read(stream,buf,respo);
-        stream.shutdown();
-        return respo.body();
-    } catch(const std::exception& e){
-        std::cerr << "REST error: " << e.what() << std::endl;
-        return "";
-    }
-}
+        // Send request
+        http::write(*socket_, req);
+        std::cout << "[CryptoREST] Sent request: " << req_body.dump() << "\n";
 
-bool CryptoREST::fetch_position(const std::string& symbol,double& amount,double& avgPrice) {
-    long nonce = std::chrono::duration_cast<std::chrono::milliseconds>(
-                     std::chrono::system_clock::now().time_since_epoch()).count();
-    std::string method = "private/get-positions";
-    std::string id = "1";
-    json params = {
-        {"instrument_name",symbol}
-    };
-    std::string payload = method + id + api_key_ + params.dump() + std::to_string(nonce);
-    std::string sig = sign_payload(payload, api_secret_);
+        // Receive response
+        beast::flat_buffer buffer;
+        http::response<http::string_body> res;
+        http::read(*socket_, buffer, res);
+        std::cout << "[CryptoREST] Received response: HTTP " << res.result_int() << " " << res.reason() << "\n";
 
-    json req_body = {
-        {"id", id},
-        {"method",method},
-        {"api_key", api_key_},
-        {"sig", sig},
-        {"nonce", nonce},
-        {"params", params}
-    };
+        // Close socket to avoid reuse issues
+        boost::system::error_code ec;
+        socket_->next_layer().close(ec);
+        if (ec) std::cerr << "[CryptoREST] Socket close error: " << ec.message() << '\n';
+        socket_.reset();
 
-    std::string resp = send_rest(req_body.dump());
-    if (resp.empty()) return false;
+        // Apply delay to avoid rate limits
+        std::this_thread::sleep_for(REQUEST_DELAY);
 
-    auto j = json::parse(resp,nullptr,false);
-    if (j.is_discarded() || j["code"] != 0) return false;
-
-    const auto& positions = j["result"]["data"];
-    for (const auto& p : positions) {
-        if (p["instrument_name"] == symbol) {
-            amount   = p["quantity"].get<double>();
-            avgPrice = p["avg_price"].get<double>();
-            return true;
+        // Parse response
+        json j = json::parse(res.body(), nullptr, false);
+        if (j.is_discarded()) {
+            std::cerr << "[CryptoREST] Failed to parse response: " << res.body() << "\n";
+            return false;
         }
+
+        if (res.result() != http::status::ok) {
+            std::cerr << "[CryptoREST] HTTP error: " << res.result_int() << " " << res.reason() << "\n";
+            return false;
+        }
+
+        if (j.contains("result") && j["result"].contains("data")) {
+            const auto& data = j["result"]["data"];
+            if (!data.is_array()) {
+                std::cerr << "[CryptoREST] Invalid data format: " << j.dump() << "\n";
+                return false;
+            }
+            for (const auto& pos : data) {
+                if (pos.contains("instrument_name") && pos["instrument_name"] == symbol) {
+                    amount = pos.contains("quantity") ? pos["quantity"].get<double>() : 0.0;
+                    avg_price = pos.contains("avg_price") ? pos["avg_price"].get<double>() : 0.0;
+                    std::cout << "[CryptoREST] Position fetched: symbol=" << symbol
+                              << ", amount=" << amount << ", avg_price=" << avg_price << "\n";
+                    return true;
+                }
+            }
+            std::cout << "[CryptoREST] No position found for symbol: " << symbol << "\n";
+            return false;
+        } else {
+            std::cerr << "[CryptoREST] Invalid response structure: " << j.dump() << "\n";
+            return false;
+        }
+    } catch (const boost::system::system_error& e) {
+        std::cerr << "[CryptoREST] Error: " << e.what() << " [" << e.code().message() << "]\n";
+        std::this_thread::sleep_for(std::chrono::milliseconds(15000)); // Longer backoff
+        return false;
+    } catch (const std::exception& e) {
+        std::cerr << "[CryptoREST] Exception: " << e.what() << "\n";
+        std::this_thread::sleep_for(std::chrono::milliseconds(15000));
+        return false;
     }
-    return false;
 }
 
 } // namespace RLTrader

@@ -21,7 +21,9 @@ Strategy::Strategy(BaseInstrument& instr, BaseExchange& exch, const double& bala
 }
 
 void Strategy::reset() {
+	std::cout << "Resetting exchange" << std::endl;
 	this->exchange.reset();
+	std::cout << "Done Reset exchange" << std::endl;
 	double initQty = 0;
 	double avgPrice = 0;
 	this->target_inventory = 0;
