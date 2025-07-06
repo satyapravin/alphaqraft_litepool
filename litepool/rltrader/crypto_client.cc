@@ -6,8 +6,10 @@
 
 namespace RLTrader {
 
-constexpr const char *CR_PUBLIC_HOST  = "stream.crypto.com";
-constexpr const char *CR_PRIVATE_HOST = "stream.crypto.com";
+//constexpr const char *CR_PUBLIC_HOST  = "stream.crypto.com";
+//constexpr const char *CR_PRIVATE_HOST = "stream.crypto.com";
+constexpr const char *CR_PUBLIC_HOST  = "uat-stream.3ona.co";
+constexpr const char *CR_PRIVATE_HOST = "uat-stream.3ona.co";
 constexpr const char *CR_PUBLIC_PATH  = "/exchange/v1/market";
 constexpr const char *CR_PRIVATE_PATH = "/exchange/v1/user";
 constexpr const char *CR_SSL_PORT     = "443";

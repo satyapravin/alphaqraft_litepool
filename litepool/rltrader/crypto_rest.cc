@@ -39,13 +39,15 @@ static std::string send_rest(const std::string& body) {
         ssl::context   ctx(ssl::context::tlsv12_client);
         ctx.set_default_verify_paths();
         tcp::resolver  res(ioc);
-        auto const ep = res.resolve("api.crypto.com","443");
+        //auto const ep = res.resolve("api.crypto.com","443");
+        auto const ep = res.resolve("uat-api.3ona.co","443");
         ssl::stream<tcp::socket> stream(ioc,ctx);
         boost::asio::connect(beast::get_lowest_layer(stream), ep);
         stream.handshake(ssl::stream_base::client);
 
         http::request<http::string_body> req(http::verb::post,"/exchange/v1/private/get-positions",11);
-        req.set(http::field::host,"api.crypto.com");
+        //req.set(http::field::host,"api.crypto.com");
+        req.set(http::field::host,"uat-api.3ona.co");
         req.set(http::field::content_type,"application/json");
         req.body() = body;
         req.prepare_payload();
