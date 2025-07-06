@@ -14,6 +14,7 @@ CryptoExchange::CryptoExchange(const std::string& symbol,
       rest_(api_key, api_secret),
       symbol_(symbol),
       hedge_symbol_(hedge_symbol.empty() ? symbol : hedge_symbol) {
+    std::cout << "[CryptoExchange] Constructed\n";
     set_callbacks();
     client_.start();
 }
@@ -21,8 +22,7 @@ CryptoExchange::CryptoExchange(const std::string& symbol,
 void CryptoExchange::reset() {
     std::cout << "[CryptoExchange] Resetting exchange\n";
     client_.stop();
-    // Increased delay to ensure clean resource cleanup
-    std::this_thread::sleep_for(std::chrono::milliseconds(15000)); // 15s delay
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000)); // Reduced to 1s
     executions_.clear();
     seen_trades_.clear();
     client_.start();
@@ -31,11 +31,13 @@ void CryptoExchange::reset() {
 
 /* ---------------- callbacks ----------------------------------------- */
 void CryptoExchange::set_callbacks() {
+    std::cout << "[CryptoExchange] Setting callbacks\n";
     client_.set_orderbook_cb([this](const json& d) { on_orderbook(d); });
     client_.set_trade_cb([this](const json& d) { on_private_trades(d); });
 }
 
 void CryptoExchange::on_orderbook(const json& d) {
+    std::cout << "[CryptoExchange] Entering on_orderbook\n";
     if (!d.is_array() || d.empty()) {
         std::cerr << "[CryptoExchange] Invalid orderbook data\n";
         return;
@@ -66,6 +68,7 @@ void CryptoExchange::on_orderbook(const json& d) {
 }
 
 void CryptoExchange::on_private_trades(const json& arr) {
+    std::cout << "[CryptoExchange] Entering on_private_trades\n";
     std::lock_guard lk(fill_mtx_);
     if (!arr.is_array()) {
         std::cerr << "[CryptoExchange] Invalid trades data\n";
@@ -95,6 +98,7 @@ void CryptoExchange::on_private_trades(const json& arr) {
 
 /* ---------------- BaseExchange impl --------------------------------- */
 bool CryptoExchange::next_read(size_t& slot, OrderBook& book) {
+    std::cout << "[CryptoExchange] Entering next_read\n";
     book = book_buf_.get_read_slot(slot);
     bool valid = book.bid_prices[0] != 0.0 || book.ask_prices[0] != 0.0;
     if (!valid) {
@@ -115,6 +119,7 @@ void CryptoExchange::fetchPosition(double& a, double& p, bool is_hedge) {
 }
 
 std::vector<Order> CryptoExchange::getFills() {
+    std::cout << "[CryptoExchange] Entering getFills\n";
     std::lock_guard lk(fill_mtx_);
     std::vector<Order> tmp;
     tmp.swap(executions_);
@@ -123,14 +128,17 @@ std::vector<Order> CryptoExchange::getFills() {
 }
 
 void CryptoExchange::cancelOrders() {
+    std::cout << "[CryptoExchange] Entering cancelOrders\n";
     client_.cancel_all_orders();
 }
 
 void CryptoExchange::quote(std::string oid, OrderSide s, const double& pr, const double& amt) {
+    std::cout << "[CryptoExchange] Entering quote\n";
     client_.place_order(s == OrderSide::BUY ? "BUY" : "SELL", pr, amt, oid, false, "LIMIT");
 }
 
 void CryptoExchange::market(std::string oid, OrderSide s, const double& pr, const double& amt, bool hedge) {
+    std::cout << "[CryptoExchange] Entering market\n";
     client_.place_order(s == OrderSide::BUY ? "BUY" : "SELL", pr, amt, oid, hedge, "MARKET");
 }
 

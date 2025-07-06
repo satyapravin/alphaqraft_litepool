@@ -8,6 +8,12 @@
 #include <atomic>
 
 namespace RLTrader {
+    // Thread safety:
+    // - All public methods are thread-safe.
+    // - fill_mtx_ protects executions_ and seen_trades_.
+    // - Callbacks (on_orderbook, on_private_trades) are invoked by CryptoClient in separate threads,
+    //   but fill_mtx_ ensures thread-safe access to shared data.
+    // - reset() stops and restarts CryptoClient, safe to call concurrently.
     class CryptoExchange final : public BaseExchange {
     public:
         CryptoExchange(const std::string& symbol,
@@ -22,7 +28,7 @@ namespace RLTrader {
         void toBook(const std::unordered_map<std::string,double>&, OrderBook&) override {
             throw std::runtime_error("Not implemented");
         }
-        void fetchPosition(double& a,double& p,bool is_hedge) override;
+        void fetchPosition(double& a, double& p, bool is_hedge) override;
         std::vector<Order> getFills() override;
         void cancelOrders() override;
         bool isDummy() override { return false; }
@@ -31,16 +37,16 @@ namespace RLTrader {
         const std::map<std::string,Order>& getAskOrders() const override { throw std::runtime_error("N/A"); }
         std::vector<Order> getUnackedOrders() const override { throw std::runtime_error("N/A"); }
 
-        void quote (std::string oid, OrderSide side, const double& price,const double& amt) override;
-        void market(std::string oid, OrderSide side, const double& price,const double& amt,bool hedge) override;
+        void quote(std::string oid, OrderSide side, const double& price, const double& amt) override;
+        void market(std::string oid, OrderSide side, const double& price, const double& amt, bool hedge) override;
 
     private:
         void set_callbacks();
         void on_private_trades(const json& d);
-        void on_orderbook      (const json& d);
+        void on_orderbook(const json& d);
 
         CryptoClient client_;
-        CryptoREST   rest_;
+        CryptoREST rest_;
         LockFreeOrderBookBuffer book_buf_;
 
         std::mutex fill_mtx_;

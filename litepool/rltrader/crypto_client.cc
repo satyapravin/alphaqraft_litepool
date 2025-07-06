@@ -17,7 +17,8 @@ constexpr const char *CR_PRIVATE_PATH = "/exchange/v1/user";
 constexpr const char *CR_SSL_PORT     = "443";
 constexpr const char *USER_AGENT     = "RLTrader/1.0 (Crypto.com V1 API Client)";
 
-static constexpr std::chrono::milliseconds CONNECT_DELAY{30000}; // 30s to avoid rate limits
+static constexpr std::chrono::milliseconds CONNECT_DELAY{1000}; // 1s for debugging
+static constexpr std::chrono::seconds CONNECT_TIMEOUT{10}; // Timeout for connection operations
 
 /* --------------------------------------------------------------------- */
 CryptoClient::CryptoClient(std::string api_key,
@@ -37,36 +38,36 @@ CryptoClient::~CryptoClient() { stop(); }
 /* ------------------------- life-cycle -------------------------------- */
 void CryptoClient::start() {
     std::cout << "[CryptoClient#" << instance_id_ << "] Entering start\n";
-    std::lock_guard<std::mutex> lock(ws_mutex_);
     if (running_.exchange(true, std::memory_order_acquire)) {
         std::cerr << "[CryptoClient#" << instance_id_ << "] Already running, skipping start\n";
         return;
     }
 
     // Initialize fresh resources
-    public_ioc_  = std::make_unique<net::io_context>();
-    private_ioc_ = std::make_unique<net::io_context>();
-    ssl_ctx_     = std::make_unique<ssl::context>(ssl::context::tlsv12_client);
-    ssl_ctx_->set_default_verify_paths();
-    ssl_ctx_->set_verify_mode(ssl::verify_peer);
+    {
+        std::lock_guard<std::mutex> public_lock(public_mutex_);
+        std::lock_guard<std::mutex> private_lock(private_mutex_);
+        public_ioc_  = std::make_unique<net::io_context>();
+        private_ioc_ = std::make_unique<net::io_context>();
+        ssl_ctx_     = std::make_unique<ssl::context>(ssl::context::tlsv12_client);
+        ssl_ctx_->set_default_verify_paths();
+        ssl_ctx_->set_verify_mode(ssl::verify_peer);
 
-    public_resolver_  = std::make_unique<tcp::resolver>(*public_ioc_);
-    private_resolver_ = std::make_unique<tcp::resolver>(*private_ioc_);
+        public_resolver_  = std::make_unique<tcp::resolver>(*public_ioc_);
+        private_resolver_ = std::make_unique<tcp::resolver>(*private_ioc_);
 
-    public_work_  = std::make_unique<boost::asio::executor_work_guard<net::io_context::executor_type>>(public_ioc_->get_executor());
-    private_work_ = std::make_unique<boost::asio::executor_work_guard<net::io_context::executor_type>>(private_ioc_->get_executor());
+        public_work_  = std::make_unique<boost::asio::executor_work_guard<net::io_context::executor_type>>(public_ioc_->get_executor());
+        private_work_ = std::make_unique<boost::asio::executor_work_guard<net::io_context::executor_type>>(private_ioc_->get_executor());
 
-    // Clear buffers and queues
-    public_buffer_.clear();
-    private_buffer_.clear();
-    public_q_.reset();
-    private_q_.reset();
+        public_buffer_.clear();
+        private_buffer_.clear();
+        public_q_.reset();
+        private_q_.reset();
+    }
 
-    std::cout << "[CryptoClient#" << instance_id_ << "] Setting up connections\n";
-    setup_connections();
-
+    // Start threads before setup
     std::cout << "[CryptoClient#" << instance_id_ << "] Starting threads\n";
-    public_thread_  = std::make_unique<std::thread>([this] {
+    public_thread_ = std::make_unique<std::thread>([this] {
         std::cout << "[CryptoClient#" << instance_id_ << "] Public thread started\n";
         public_ioc_->run();
         std::cout << "[CryptoClient#" << instance_id_ << "] Public thread exited\n";
@@ -77,52 +78,55 @@ void CryptoClient::start() {
         std::cout << "[CryptoClient#" << instance_id_ << "] Private thread exited\n";
     });
 
+    std::cout << "[CryptoClient#" << instance_id_ << "] Setting up connections\n";
+    setup_connections();
+
     std::cout << "[CryptoClient#" << instance_id_ << "] Started\n";
 }
 
 void CryptoClient::stop() {
     std::cout << "[CryptoClient#" << instance_id_ << "] Entering stop\n";
-    std::lock_guard<std::mutex> lock(ws_mutex_);
     if (!running_.exchange(false, std::memory_order_release)) {
         std::cerr << "[CryptoClient#" << instance_id_ << "] Already stopped, skipping stop\n";
         return;
     }
 
     boost::system::error_code ec;
-    // Cancel pending timers
-    if (public_timer_) {
-        public_timer_->cancel(ec);
-        if (ec && ec != boost::asio::error::operation_aborted) {
-            std::cerr << "[CryptoClient#" << instance_id_ << "] Public timer cancel: " << ec.message() << '\n';
+    {
+        std::lock_guard<std::mutex> public_lock(public_mutex_);
+        if (public_timer_) {
+            public_timer_->cancel(ec);
+            if (ec && ec != boost::asio::error::operation_aborted) {
+                std::cerr << "[CryptoClient#" << instance_id_ << "] Public timer cancel: " << ec.message() << '\n';
+            }
+        }
+        if (public_ws_ && public_connected_) {
+            public_ws_->close(websocket::close_code::normal, ec);
+            if (ec) std::cerr << "[CryptoClient#" << instance_id_ << "] Public WS close: " << ec.message() << '\n';
+            public_connected_ = false;
+        }
+        if (public_work_) {
+            public_work_.reset();
+            public_ioc_->stop();
         }
     }
-    if (private_timer_) {
-        private_timer_->cancel(ec);
-        if (ec && ec != boost::asio::error::operation_aborted) {
-            std::cerr << "[CryptoClient#" << instance_id_ << "] Private timer cancel: " << ec.message() << '\n';
+    {
+        std::lock_guard<std::mutex> private_lock(private_mutex_);
+        if (private_timer_) {
+            private_timer_->cancel(ec);
+            if (ec && ec != boost::asio::error::operation_aborted) {
+                std::cerr << "[CryptoClient#" << instance_id_ << "] Private timer cancel: " << ec.message() << '\n';
+            }
         }
-    }
-
-    // Close WebSocket connections
-    if (public_ws_ && public_connected_) {
-        public_ws_->close(websocket::close_code::normal, ec);
-        if (ec) std::cerr << "[CryptoClient#" << instance_id_ << "] Public WS close: " << ec.message() << '\n';
-        public_connected_ = false;
-    }
-    if (private_ws_ && private_connected_) {
-        private_ws_->close(websocket::close_code::normal, ec);
-        if (ec) std::cerr << "[CryptoClient#" << instance_id_ << "] Private WS close: " << ec.message() << '\n';
-        private_connected_ = false;
-    }
-
-    // Reset work guards and stop io_contexts
-    if (public_work_) {
-        public_work_.reset();
-        public_ioc_->stop();
-    }
-    if (private_work_) {
-        private_work_.reset();
-        private_ioc_->stop();
+        if (private_ws_ && private_connected_) {
+            private_ws_->close(websocket::close_code::normal, ec);
+            if (ec) std::cerr << "[CryptoClient#" << instance_id_ << "] Private WS close: " << ec.message() << '\n';
+            private_connected_ = false;
+        }
+        if (private_work_) {
+            private_work_.reset();
+            private_ioc_->stop();
+        }
     }
 
     // Join threads
@@ -135,21 +139,25 @@ void CryptoClient::stop() {
         private_thread_->join();
     }
 
-    // Reset all resources to ensure no dangling pointers
-    public_ws_.reset();
-    private_ws_.reset();
-    public_resolver_.reset();
-    private_resolver_.reset();
-    public_timer_.reset();
-    private_timer_.reset();
-    public_ioc_.reset();
-    private_ioc_.reset();
-    ssl_ctx_.reset();
-    public_connected_ = false;
-    private_connected_ = false;
-    public_writing_ = false;
-    private_writing_ = false;
-    retry_count_ = 0;
+    // Reset resources
+    {
+        std::lock_guard<std::mutex> public_lock(public_mutex_);
+        std::lock_guard<std::mutex> private_lock(private_mutex_);
+        public_ws_.reset();
+        private_ws_.reset();
+        public_resolver_.reset();
+        private_resolver_.reset();
+        public_timer_.reset();
+        private_timer_.reset();
+        public_ioc_.reset();
+        private_ioc_.reset();
+        ssl_ctx_.reset();
+        public_connected_ = false;
+        private_connected_ = false;
+        public_writing_ = false;
+        private_writing_ = false;
+        retry_count_ = 0;
+    }
 
     std::cout << "[CryptoClient#" << instance_id_ << "] Stopped\n";
 }
@@ -157,27 +165,28 @@ void CryptoClient::stop() {
 /* ---------------------- connection helpers --------------------------- */
 void CryptoClient::setup_connections() {
     std::cout << "[CryptoClient#" << instance_id_ << "] Entering setup_connections\n";
-    std::lock_guard<std::mutex> lock(ws_mutex_);
     setup_public_ws();
     setup_private_ws();
 }
 
 void CryptoClient::setup_public_ws() {
     std::cout << "[CryptoClient#" << instance_id_ << "] Entering setup_public_ws\n";
-    std::lock_guard<std::mutex> lock(ws_mutex_);
-    if (!public_ioc_) {
-        std::cerr << "[CryptoClient#" << instance_id_ << "] Public io_context is null\n";
-        return;
+    {
+        std::lock_guard<std::mutex> lock(public_mutex_);
+        if (!public_ioc_) {
+            std::cerr << "[CryptoClient#" << instance_id_ << "] Public io_context is null\n";
+            return;
+        }
+        public_ws_ = std::make_unique<websocket_stream>(*public_ioc_, *ssl_ctx_);
+        public_ws_->set_option(websocket::stream_base::decorator(
+            [](websocket::request_type& req) {
+                req.set(beast::http::field::user_agent, USER_AGENT);
+                req.set(beast::http::field::host, CR_PUBLIC_HOST);
+            }));
+        public_timer_ = std::make_unique<net::steady_timer>(*public_ioc_);
     }
-    public_ws_ = std::make_unique<websocket_stream>(*public_ioc_, *ssl_ctx_);
-    public_ws_->set_option(websocket::stream_base::decorator(
-        [](websocket::request_type& req) {
-            req.set(beast::http::field::user_agent, USER_AGENT);
-            req.set(beast::http::field::host, CR_PUBLIC_HOST);
-        }));
-    public_timer_ = std::make_unique<net::steady_timer>(*public_ioc_);
-    public_timer_->expires_after(CONNECT_DELAY);
     std::cout << "[CryptoClient#" << instance_id_ << "] Scheduling public timer\n";
+    public_timer_->expires_after(CONNECT_DELAY);
     public_timer_->async_wait([this](auto ec) {
         std::cout << "[CryptoClient#" << instance_id_ << "] Public timer fired\n";
         if (!ec && running_) do_public_connect();
@@ -189,20 +198,22 @@ void CryptoClient::setup_public_ws() {
 
 void CryptoClient::setup_private_ws() {
     std::cout << "[CryptoClient#" << instance_id_ << "] Entering setup_private_ws\n";
-    std::lock_guard<std::mutex> lock(ws_mutex_);
-    if (!private_ioc_) {
-        std::cerr << "[CryptoClient#" << instance_id_ << "] Private io_context is null\n";
-        return;
+    {
+        std::lock_guard<std::mutex> lock(private_mutex_);
+        if (!private_ioc_) {
+            std::cerr << "[CryptoClient#" << instance_id_ << "] Private io_context is null\n";
+            return;
+        }
+        private_ws_ = std::make_unique<websocket_stream>(*private_ioc_, *ssl_ctx_);
+        private_ws_->set_option(websocket::stream_base::decorator(
+            [](websocket::request_type& req) {
+                req.set(beast::http::field::user_agent, USER_AGENT);
+                req.set(beast::http::field::host, CR_PRIVATE_HOST);
+            }));
+        private_timer_ = std::make_unique<net::steady_timer>(*private_ioc_);
     }
-    private_ws_ = std::make_unique<websocket_stream>(*private_ioc_, *ssl_ctx_);
-    private_ws_->set_option(websocket::stream_base::decorator(
-        [](websocket::request_type& req) {
-            req.set(beast::http::field::user_agent, USER_AGENT);
-            req.set(beast::http::field::host, CR_PRIVATE_HOST);
-        }));
-    private_timer_ = std::make_unique<net::steady_timer>(*private_ioc_);
-    private_timer_->expires_after(CONNECT_DELAY);
     std::cout << "[CryptoClient#" << instance_id_ << "] Scheduling private timer\n";
+    private_timer_->expires_after(CONNECT_DELAY);
     private_timer_->async_wait([this](auto ec) {
         std::cout << "[CryptoClient#" << instance_id_ << "] Private timer fired\n";
         if (!ec && running_) do_private_connect();
@@ -214,44 +225,71 @@ void CryptoClient::setup_private_ws() {
 
 void CryptoClient::do_public_connect() {
     std::cout << "[CryptoClient#" << instance_id_ << "] Entering do_public_connect\n";
-    std::lock_guard<std::mutex> lock(ws_mutex_);
-    if (!public_resolver_ || !public_ws_) {
-        std::cerr << "[CryptoClient#" << instance_id_ << "] Public resolver or WebSocket is null\n";
-        return;
+    {
+        std::lock_guard<std::mutex> lock(public_mutex_);
+        if (!public_resolver_ || !public_ws_) {
+            std::cerr << "[CryptoClient#" << instance_id_ << "] Public resolver or WebSocket is null\n";
+            return;
+        }
     }
     std::cout << "[CryptoClient#" << instance_id_ << "] Initiating public WS connection\n";
+
+    // Create a timer for connection timeout
+    auto timeout_timer = std::make_shared<net::steady_timer>(*public_ioc_);
+    timeout_timer->expires_after(CONNECT_TIMEOUT);
+    timeout_timer->async_wait([this](auto ec) {
+        if (!ec) {
+            std::cerr << "[CryptoClient#" << instance_id_ << "] Public connection timeout\n";
+            handle_error("Public connect timeout", boost::asio::error::timed_out);
+        }
+    });
+
     public_resolver_->async_resolve(CR_PUBLIC_HOST, CR_SSL_PORT,
-        [this](auto ec, tcp::resolver::results_type res) {
+        [this, timeout_timer](auto ec, tcp::resolver::results_type res) {
             std::cout << "[CryptoClient#" << instance_id_ << "] Public resolve completed\n";
-            if (ec) return handle_error("Public resolve", ec);
+            if (ec) {
+                timeout_timer->cancel();
+                return handle_error("Public resolve", ec);
+            }
 
             // Create a Beast TCP stream for connection
             auto stream = std::make_shared<beast::tcp_stream>(*public_ioc_);
+            stream->expires_after(CONNECT_TIMEOUT);
             beast::get_lowest_layer(*stream).async_connect(res,
-                [this, stream](auto ec, tcp::endpoint) {
+                [this, stream, timeout_timer](auto ec, tcp::endpoint) {
                     std::cout << "[CryptoClient#" << instance_id_ << "] Public TCP connect completed\n";
-                    if (ec) return handle_error("Public connect", ec);
+                    if (ec) {
+                        timeout_timer->cancel();
+                        return handle_error("Public connect", ec);
+                    }
 
                     // Wrap stream with SSL stream
                     auto ssl_stream = std::make_shared<ssl::stream<beast::tcp_stream>>(std::move(*stream), *ssl_ctx_);
                     ssl_stream->async_handshake(ssl::stream_base::client,
-                        [this, ssl_stream](auto ec) {
+                        [this, ssl_stream, timeout_timer](auto ec) {
                             std::cout << "[CryptoClient#" << instance_id_ << "] Public SSL handshake completed\n";
-                            if (ec) return handle_error("Public SSL", ec);
+                            if (ec) {
+                                timeout_timer->cancel();
+                                return handle_error("Public SSL", ec);
+                            }
 
                             // Assign SSL stream to WebSocket stream
-                            public_ws_ = std::make_unique<websocket_stream>(std::move(*ssl_stream));
-                            public_ws_->set_option(websocket::stream_base::decorator(
-                                [](websocket::request_type& req) {
-                                    req.set(beast::http::field::user_agent, USER_AGENT);
-                                    req.set(beast::http::field::host, CR_PUBLIC_HOST);
-                                }));
+                            {
+                                std::lock_guard<std::mutex> lock(public_mutex_);
+                                public_ws_ = std::make_unique<websocket_stream>(std::move(*ssl_stream));
+                                public_ws_->set_option(websocket::stream_base::decorator(
+                                    [](websocket::request_type& req) {
+                                        req.set(beast::http::field::user_agent, USER_AGENT);
+                                        req.set(beast::http::field::host, CR_PUBLIC_HOST);
+                                    }));
+                            }
 
                             auto response = std::make_shared<websocket::response_type>();
                             std::cout << "[CryptoClient#" << instance_id_ << "] Starting public WS handshake\n";
                             public_ws_->async_handshake(*response, CR_PUBLIC_HOST, CR_PUBLIC_PATH,
-                                [this, response](auto ec) {
+                                [this, response, timeout_timer](auto ec) {
                                     std::cout << "[CryptoClient#" << instance_id_ << "] Public WS handshake completed\n";
+                                    timeout_timer->cancel();
                                     if (ec) {
                                         std::cerr << "[CryptoClient#" << instance_id_ << "] Public WS handshake failed: "
                                                   << ec.message() << ", HTTP Status: " << response->result_int()
@@ -277,44 +315,71 @@ void CryptoClient::do_public_connect() {
 
 void CryptoClient::do_private_connect() {
     std::cout << "[CryptoClient#" << instance_id_ << "] Entering do_private_connect\n";
-    std::lock_guard<std::mutex> lock(ws_mutex_);
-    if (!private_resolver_ || !private_ws_) {
-        std::cerr << "[CryptoClient#" << instance_id_ << "] Private resolver or WebSocket is null\n";
-        return;
+    {
+        std::lock_guard<std::mutex> lock(private_mutex_);
+        if (!private_resolver_ || !private_ws_) {
+            std::cerr << "[CryptoClient#" << instance_id_ << "] Private resolver or WebSocket is null\n";
+            return;
+        }
     }
     std::cout << "[CryptoClient#" << instance_id_ << "] Initiating private WS connection\n";
+
+    // Create a timer for connection timeout
+    auto timeout_timer = std::make_shared<net::steady_timer>(*private_ioc_);
+    timeout_timer->expires_after(CONNECT_TIMEOUT);
+    timeout_timer->async_wait([this](auto ec) {
+        if (!ec) {
+            std::cerr << "[CryptoClient#" << instance_id_ << "] Private connection timeout\n";
+            handle_error("Private connect timeout", boost::asio::error::timed_out);
+        }
+    });
+
     private_resolver_->async_resolve(CR_PRIVATE_HOST, CR_SSL_PORT,
-        [this](auto ec, tcp::resolver::results_type res) {
+        [this, timeout_timer](auto ec, tcp::resolver::results_type res) {
             std::cout << "[CryptoClient#" << instance_id_ << "] Private resolve completed\n";
-            if (ec) return handle_error("Private resolve", ec);
+            if (ec) {
+                timeout_timer->cancel();
+                return handle_error("Private resolve", ec);
+            }
 
             // Create a Beast TCP stream for connection
             auto stream = std::make_shared<beast::tcp_stream>(*private_ioc_);
+            stream->expires_after(CONNECT_TIMEOUT);
             beast::get_lowest_layer(*stream).async_connect(res,
-                [this, stream](auto ec, tcp::endpoint) {
+                [this, stream, timeout_timer](auto ec, tcp::endpoint) {
                     std::cout << "[CryptoClient#" << instance_id_ << "] Private TCP connect completed\n";
-                    if (ec) return handle_error("Private connect", ec);
+                    if (ec) {
+                        timeout_timer->cancel();
+                        return handle_error("Private connect", ec);
+                    }
 
                     // Wrap stream with SSL stream
                     auto ssl_stream = std::make_shared<ssl::stream<beast::tcp_stream>>(std::move(*stream), *ssl_ctx_);
                     ssl_stream->async_handshake(ssl::stream_base::client,
-                        [this, ssl_stream](auto ec) {
+                        [this, ssl_stream, timeout_timer](auto ec) {
                             std::cout << "[CryptoClient#" << instance_id_ << "] Private SSL handshake completed\n";
-                            if (ec) return handle_error("Private SSL", ec);
+                            if (ec) {
+                                timeout_timer->cancel();
+                                return handle_error("Private SSL", ec);
+                            }
 
                             // Assign SSL stream to WebSocket stream
-                            private_ws_ = std::make_unique<websocket_stream>(std::move(*ssl_stream));
-                            private_ws_->set_option(websocket::stream_base::decorator(
-                                [](websocket::request_type& req) {
-                                    req.set(beast::http::field::user_agent, USER_AGENT);
-                                    req.set(beast::http::field::host, CR_PRIVATE_HOST);
-                                }));
+                            {
+                                std::lock_guard<std::mutex> lock(private_mutex_);
+                                private_ws_ = std::make_unique<websocket_stream>(std::move(*ssl_stream));
+                                private_ws_->set_option(websocket::stream_base::decorator(
+                                    [](websocket::request_type& req) {
+                                        req.set(beast::http::field::user_agent, USER_AGENT);
+                                        req.set(beast::http::field::host, CR_PRIVATE_HOST);
+                                    }));
+                            }
 
                             auto response = std::make_shared<websocket::response_type>();
                             std::cout << "[CryptoClient#" << instance_id_ << "] Starting private WS handshake\n";
                             private_ws_->async_handshake(*response, CR_PRIVATE_HOST, CR_PRIVATE_PATH,
-                                [this, response](auto ec) {
+                                [this, response, timeout_timer](auto ec) {
                                     std::cout << "[CryptoClient#" << instance_id_ << "] Private WS handshake completed\n";
+                                    timeout_timer->cancel();
                                     if (ec) {
                                         std::cerr << "[CryptoClient#" << instance_id_ << "] Private WS handshake failed: "
                                                   << ec.message() << ", HTTP Status: " << response->result_int()
@@ -415,71 +480,79 @@ void CryptoClient::send_private_msg(json&& j) {
 
 void CryptoClient::write_next_public() {
     std::cout << "[CryptoClient#" << instance_id_ << "] Entering write_next_public\n";
-    std::lock_guard<std::mutex> lock(ws_mutex_);
-    if (!public_connected_ || public_writing_ || !public_ws_) return;
-    json j;
-    if (public_q_.pop(j)) {
-        public_writing_ = true;
-        auto dump = j.dump();
-        public_ws_->async_write(net::buffer(dump),
-            [this](auto ec, std::size_t) {
-                std::cout << "[CryptoClient#" << instance_id_ << "] Public write completed\n";
-                std::lock_guard<std::mutex> lock(ws_mutex_);
-                public_writing_ = false;
-                if (ec) handle_error("Public write", ec);
-                else if (!public_q_.empty()) write_next_public();
-            });
+    {
+        std::lock_guard<std::mutex> lock(public_mutex_);
+        if (!public_connected_ || public_writing_ || !public_ws_) return;
+        json j;
+        if (public_q_.pop(j)) {
+            public_writing_ = true;
+            auto dump = j.dump();
+            public_ws_->async_write(net::buffer(dump),
+                [this](auto ec, std::size_t) {
+                    std::cout << "[CryptoClient#" << instance_id_ << "] Public write completed\n";
+                    std::lock_guard<std::mutex> lock(public_mutex_);
+                    public_writing_ = false;
+                    if (ec) handle_error("Public write", ec);
+                    else if (!public_q_.empty()) write_next_public();
+                });
+        }
     }
 }
 
 void CryptoClient::write_next_private() {
     std::cout << "[CryptoClient#" << instance_id_ << "] Entering write_next_private\n";
-    std::lock_guard<std::mutex> lock(ws_mutex_);
-    if (!private_connected_ || private_writing_ || !private_ws_) return;
-    json j;
-    if (private_q_.pop(j)) {
-        private_writing_ = true;
-        auto dump = j.dump();
-        private_ws_->async_write(net::buffer(dump),
-            [this](auto ec, std::size_t) {
-                std::cout << "[CryptoClient#" << instance_id_ << "] Private write completed\n";
-                std::lock_guard<std::mutex> lock(ws_mutex_);
-                private_writing_ = false;
-                if (ec) handle_error("Private write", ec);
-                else if (!private_q_.empty()) write_next_private();
-            });
+    {
+        std::lock_guard<std::mutex> lock(private_mutex_);
+        if (!private_connected_ || private_writing_ || !private_ws_) return;
+        json j;
+        if (private_q_.pop(j)) {
+            private_writing_ = true;
+            auto dump = j.dump();
+            private_ws_->async_write(net::buffer(dump),
+                [this](auto ec, std::size_t) {
+                    std::cout << "[CryptoClient#" << instance_id_ << "] Private write completed\n";
+                    std::lock_guard<std::mutex> lock(private_mutex_);
+                    private_writing_ = false;
+                    if (ec) handle_error("Private write", ec);
+                    else if (!private_q_.empty()) write_next_private();
+                });
+        }
     }
 }
 
 /* --------------------------- read loops ----------------------------- */
 void CryptoClient::do_public_read() {
     std::cout << "[CryptoClient#" << instance_id_ << "] Entering do_public_read\n";
-    std::lock_guard<std::mutex> lock(ws_mutex_);
-    if (!public_ws_ || !public_connected_) return;
-    public_ws_->async_read(public_buffer_,
-        [this](auto ec, std::size_t) {
-            std::cout << "[CryptoClient#" << instance_id_ << "] Public read completed\n";
-            if (ec) return handle_error("Public read", ec);
-            json j = json::parse(beast::buffers_to_string(public_buffer_.data()), nullptr, false);
-            public_buffer_.consume(public_buffer_.size());
-            if (!j.is_discarded()) handle_public_msg(j);
-            if (running_) do_public_read();
-        });
+    {
+        std::lock_guard<std::mutex> lock(public_mutex_);
+        if (!public_ws_ || !public_connected_) return;
+        public_ws_->async_read(public_buffer_,
+            [this](auto ec, std::size_t) {
+                std::cout << "[CryptoClient#" << instance_id_ << "] Public read completed\n";
+                if (ec) return handle_error("Public read", ec);
+                json j = json::parse(beast::buffers_to_string(public_buffer_.data()), nullptr, false);
+                public_buffer_.consume(public_buffer_.size());
+                if (!j.is_discarded()) handle_public_msg(j);
+                if (running_) do_public_read();
+            });
+    }
 }
 
 void CryptoClient::do_private_read() {
     std::cout << "[CryptoClient#" << instance_id_ << "] Entering do_private_read\n";
-    std::lock_guard<std::mutex> lock(ws_mutex_);
-    if (!private_ws_ || !private_connected_) return;
-    private_ws_->async_read(private_buffer_,
-        [this](auto ec, std::size_t) {
-            std::cout << "[CryptoClient#" << instance_id_ << "] Private read completed\n";
-            if (ec) return handle_error("Private read", ec);
-            json j = json::parse(beast::buffers_to_string(private_buffer_.data()), nullptr, false);
-            private_buffer_.consume(private_buffer_.size());
-            if (!j.is_discarded()) handle_private_msg(j);
-            if (running_) do_private_read();
-        });
+    {
+        std::lock_guard<std::mutex> lock(private_mutex_);
+        if (!private_ws_ || !private_connected_) return;
+        private_ws_->async_read(private_buffer_,
+            [this](auto ec, std::size_t) {
+                std::cout << "[CryptoClient#" << instance_id_ << "] Private read completed\n";
+                if (ec) return handle_error("Private read", ec);
+                json j = json::parse(beast::buffers_to_string(private_buffer_.data()), nullptr, false);
+                private_buffer_.consume(private_buffer_.size());
+                if (!j.is_discarded()) handle_private_msg(j);
+                if (running_) do_private_read();
+            });
+    }
 }
 
 /* ---------------------- message dispatchers ------------------------- */
@@ -559,7 +632,7 @@ void CryptoClient::get_position() {
 /* --------------------------- error handler -------------------------- */
 void CryptoClient::handle_error(const std::string& where, const beast::error_code& ec, int http_status) {
     std::cerr << "[CryptoClient#" << instance_id_ << "] " << where << " : " << ec.message() << '\n';
-    if (ec == boost::asio::error::connection_refused || ec == boost::asio::ssl::error::stream_truncated || ec) {
+    if (ec == boost::asio::error::connection_refused || ec == boost::asio::ssl::error::stream_truncated || ec == boost::asio::error::timed_out) {
         // Retry connection with exponential backoff
         auto delay = std::chrono::milliseconds(http_status == 429 ? 60000 : 30000 * (1 + retry_count_++));
         std::cerr << "[CryptoClient#" << instance_id_ << "] Retrying " << where << " after " << delay.count() << "ms\n";

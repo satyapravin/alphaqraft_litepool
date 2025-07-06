@@ -25,6 +25,7 @@ constexpr const char* REST_HOST = "uat-api.3ona.co";
 constexpr const char* REST_PORT = "443";
 constexpr const char* USER_AGENT = "RLTrader/1.0 (Crypto.com V1 API Client)";
 static constexpr std::chrono::milliseconds REQUEST_DELAY{10000}; // 10s delay to avoid rate limits
+static constexpr std::chrono::seconds REQUEST_TIMEOUT{5}; // Timeout for REST operations
 
 /* --------------------------------------------------------------------- */
 CryptoREST::CryptoREST(const std::string& api_key, const std::string& api_secret)
@@ -40,6 +41,7 @@ CryptoREST::CryptoREST(const std::string& api_key, const std::string& api_secret
 
 CryptoREST::~CryptoREST() {
     boost::system::error_code ec;
+    std::lock_guard<std::mutex> lock(connection_mutex_);
     if (socket_) {
         socket_->next_layer().close(ec);
         if (ec) std::cerr << "[CryptoREST] Socket close error: " << ec.message() << '\n';
@@ -49,18 +51,33 @@ CryptoREST::~CryptoREST() {
 }
 
 /* --------------------------------------------------------------------- */
-bool CryptoREST::fetch_position(const std::string& symbol, double& amount, double& avg_price) {
-    amount = avg_price = 0; // Initialize to safe defaults
+void CryptoREST::do_connect() {
+    std::cout << "[CryptoREST] Entering do_connect\n";
+    std::lock_guard<std::mutex> lock(connection_mutex_);
+    if (!running_) {
+        std::cerr << "[CryptoREST] Not running, cannot connect\n";
+        return;
+    }
     try {
-        // Initialize socket if not already done
         if (!socket_) {
             socket_ = std::make_unique<ssl::stream<tcp::socket>>(ioc_, ssl_ctx_);
             std::cout << "[CryptoREST] Created new SSL socket\n";
         }
 
+        // Create timeout timer
+        auto timeout_timer = std::make_shared<net::steady_timer>(ioc_);
+        timeout_timer->expires_after(REQUEST_TIMEOUT);
+        timeout_timer->async_wait([this](auto ec) {
+            if (!ec) {
+                std::cerr << "[CryptoREST] Connection timeout\n";
+                std::lock_guard<std::mutex> lock(connection_mutex_);
+                socket_.reset();
+            }
+        });
+
         // Resolve host
         tcp::resolver resolver(ioc_);
-        auto const results = resolver.resolve(REST_HOST, REST_PORT);
+        auto results = resolver.resolve(REST_HOST, REST_PORT);
         std::cout << "[CryptoREST] Resolved " << REST_HOST << ":" << REST_PORT << "\n";
 
         // Connect
@@ -70,6 +87,44 @@ bool CryptoREST::fetch_position(const std::string& symbol, double& amount, doubl
         // Perform SSL handshake
         socket_->handshake(ssl::stream_base::client);
         std::cout << "[CryptoREST] SSL handshake completed\n";
+        timeout_timer->cancel();
+    } catch (const boost::system::system_error& e) {
+        std::cerr << "[CryptoREST] Connect error: " << e.what() << " [" << e.code().message() << "]\n";
+        socket_.reset();
+    } catch (const std::exception& e) {
+        std::cerr << "[CryptoREST] Connect exception: " << e.what() << "\n";
+        socket_.reset();
+    }
+}
+
+bool CryptoREST::fetch_position(const std::string& symbol, double& amount, double& avg_price) {
+    std::cout << "[CryptoREST] Entering fetch_position\n";
+    amount = avg_price = 0; // Initialize to safe defaults
+    std::lock_guard<std::mutex> lock(connection_mutex_);
+    if (!running_) {
+        std::cerr << "[CryptoREST] Not running, cannot fetch position\n";
+        return false;
+    }
+    try {
+        if (!socket_) {
+            running_ = true;
+            do_connect();
+            if (!socket_) {
+                std::cerr << "[CryptoREST] Failed to establish connection\n";
+                return false;
+            }
+        }
+
+        // Create timeout timer
+        auto timeout_timer = std::make_shared<net::steady_timer>(ioc_);
+        timeout_timer->expires_after(REQUEST_TIMEOUT);
+        timeout_timer->async_wait([this](auto ec) {
+            if (!ec) {
+                std::cerr << "[CryptoREST] Request timeout\n";
+                std::lock_guard<std::mutex> lock(connection_mutex_);
+                socket_.reset();
+            }
+        });
 
         // Construct request
         long ts = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -115,11 +170,12 @@ bool CryptoREST::fetch_position(const std::string& symbol, double& amount, doubl
         http::response<http::string_body> res;
         http::read(*socket_, buffer, res);
         std::cout << "[CryptoREST] Received response: HTTP " << res.result_int() << " " << res.reason() << "\n";
+        timeout_timer->cancel();
 
         // Close socket to avoid reuse issues
         boost::system::error_code ec;
         socket_->next_layer().close(ec);
-        if (ec) std::cerr << "[CryptoREST] Socket close error: " << ec.message() << '\n';
+        if (ec) std::cerr << "[CryptoREST] Socket close error: " << ec.message() << "\n";
         socket_.reset();
 
         // Apply delay to avoid rate limits
@@ -160,10 +216,12 @@ bool CryptoREST::fetch_position(const std::string& symbol, double& amount, doubl
         }
     } catch (const boost::system::system_error& e) {
         std::cerr << "[CryptoREST] Error: " << e.what() << " [" << e.code().message() << "]\n";
+        socket_.reset();
         std::this_thread::sleep_for(std::chrono::milliseconds(15000)); // Longer backoff
         return false;
     } catch (const std::exception& e) {
         std::cerr << "[CryptoREST] Exception: " << e.what() << "\n";
+        socket_.reset();
         std::this_thread::sleep_for(std::chrono::milliseconds(15000));
         return false;
     }
