@@ -31,7 +31,7 @@
 
 #include <filesystem>
 
-#include "deribit_exchange.h"
+#include "crypto_exchange.h"
 #include "sim_exchange.h"
 
 namespace fs = std::filesystem;
@@ -139,7 +139,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
 
 
     if (this->is_prod) {
-      exch_raw_ptr = new RLTrader::DeribitExchange(symbol, hedge_symbol, api_key, api_secret);
+      exch_raw_ptr = new RLTrader::CryptoExchange(symbol, hedge_symbol, api_key, api_secret);
     } else {
       int idx = env_id % 64;
       std::string filename = foldername + std::to_string(idx + 1) + ".csv";

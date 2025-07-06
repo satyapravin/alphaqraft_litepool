@@ -97,7 +97,7 @@ policy.ent_coef = 0.0001
 collector = PPOCollector(env, policy, n_steps=1024)
 
 # === PPO Training Loop ===
-def train(epochs=20000, rollout_len=1024, minibatch_seq_len=512, minibatch_envs=64, update_epochs=16):
+def train(epochs=24000, rollout_len=1024, minibatch_seq_len=512, minibatch_envs=64, update_epochs=16):
     # === Try to resume from checkpoint ===
     resume_info = load_latest_checkpoint()
     if resume_info:
