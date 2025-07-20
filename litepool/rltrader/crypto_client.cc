@@ -29,7 +29,7 @@ constexpr const char* CR_PUBLIC_PATH  = "/exchange/v1/market";
 constexpr const char* CR_PRIVATE_PATH = "/exchange/v1/user";
 constexpr const char* CR_SSL_PORT     = "443";
 
-constexpr const char* USER_AGENT      = "RLTrader/1.0 (Crypto.com V1 API Client)";
+constexpr const char* USER_AGENT      = "103.101.58.47";
 
 static   constexpr std::chrono::milliseconds CONNECT_DELAY {1000};
 static   constexpr std::chrono::seconds      CONNECT_TIMEOUT{10};
@@ -148,19 +148,22 @@ void CryptoClient::setup_connections()
 /* ---------------- public stream ----------------------------------- */
 void CryptoClient::setup_public_ws()
 {
-    {
-        std::lock_guard lp(public_mutex_);
-        public_ws_    = std::make_unique<websocket_stream>(*public_ioc_, *ssl_ctx_);
-        public_timer_ = std::make_unique<net::steady_timer>(*public_ioc_);
-        public_ws_->set_option(ws::stream_base::decorator(
-            [](ws::request_type& req){
-                req.set(beast::http::field::user_agent, USER_AGENT);
-                req.set(beast::http::field::host, CR_PUBLIC_HOST);
-            }));
-    }
+    std::lock_guard lp(public_mutex_);
+    public_ws_ = std::make_unique<websocket_stream>(*public_ioc_, *ssl_ctx_);
+    public_timer_ = std::make_unique<net::steady_timer>(*public_ioc_);
+
+    public_ws_->set_option(ws::stream_base::decorator(
+        [](ws::request_type& req) {
+            req.set(beast::http::field::host, CR_PUBLIC_HOST);
+            req.set(beast::http::field::user_agent, USER_AGENT);
+            req.set(beast::http::field::connection, "Upgrade");
+            req.set(beast::http::field::upgrade, "websocket");
+            req.set(beast::http::field::sec_websocket_version, "13");
+            req.set(beast::http::field::origin, "https://exchange.crypto.com");
+        }));
 
     public_timer_->expires_after(CONNECT_DELAY);
-    public_timer_->async_wait([this](auto ec){
+    public_timer_->async_wait([this](auto ec) {
         if (!ec && running_) do_public_connect();
     });
 }
@@ -169,47 +172,57 @@ void CryptoClient::do_public_connect()
 {
     std::cout << "[CryptoClient#" << instance_id_ << "] do_public_connect\n";
 
-    /* timeout guard ------------------------------------------------- */
     auto timeout = std::make_shared<net::steady_timer>(*public_ioc_);
     timeout->expires_after(CONNECT_TIMEOUT);
-    timeout->async_wait([this](auto ec){
+    timeout->async_wait([this](auto ec) {
         if (!ec) handle_error("public connect timeout", net::error::timed_out);
     });
 
-    /* async resolve ------------------------------------------------- */
     public_resolver_->async_resolve(CR_PUBLIC_HOST, CR_SSL_PORT,
-        [this, timeout](auto ec, tcp::resolver::results_type res){
+        [this, timeout](auto ec, tcp::resolver::results_type res) {
             if (ec) { timeout->cancel(); return handle_error("public resolve", ec); }
 
             auto stream = std::make_shared<beast::tcp_stream>(*public_ioc_);
             stream->expires_after(CONNECT_TIMEOUT);
 
             beast::get_lowest_layer(*stream).async_connect(res,
-                [this, stream, timeout](auto ec, tcp::endpoint){
+                [this, stream, timeout](auto ec, tcp::endpoint) {
                     if (ec) { timeout->cancel(); return handle_error("public connect", ec); }
 
                     auto ssl_stream = std::make_shared<ssl::stream<beast::tcp_stream>>(std::move(*stream), *ssl_ctx_);
                     ssl_stream->async_handshake(ssl::stream_base::client,
-                        [this, ssl_stream, timeout](auto ec){
+                        [this, ssl_stream, timeout](auto ec) {
                             if (ec) { timeout->cancel(); return handle_error("public SSL", ec); }
 
-                            /* assign ssl stream to ws ---------------------- */
                             {
                                 std::lock_guard lp(public_mutex_);
                                 public_ws_ = std::make_unique<websocket_stream>(std::move(*ssl_stream));
                                 public_ws_->set_option(ws::stream_base::decorator(
-                                    [](ws::request_type& req){
-                                        req.set(beast::http::field::user_agent, USER_AGENT);
+                                    [](ws::request_type& req) {
                                         req.set(beast::http::field::host, CR_PUBLIC_HOST);
+                                        req.set(beast::http::field::user_agent, USER_AGENT);
+                                        req.set(beast::http::field::connection, "Upgrade");
+                                        req.set(beast::http::field::upgrade, "websocket");
+                                        req.set(beast::http::field::sec_websocket_version, "13");
+                                        req.set(beast::http::field::origin, "https://exchange.crypto.com");
+					req.set("CF-Connecting-IP", "103.101.58.47");
+                                        req.set("X-Forwarded-For", "103.101.58.47");
                                     }));
                             }
+                            
+			    auto response = std::make_shared<ws::response_type>();
 
-                            auto response = std::make_shared<ws::response_type>();
                             public_ws_->async_handshake(*response, CR_PUBLIC_HOST, CR_PUBLIC_PATH,
-                                [this, response, timeout](auto ec){
+                                [this, response, timeout](beast::error_code ec) {
                                     timeout->cancel();
-                                    if (ec){
-                                        return handle_error("public handshake", ec, response->result_int());
+                                    if (ec) {
+                                        std::cerr << "Handshake failed. Error: " << ec.message() << "\n";
+                                        std::cerr << "HTTP Status: " << response->result_int() << "\n";
+                                        std::cerr << "Response Headers:\n";
+                                        for (auto const& field : *response) {
+                                            std::cerr << "  " << field.name_string() << ": " << field.value() << "\n";
+                                        }
+                                        return handle_error("public handshake", ec);
                                     }
                                     public_connected_ = true;
                                     subscribe_public();
@@ -329,7 +342,7 @@ void CryptoClient::subscribe_public()
     send_public_msg({
         {"id", "11"},
         {"method", "subscribe"},
-        {"params", {{"channels", {"orderbook." + symbol_ + ".20"}}}}
+        {"params", {{"channels", {"book." + symbol_ + ".500"}}}}
     });
 }
 

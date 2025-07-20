@@ -23,9 +23,10 @@ namespace RLTrader
 
 /* ------------------------------------------------------------------ */
 
+//constexpr const char* REST_HOST   = "api.crypto.com";
 constexpr const char* REST_HOST   = "uat-api.3ona.co";
 constexpr const char* REST_PORT   = "443";
-constexpr const char* USER_AGENT  = "RLTrader/1.0 (Crypto.com V1 API Client)";
+constexpr const char* USER_AGENT  = "AlphaQraft_Trading";
 static   constexpr std::chrono::milliseconds REQUEST_DELAY{10'000};
 static   constexpr std::chrono::seconds      REQUEST_TIMEOUT{5};
 
@@ -169,7 +170,7 @@ bool CryptoREST::fetch_position(const std::string& symbol,
 
         return true;
     } catch (const std::exception& e) {
-        std::cerr << "[CryptoREST] fetch_position: " << e.what() << '\n';
+        std::cout << "[CryptoREST] fetch_position: " << e.what() << '\n';
         socket_.reset();
         return false;
     }

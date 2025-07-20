@@ -85,12 +85,10 @@ def load_model_and_env():
         num_envs=num_of_envs,
         batch_size=num_of_envs,
         num_threads=1,
-        is_prod=True,
+        is_prod=False,
         is_inverse_instr=True,
-        #api_key="Wd82oXzXWzJRf4ZHpsijXK", # PROD
-        #api_secret="cxakp_SE3VYcB2u336cdcfN5hiBU", #PROD
-        api_key="pd4khWVrKGgRL8HHgbDs1X", # UAT 
-        api_secret="cxaks_gCz5k6k9ucFUB4dQASiKEB", #UAT
+        api_key="",
+        api_secret="",
         symbol="BTCUSD-PERP",
         hedge_symbol="BTC",
         tick_size=0.1,
@@ -98,7 +96,7 @@ def load_model_and_env():
         maker_fee=-0.00004,          # === matches training script ===
         taker_fee=0.0005,
         foldername="./test_files/",
-        balance=0.05,
+        balance=5.0,
         start=1,
         max=max_steps,
     )
