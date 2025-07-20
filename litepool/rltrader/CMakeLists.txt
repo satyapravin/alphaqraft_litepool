@@ -35,7 +35,7 @@ pybind11_add_module(rltrader_litepool rltrader_litepool.h rltrader_litepool.cc
                                       sim_exchange.h sim_exchange.cc
                                       crypto_exchange.h crypto_exchange.cc
                                       crypto_client.h crypto_client.cc
-                                      crypto_rest.h crypto_rest.cc
+                                      crypto_rest.h crypto_rest.cc crypto_util.h
                                       deribit_exchange.h deribit_exchange.cc
                                       deribit_client.h deribit_client.cc
                                       deribit_rest.h deribit_rest.cc
@@ -61,7 +61,7 @@ add_executable(rltradertest rltrader_litepool_test.cc
                                       sim_exchange.h sim_exchange.cc
                                       crypto_exchange.h crypto_exchange.cc
                                       crypto_client.h crypto_client.cc
-                                      crypto_rest.h crypto_rest.cc
+                                      crypto_rest.h crypto_rest.cc crypto_util.h
                                       deribit_exchange.h deribit_exchange.cc
                                       deribit_client.h deribit_client.cc
                                       deribit_rest.h deribit_rest.cc

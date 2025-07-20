@@ -1,4 +1,5 @@
 #include "crypto_rest.h"
+#include "crypto_util.h"
 
 #include <chrono>
 #include <iomanip>
@@ -95,28 +96,26 @@ bool CryptoREST::fetch_position(const std::string& symbol,
         constexpr char METHOD[] = "private/get-positions";
         constexpr char ID[]     = "1";
 
-        std::ostringstream prehash;
-        prehash << METHOD << ID << api_key_
-                << "instrument_name" << symbol << ts;
+        json params = {{"instrument_name", symbol}};
+        std::string payload = build_payload(METHOD, ID, api_key_, params, ts);
 
-        unsigned char digest[32];
-        unsigned int  dlen{};
+        unsigned char digest[32]; unsigned int dlen{};
         HMAC(EVP_sha256(), api_secret_.data(), api_secret_.size(),
-             reinterpret_cast<const unsigned char*>(prehash.str().data()),
-             prehash.str().size(), digest, &dlen);
+             reinterpret_cast<const unsigned char*>(payload.data()),
+             payload.size(), digest, &dlen);
 
         std::ostringstream sig;
         sig << std::hex << std::setfill('0');
         for (unsigned i = 0; i < dlen; ++i)
             sig << std::setw(2) << static_cast<int>(digest[i]);
 
-        json body{
-            {"id",     ID},
-            {"method", METHOD},
-            {"params", {{"instrument_name", symbol}}},
+        json body = {
+            {"id",      ID},
+            {"method",  METHOD},
             {"api_key", api_key_},
-            {"sig",     sig.str()},
-            {"nonce",   ts}
+            {"params",  params},
+            {"nonce",   ts},
+            {"sig",     sig.str()}
         };
 
         /* ---- send ---------------------------------------------------- */

@@ -1,5 +1,5 @@
 #include "crypto_client.h"
-
+#include "crypto_util.h"
 #include <boost/asio/connect.hpp>
 #include <boost/asio/post.hpp>
 #include <chrono>
@@ -295,22 +295,20 @@ void CryptoClient::do_private_connect()
 /* ------------------------------------------------------------------ */
 /*  Authentication & subscriptions                                    */
 /* ------------------------------------------------------------------ */
-void CryptoClient::authenticate()
-{
+void CryptoClient::authenticate() {
     const long ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    std::chrono::system_clock::now().time_since_epoch()).count();
 
     constexpr char METHOD[] = "public/auth";
     constexpr char ID[]     = "1";
 
-    std::ostringstream prehash;
-    prehash << METHOD << ID << api_key_ << ts;
+    json params = json::object(); 
+    std::string payload = build_payload(METHOD, ID, api_key_, params, ts);
 
-    unsigned char digest[32];
-    unsigned int  dlen{};
+    unsigned char digest[32]; unsigned int dlen{};
     HMAC(EVP_sha256(), api_secret_.data(), api_secret_.size(),
-         reinterpret_cast<const unsigned char*>(prehash.str().data()),
-         prehash.str().size(), digest, &dlen);
+         reinterpret_cast<const unsigned char*>(payload.data()),
+         payload.size(), digest, &dlen);
 
     std::ostringstream sig;
     sig << std::hex << std::setfill('0');
@@ -318,11 +316,11 @@ void CryptoClient::authenticate()
         sig << std::setw(2) << static_cast<int>(digest[i]);
 
     send_private_msg({
-        {"id",     ID},
+        {"id", ID},
         {"method", METHOD},
         {"api_key", api_key_},
-        {"sig",     sig.str()},
-        {"nonce",   ts}
+        {"sig", sig.str()},
+        {"nonce", ts}
     });
 }
 
