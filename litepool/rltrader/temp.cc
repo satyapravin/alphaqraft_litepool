@@ -44,64 +44,76 @@ public:
     }
 
 private:
-    void do_connect() {
-        if (!running_) return;
+void do_connect() {
+    if (!running_) return;
 
-        ws_.control_callback(
-            [this](ws::frame_type type, beast::string_view payload) {
-                if (type == ws::frame_type::pong) {
-                    std::cout << "Received WebSocket pong: " << payload << '\n';
-                }
-            });
+    ws_.control_callback(
+        [this](ws::frame_type type, beast::string_view payload) {
+            if (type == ws::frame_type::pong) {
+                std::cout << "Received WebSocket pong: " << payload << '\n';
+            }
+        });
 
-        auto timeout = std::make_shared<asio::steady_timer>(ioc_);
-        timeout->expires_after(std::chrono::seconds(10)); // CONNECT_TIMEOUT for setup
-        resolver_.async_resolve("stream.crypto.com", "443",
-            [this, timeout](beast::error_code ec, tcp::resolver::results_type results) {
-                timeout->cancel();
-                if (ec) {
-                    handle_error("resolve", ec);
-                    return;
-                }
-                std::cout << "Resolve completed\n";
-                asio::async_connect(ws_.next_layer().next_layer(), results,
-                    [this, timeout](beast::error_code ec, auto) {
-                        timeout->cancel();
-                        if (ec) {
-                            handle_error("connect", ec);
-                            return;
-                        }
-                        ws_.next_layer().async_handshake(ssl::stream_base::client,
-                            [this, timeout](beast::error_code ec) {
-                                timeout->cancel();
-                                if (ec) {
-                                    handle_error("ssl handshake", ec);
-                                    return;
-                                }
-                                ws_.set_option(ws::stream_base::decorator(
-                                    [](ws::request_type& req) {
-                                        req.set(beast::http::field::host, "stream.crypto.com");
-                                        req.set(beast::http::field::user_agent, "Boost Beast WebSocket");
-                                        req.set(beast::http::field::sec_websocket_protocol, "json");
-                                    }));
-                                ws_.async_handshake("stream.crypto.com", "/exchange/v1/market",
-                                    [this, timeout](beast::error_code ec) {
-                                        timeout->cancel();
-                                        if (ec) {
-                                            handle_error("websocket handshake", ec);
-                                            return;
-                                        }
-                                        std::cout << "WebSocket handshake completed\n";
-                                        connected_ = true;
-                                        send_subscription();
-                                        do_read();
-                                        do_ping();
-                                    });
-                            });
-                    });
-            });
-    }
+    auto timeout = std::make_shared<asio::steady_timer>(ioc_);
+    timeout->expires_after(std::chrono::seconds(10));
+    resolver_.async_resolve("stream.crypto.com", "443",
+        [this, timeout](beast::error_code ec, tcp::resolver::results_type results) {
+            timeout->cancel();
+            if (ec) {
+                handle_error("resolve", ec);
+                return;
+            }
+            std::cout << "Resolve completed\n";
+            asio::async_connect(ws_.next_layer().next_layer(), results,
+                [this, timeout](beast::error_code ec, auto) {
+                    timeout->cancel();
+                    if (ec) {
+                        handle_error("connect", ec);
+                        return;
+                    }
+                    // Set SNI Hostname
+                    if (!SSL_set_tlsext_host_name(ws_.next_layer().native_handle(), "stream.crypto.com")) {
+                        ec = beast::error_code(static_cast<int>(::ERR_get_error()),
+                            asio::error::get_ssl_category());
+                        handle_error("SSL_set_tlsext_host_name", ec);
+                        return;
+                    }
 
+                    ws_.next_layer().async_handshake(ssl::stream_base::client,
+                        [this, timeout](beast::error_code ec) {
+                            timeout->cancel();
+                            if (ec) {
+                                handle_error("ssl handshake", ec);
+                                return;
+                            }
+                            // Enhanced WebSocket handshake headers
+                            ws_.set_option(ws::stream_base::decorator(
+                                [](ws::request_type& req) {
+                                    req.set(beast::http::field::host, "stream.crypto.com");
+                                    req.set(beast::http::field::user_agent, "Boost Beast WebSocket");
+                                    req.set(beast::http::field::accept, "*/*");
+                                    req.set(beast::http::field::connection, "upgrade");
+                                    req.set(beast::http::field::upgrade, "websocket");
+                                    req.set(beast::http::field::sec_websocket_version, "13");
+                                    // Add any required API keys here if needed
+                                }));
+                            ws_.async_handshake("stream.crypto.com", "/v2/market",
+                                [this, timeout](beast::error_code ec) {
+                                    timeout->cancel();
+                                    if (ec) {
+                                        handle_error("websocket handshake", ec);
+                                        return;
+                                    }
+                                    std::cout << "WebSocket handshake completed\n";
+                                    connected_ = true;
+                                    send_subscription();
+                                    start_async_read();
+                                    do_ping();
+                                });
+                        });
+                });
+        });
+}
     void send_subscription() {
         json subscribe_msg = {
             {"id", "1"},
@@ -120,27 +132,54 @@ private:
             });
     }
 
-    void do_read() {
+    void start_async_read() {
         if (!running_ || !connected_) return;
 
+        // Clear the buffer before starting a new read
+        buffer_.consume(buffer_.size());
+
         ws_.async_read(buffer_,
-            [this](beast::error_code ec, std::size_t bytes) {
+            [this](beast::error_code ec, std::size_t bytes_transferred) {
                 if (ec) {
-                    std::cerr << "Read error: " << ec.message() << ", bytes: " << bytes << '\n';
+                    if (ec == ws::error::closed) {
+                        std::cout << "WebSocket connection closed gracefully\n";
+                    } else {
+                        std::cerr << "Read error: " << ec.message() << '\n';
+                    }
                     handle_error("read", ec);
                     return;
                 }
-                std::cout << "Read received: " << bytes << " bytes\n";
-                json j = json::parse(beast::buffers_to_string(buffer_.data()), nullptr, false);
-                if (j.is_discarded()) {
-                    std::cerr << "Failed to parse message: " << beast::buffers_to_string(buffer_.data()) << '\n';
-                } else {
-                    std::cout << "Received message: " << j.dump() << '\n';
-                    handle_message(j);
+
+                // Process the received data
+                process_received_data(bytes_transferred);
+
+                // Continue reading
+                if (running_ && connected_) {
+                    start_async_read();
                 }
-                buffer_.consume(buffer_.size());
-                if (running_) do_read();
             });
+    }
+
+    void process_received_data(std::size_t bytes_transferred) {
+        try {
+            std::cout << "Received " << bytes_transferred << " bytes\n";
+            
+            // Parse the JSON message
+            auto data = beast::buffers_to_string(buffer_.data());
+            json j = json::parse(data, nullptr, false);
+            
+            if (j.is_discarded()) {
+                std::cerr << "Failed to parse message: " << data << '\n';
+            } else {
+                std::cout << "Received message: " << j.dump(2) << '\n';
+                handle_message(j);
+            }
+            
+            // Consume the processed data
+            buffer_.consume(bytes_transferred);
+        } catch (const std::exception& e) {
+            std::cerr << "Error processing data: " << e.what() << '\n';
+        }
     }
 
     void do_ping() {
@@ -197,7 +236,8 @@ private:
         std::cerr << "Error in " << where << ": " << ec.message() << '\n';
         if (ec == asio::error::connection_refused ||
             ec == asio::error::timed_out ||
-            ec == ssl::error::stream_truncated) {
+            ec == ssl::error::stream_truncated ||
+            ec == ws::error::closed) {
             connected_ = false;
             auto delay = std::chrono::milliseconds(500);
             std::cout << "Scheduling reconnect after " << delay.count() << "ms\n";
