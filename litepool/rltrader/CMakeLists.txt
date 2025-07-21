@@ -53,6 +53,8 @@ pybind11_add_module(rltrader_litepool rltrader_litepool.h rltrader_litepool.cc
 
 set_target_properties(rltrader_litepool PROPERTIES PREFIX "" SUFFIX ".so")
 include_directories(${PROJECT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+add_executable(temptest temp.cc)
+
 add_executable(rltradertest rltrader_litepool_test.cc
                                       base_instrument.h rl_macros.h
                                       csv_reader.h csv_reader.cc
@@ -82,6 +84,8 @@ add_executable(rltradertest rltrader_litepool_test.cc
                                       fixed_vector.h
 )
 
+target_link_libraries(temptest PUBLIC OpenSSL::SSL OpenSSL::Crypto Boost::system Threads::Threads
+                                        PRIVATE glog -lstdc++fs nlohmann_json::nlohmann_json)
 target_link_libraries(rltrader_litepool PUBLIC OpenSSL::SSL OpenSSL::Crypto Boost::system Threads::Threads
                                         PRIVATE glog -lstdc++fs nlohmann_json::nlohmann_json)
 target_link_libraries(rltradertest PUBLIC OpenSSL::SSL OpenSSL::Crypto Boost::system Threads::Threads
