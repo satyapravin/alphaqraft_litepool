@@ -102,6 +102,7 @@ private:
     boost::beast::multi_buffer public_buffer_;
     std::mutex public_mutex_;
     std::thread public_thread_;
+    boost::asio::strand<boost::asio::io_context::executor_type> public_write_strand_;
 
     // Private stream resources
     std::unique_ptr<boost::asio::io_context> private_ioc_;
@@ -114,6 +115,7 @@ private:
     boost::beast::multi_buffer private_buffer_;
     std::mutex private_mutex_;
     std::thread private_thread_;
+    boost::asio::strand<boost::asio::io_context::executor_type> private_write_strand_;
 
     // SSL context
     std::unique_ptr<boost::asio::ssl::context> ssl_ctx_;
