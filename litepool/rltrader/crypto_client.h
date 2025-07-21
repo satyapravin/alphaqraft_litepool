@@ -1,184 +1,142 @@
-#ifndef RLTRADER_CRYPTO_CLIENT_H
-#define RLTRADER_CRYPTO_CLIENT_H
+#ifndef CRYPTO_CLIENT_H
+#define CRYPTO_CLIENT_H
 
+#include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
+#include <boost/beast/websocket.hpp>
+#include <boost/beast/websocket/ssl.hpp>
+#include <nlohmann/json.hpp>
 #include <atomic>
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <queue>
 #include <string>
-#include <vector>
+#include <thread>
 
-#include <boost/asio.hpp>
-#include <boost/asio/ssl.hpp>
-#include <boost/beast.hpp>
-#include <boost/beast/ssl.hpp>
-#include <boost/beast/websocket.hpp>
-#include <nlohmann/json.hpp>
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
+namespace RLTrader {
 
-namespace RLTrader
-{
-    namespace net   = boost::asio;
-    namespace ssl   = boost::asio::ssl;
-    namespace beast = boost::beast;
-    namespace ws    = beast::websocket;
-
+class CryptoClient {
+public:
+    using tcp = boost::asio::ip::tcp;
+    using ssl_stream = boost::asio::ssl::stream<tcp::socket>;
+    using websocket_stream = boost::beast::websocket::stream<ssl_stream>;
     using json = nlohmann::json;
-    using tcp  = net::ip::tcp;
-
-/* ---------------- simple threadsafe bounded queue ----------------- */
-template<typename T>
-class LockFreeQueue
-{
-public:
-    bool push(const T& item)
-    {
-        std::lock_guard lk(m_);
-        if (q_.size() >= kMax) return false;
-        q_.push(item);
-        return true;
-    }
-    bool push(T&& item)
-    {
-        std::lock_guard lk(m_);
-        if (q_.size() >= kMax) return false;
-        q_.push(std::move(item));
-        return true;
-    }
-    bool pop(T& item)
-    {
-        std::lock_guard lk(m_);
-        if (q_.empty()) return false;
-        item = std::move(q_.front());
-        q_.pop();
-        return true;
-    }
-    bool empty() const
-    {
-        std::lock_guard lk(m_);
-        return q_.empty();
-    }
-    void reset()
-    {
-        std::lock_guard lk(m_);
-        std::queue<T>().swap(q_);
-    }
-
-private:
-    static constexpr std::size_t kMax = 1024;
-    mutable std::mutex           m_;
-    std::queue<T>                q_;
-};
-
-/* ----------------------------- client ----------------------------- */
-class CryptoClient
-{
-public:
-    using websocket_stream = ws::stream<ssl::stream<beast::tcp_stream>>;
 
     CryptoClient(std::string api_key,
-                 std::string api_secret,
-                 std::string symbol,
-                 std::string hedge_symbol = "");
+                std::string api_secret,
+                std::string symbol,
+                std::string hedge_symbol = "");
     ~CryptoClient();
 
+    // Lifecycle management
     void start();
     void stop();
 
-    /* callbacks ----------------------------------------------------- */
+    // Callback setters
     void set_orderbook_cb(std::function<void(const json&)> cb);
-    void set_trade_cb    (std::function<void(const json&)> cb);
-    void set_position_cb (std::function<void(const json&)> cb);
-    void set_order_cb    (std::function<void(const json&)> cb);
+    void set_trade_cb(std::function<void(const json&)> cb);
+    void set_position_cb(std::function<void(const json&)> cb);
+    void set_order_cb(std::function<void(const json&)> cb);
 
-    /* trading helpers ---------------------------------------------- */
-    void place_order(const std::string& side,double price,double size,
-                     const std::string& client_oid,bool hedge=false,
-                     const std::string& type="LIMIT");
+    // Trading operations
+    void place_order(const std::string& side, double price, double size,
+                    const std::string& client_oid = "", bool hedge = false,
+                    const std::string& type = "LIMIT");
     void cancel_order(const std::string& order_id);
     void cancel_all_orders();
     void get_position();
 
 private:
-    /* connection helpers ------------------------------------------- */
-    void setup_connections();
+    // Connection management
     void setup_public_ws();
     void setup_private_ws();
     void do_public_connect();
     void do_private_connect();
 
+    // Ping management
+    void start_public_ping();
+    void start_private_ping();
+
+    // Authentication & subscriptions
     void authenticate();
     void subscribe_public();
     void subscribe_private();
 
-    /* messaging ----------------------------------------------------- */
-    void send_public_msg (json&& j);
+    // Messaging
+    void send_public_msg(json&& j);
     void send_private_msg(json&& j);
-    void write_next_public();
-    void write_next_private();
+
+    // Read loops
     void do_public_read();
     void do_private_read();
-    void handle_public_msg (const json& j);
+
+    // Message handling
+    void handle_public_msg(const json& j);
     void handle_private_msg(const json& j);
-    void handle_error(const std::string& where,
-                      const beast::error_code& ec,
-                      int http_status = 0);
+    void handle_public_error(const std::string& where, boost::beast::error_code ec);
+    void handle_private_error(const std::string& where, boost::beast::error_code ec);
 
-    static std::string gen_id()
-    {
-        static std::atomic<uint64_t> id{0};
-        return std::to_string(id++);
-    }
+    // Utility
+    std::string gen_id() const;
+    std::string build_payload(const std::string& method, const std::string& id,
+                             const std::string& api_key, const json& params, long nonce) const;
 
-    /* immutable ----------------------------------------------------- */
+    // API credentials
     const std::string api_key_;
     const std::string api_secret_;
     const std::string symbol_;
     const std::string hedge_symbol_;
     const std::string instance_id_;
 
-    /* state --------------------------------------------------------- */
-    std::atomic<bool> running_{false};
-    bool public_connected_{false};
-    bool private_connected_{false};
-    bool public_writing_{false};
-    bool private_writing_{false};
-    int  retry_count_{0};
+    // Network components
+    std::unique_ptr<boost::asio::io_context> public_ioc_;
+    std::unique_ptr<boost::asio::io_context> private_ioc_;
+    std::unique_ptr<boost::asio::ssl::context> ssl_ctx_;
 
-    std::unique_ptr<net::io_context> public_ioc_;
-    std::unique_ptr<net::io_context> private_ioc_;
-    std::unique_ptr<ssl::context>    ssl_ctx_;
-
-    std::unique_ptr<tcp::resolver>   public_resolver_;
-    std::unique_ptr<tcp::resolver>   private_resolver_;
-    std::unique_ptr<websocket_stream> public_ws_;
-    std::unique_ptr<websocket_stream> private_ws_;
-    std::unique_ptr<net::steady_timer> public_timer_;
-    std::unique_ptr<net::steady_timer> private_timer_;
-    std::unique_ptr<std::thread>        public_thread_;
-    std::unique_ptr<std::thread>        private_thread_;
-    std::unique_ptr<net::executor_work_guard<net::io_context::executor_type>>
-                                         public_work_;
-    std::unique_ptr<net::executor_work_guard<net::io_context::executor_type>>
-                                         private_work_;
-
-    beast::flat_buffer public_buffer_;
-    beast::flat_buffer private_buffer_;
-
-    LockFreeQueue<json> public_q_;
-    LockFreeQueue<json> private_q_;
-
+    // Public stream components
     std::mutex public_mutex_;
-    std::mutex private_mutex_;
+    std::unique_ptr<tcp::resolver> public_resolver_;
+    std::unique_ptr<websocket_stream> public_ws_;
+    boost::beast::flat_buffer public_buffer_;
+    std::unique_ptr<boost::asio::steady_timer> public_ping_timer_;
+    std::unique_ptr<boost::asio::steady_timer> public_heartbeat_timer_;
+    std::unique_ptr<boost::asio::executor_work_guard<
+        boost::asio::io_context::executor_type>> public_work_;
 
+    // Private stream components
+    std::mutex private_mutex_;
+    std::unique_ptr<tcp::resolver> private_resolver_;
+    std::unique_ptr<websocket_stream> private_ws_;
+    boost::beast::flat_buffer private_buffer_;
+    std::unique_ptr<boost::asio::steady_timer> private_ping_timer_;
+    std::unique_ptr<boost::asio::steady_timer> private_heartbeat_timer_;
+    std::unique_ptr<boost::asio::executor_work_guard<
+        boost::asio::io_context::executor_type>> private_work_;
+
+    // Threads
+    std::thread public_thread_;
+    std::thread private_thread_;
+
+    // State flags
+    std::atomic<bool> running_{false};
+    std::atomic<bool> public_connected_{false};
+    std::atomic<bool> private_connected_{false};
+
+    // Callbacks
     std::function<void(const json&)> orderbook_cb_;
     std::function<void(const json&)> trade_cb_;
     std::function<void(const json&)> position_cb_;
     std::function<void(const json&)> order_cb_;
+
+    // Constants
+    static constexpr const char* CR_PUBLIC_HOST = "stream.crypto.com";
+    static constexpr const char* CR_PRIVATE_HOST = "stream.crypto.com";
+    static constexpr const char* CR_PUBLIC_PATH = "/exchange/v1/market";
+    static constexpr const char* CR_PRIVATE_PATH = "/exchange/v1/user";
+    static constexpr const char* CR_SSL_PORT = "443";
+    static constexpr const char* USER_AGENT = "AlphaQraft_Trading";
 };
 
 } // namespace RLTrader
 
-#endif // RLTRADER_CRYPTO_CLIENT_H
+#endif // CRYPTO_CLIENT_H

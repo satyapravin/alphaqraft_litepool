@@ -2,728 +2,688 @@
 #include "crypto_util.h"
 #include <boost/asio/connect.hpp>
 #include <boost/asio/post.hpp>
+#include <boost/asio/ssl.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/websocket.hpp>
+#include <boost/beast/websocket/ssl.hpp>
+#include <openssl/hmac.h>
 #include <chrono>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
-#include <thread>
+#include <sys/socket.h>
+#include <netinet/tcp.h>
 
-namespace RLTrader
-{
-    namespace net   = boost::asio;
-    namespace ssl   = boost::asio::ssl;
-    namespace beast = boost::beast;
-    namespace ws    = beast::websocket;
+namespace RLTrader {
 
-    using tcp  = net::ip::tcp;
+// Constants
+constexpr std::chrono::seconds WS_PING_INTERVAL{15};
+constexpr std::chrono::seconds APP_PING_INTERVAL{30};
+constexpr std::chrono::seconds RECONNECT_DELAY{1};
+constexpr std::chrono::seconds READ_TIMEOUT{30};
 
-/* ------------------------------------------------------------------ */
-/*  Compile-time constants                                            */
-/* ------------------------------------------------------------------ */
-// constexpr const char* CR_PUBLIC_HOST  = "uat-stream.3ona.co";
-// constexpr const char* CR_PRIVATE_HOST = "uat-stream.3ona.co";
-constexpr const char* CR_PUBLIC_HOST  = "stream.crypto.com";
-constexpr const char* CR_PRIVATE_HOST = "stream.crypto.com";
-
-constexpr const char* CR_PUBLIC_PATH  = "/exchange/v1/market";
-constexpr const char* CR_PRIVATE_PATH = "/exchange/v1/user";
-constexpr const char* CR_SSL_PORT     = "443";
-
-constexpr const char* USER_AGENT      = "AlphaQraft_Trading";
-
-static   constexpr std::chrono::milliseconds CONNECT_DELAY {1000};
-static   constexpr std::chrono::seconds      CONNECT_TIMEOUT{10};
-static   constexpr std::chrono::seconds      READ_TIMEOUT{30};
-
-/* ------------------------------------------------------------------ */
-/*  Constructor / destructor                                          */
-/* ------------------------------------------------------------------ */
-CryptoClient::CryptoClient(std::string api_key,
-                           std::string api_secret,
-                           std::string symbol,
-                           std::string hedge_symbol)
+CryptoClient::CryptoClient(std::string api_key, std::string api_secret,
+                         std::string symbol, std::string hedge_symbol)
     : api_key_(std::move(api_key)),
       api_secret_(std::move(api_secret)),
       symbol_(std::move(symbol)),
       hedge_symbol_(hedge_symbol.empty() ? symbol_ : std::move(hedge_symbol)),
-      instance_id_(gen_id())
-{
-    std::cout << "[CryptoClient#" << instance_id_ << "] constructed\n";
+      instance_id_(gen_id()) {
+    std::cout << "[CryptoClient#" << instance_id_ << "] Created\n";
 }
 
-CryptoClient::~CryptoClient() { stop(); }
+CryptoClient::~CryptoClient() {
+    stop();
+}
 
-/* ------------------------------------------------------------------ */
-/*  Public life-cycle                                                 */
-/* ------------------------------------------------------------------ */
-void CryptoClient::start()
-{
+void CryptoClient::start() {
     if (running_.exchange(true)) {
-        std::cerr << "[CryptoClient#" << instance_id_ << "] already running\n";
+        std::cerr << "[CryptoClient#" << instance_id_ << "] Already running\n";
         return;
     }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+    try {
+        public_ioc_ = std::make_unique<boost::asio::io_context>();
+        private_ioc_ = std::make_unique<boost::asio::io_context>();
 
-    /* fresh IO contexts & SSL -------------------------------------- */
-    {
-        std::lock_guard lp(public_mutex_);
-        std::lock_guard lq(private_mutex_);
-
-        public_ioc_  = std::make_unique<net::io_context>();
-        private_ioc_ = std::make_unique<net::io_context>();
-
-        ssl_ctx_ = std::make_unique<ssl::context>(ssl::context::tlsv12_client);
+        ssl_ctx_ = std::make_unique<boost::asio::ssl::context>(boost::asio::ssl::context::tlsv12_client);
         ssl_ctx_->set_default_verify_paths();
-        ssl_ctx_->set_verify_mode(ssl::verify_peer);
+        ssl_ctx_->set_verify_mode(boost::asio::ssl::verify_peer);
 
-        public_resolver_  = std::make_unique<tcp::resolver>(*public_ioc_);
-        private_resolver_ = std::make_unique<tcp::resolver>(*private_ioc_);
+        public_work_ = std::make_unique<boost::asio::executor_work_guard<
+            boost::asio::io_context::executor_type>>(public_ioc_->get_executor());
+        private_work_ = std::make_unique<boost::asio::executor_work_guard<
+            boost::asio::io_context::executor_type>>(private_ioc_->get_executor());
 
-        public_work_  = std::make_unique<net::executor_work_guard<net::io_context::executor_type>>(public_ioc_->get_executor());
-        private_work_ = std::make_unique<net::executor_work_guard<net::io_context::executor_type>>(private_ioc_->get_executor());
+        public_thread_ = std::thread([this] {
+            public_ioc_->run();
+        });
+
+        private_thread_ = std::thread([this] {
+            private_ioc_->run();
+        });
+
+        setup_public_ws();
+        setup_private_ws();
+
+    } catch (const std::exception& e) {
+        std::cerr << "[CryptoClient#" << instance_id_ << "] Start failed: " << e.what() << "\n";
+        stop();
+        throw;
     }
-
-    /* threads ------------------------------------------------------- */
-    public_thread_  = std::make_unique<std::thread>([this] {
-        std::cout << "[CryptoClient#" << instance_id_ << "] public IO thread running\n";
-        public_ioc_->run();
-    });
-    private_thread_ = std::make_unique<std::thread>([this] {
-        std::cout << "[CryptoClient#" << instance_id_ << "] private IO thread running\n";
-        private_ioc_->run();
-    });
-
-    setup_connections();
 }
 
-void CryptoClient::stop()
-{
-    if (!running_.exchange(false)) return;
+void CryptoClient::stop() {
+    if (!running_.exchange(false)) {
+        return;
+    }
 
-    boost::system::error_code ec;
+    // Cancel timers
+    if (public_ping_timer_) public_ping_timer_->cancel();
+    if (private_ping_timer_) private_ping_timer_->cancel();
+    if (public_heartbeat_timer_) public_heartbeat_timer_->cancel();
+    if (private_heartbeat_timer_) private_heartbeat_timer_->cancel();
 
-    // Close WebSocket streams first
+    // Close WebSocket connections
     {
-        std::lock_guard lp(public_mutex_);
-        if (public_ws_) {
-            public_ws_->async_close(ws::close_code::normal, 
-                [this](auto ec) {
-                    if (ec) handle_error("public close", ec);
-                });
+        std::lock_guard lock(public_mutex_);
+        if (public_ws_ && public_ws_->is_open()) {
+            public_ws_->async_close(boost::beast::websocket::close_code::normal,
+                [](boost::beast::error_code ec) {});
         }
     }
     {
-        std::lock_guard lq(private_mutex_);
-        if (private_ws_) {
-            private_ws_->async_close(ws::close_code::normal, 
-                [this](auto ec) {
-                    if (ec) handle_error("private close", ec);
-                });
+        std::lock_guard lock(private_mutex_);
+        if (private_ws_ && private_ws_->is_open()) {
+            private_ws_->async_close(boost::beast::websocket::close_code::normal,
+                [](boost::beast::error_code ec) {});
         }
     }
 
-    // Cancel timers after closing streams
-    {
-        std::lock_guard lp(public_mutex_);
-        if (public_timer_) public_timer_->cancel(ec);
-        if (public_work_) public_work_.reset();
-        if (public_ioc_) public_ioc_->stop();
-    }
-    {
-        std::lock_guard lq(private_mutex_);
-        if (private_timer_) private_timer_->cancel(ec);
-        if (private_work_) private_work_.reset();
-        if (private_ioc_) private_ioc_->stop();
-    }
+    // Stop IO contexts
+    if (public_ioc_) public_ioc_->stop();
+    if (private_ioc_) private_ioc_->stop();
 
     // Join threads
-    if (public_thread_ && public_thread_->joinable()) public_thread_->join();
-    if (private_thread_ && private_thread_->joinable()) private_thread_->join();
+    if (public_thread_.joinable()) public_thread_.join();
+    if (private_thread_.joinable()) private_thread_.join();
 
-    // Clear resources
+    // Reset resources
     {
-        std::lock_guard lp(public_mutex_);
-        std::lock_guard lq(private_mutex_);
+        std::lock_guard lock(public_mutex_);
         public_ws_.reset();
-        private_ws_.reset();
         public_resolver_.reset();
-        private_resolver_.reset();
-        ssl_ctx_.reset();
+        public_ping_timer_.reset();
+        public_heartbeat_timer_.reset();
+        public_work_.reset();
         public_ioc_.reset();
+    }
+    {
+        std::lock_guard lock(private_mutex_);
+        private_ws_.reset();
+        private_resolver_.reset();
+        private_ping_timer_.reset();
+        private_heartbeat_timer_.reset();
+        private_work_.reset();
         private_ioc_.reset();
-        public_thread_.reset();
-        private_thread_.reset();
     }
 
-    public_connected_ = false;
-    private_connected_ = false;
-    public_writing_ = false;
-    private_writing_ = false;
-    retry_count_ = 0;
-
-    std::cout << "[CryptoClient#" << instance_id_ << "] Stopped cleanly\n";
+    ssl_ctx_.reset();
 }
 
-/* ------------------------------------------------------------------ */
-/*  Connection bootstrap                                              */
-/* ------------------------------------------------------------------ */
-void CryptoClient::setup_connections()
-{
-    setup_public_ws();
-    setup_private_ws();
-}
+    void CryptoClient::setup_public_ws() {
+        std::lock_guard lock(public_mutex_);
+        public_ws_ = std::make_unique<websocket_stream>(*public_ioc_, *ssl_ctx_);
+        public_ping_timer_ = std::make_unique<net::steady_timer>(*public_ioc_);
+        public_heartbeat_timer_ = std::make_unique<net::steady_timer>(*public_ioc_);
 
-/* ---------------- public stream ----------------------------------- */
-void CryptoClient::setup_public_ws()
-{
-    std::lock_guard lp(public_mutex_);
-    public_ws_ = std::make_unique<websocket_stream>(*public_ioc_, *ssl_ctx_);
-    public_timer_ = std::make_unique<net::steady_timer>(*public_ioc_);
+        // Setup WebSocket control callback for ping/pong
+        public_ws_->control_callback(
+            [this](ws::frame_type type, beast::string_view payload) {
+                if (type == ws::frame_type::pong) {
+                    std::cout << "[CryptoClient#" << instance_id_ 
+                              << "] Received WebSocket pong\n";
+                }
+            });
 
-    public_ws_->set_option(ws::stream_base::decorator(
-        [](ws::request_type& req) {
-            req.set(beast::http::field::host, CR_PUBLIC_HOST);
-            req.set(beast::http::field::user_agent, USER_AGENT);
-            req.set(beast::http::field::sec_websocket_protocol, "json");
-        }));
-
-    //public_timer_->expires_after(CONNECT_DELAY);
-    public_timer_->async_wait([this](auto ec) {
-        if (!ec && running_) do_public_connect();
-    });
-}
-
-void CryptoClient::do_public_connect()
-{
-    std::cout << "[CryptoClient#" << instance_id_ << "] Starting public connect\n";
-    auto timeout = std::make_shared<net::steady_timer>(*public_ioc_);
-    timeout->expires_after(CONNECT_TIMEOUT);
-    timeout->async_wait([this](auto ec) {
-        if (!ec) handle_error("public connect timeout", net::error::timed_out);
-    });
-
-    public_resolver_->async_resolve(CR_PUBLIC_HOST, CR_SSL_PORT,
-        [this, timeout](auto ec, auto results) {
-            if (ec) { timeout->cancel(); return handle_error("public resolve", ec); }
-
-            auto stream = std::make_shared<beast::tcp_stream>(*public_ioc_);
-            stream->expires_after(CONNECT_TIMEOUT);
-
-            beast::get_lowest_layer(*stream).async_connect(results,
-                [this, stream, timeout](auto ec, auto) {
-                    if (ec) { timeout->cancel(); return handle_error("public connect", ec); }
-
-                    auto ssl_stream = std::make_shared<ssl::stream<beast::tcp_stream>>(
-                        std::move(*stream), *ssl_ctx_);
-                    
-                    if (!SSL_set_tlsext_host_name(ssl_stream->native_handle(), CR_PUBLIC_HOST)) {
-                        return handle_error("SNI config",
-                            beast::error_code(
-                                static_cast<int>(::ERR_get_error()),
-                                net::error::get_ssl_category()));
-                    }
-
-                    ssl_stream->async_handshake(ssl::stream_base::client,
-                        [this, ssl_stream, timeout](auto ec) {
-                            if (ec) { timeout->cancel(); return handle_error("public SSL", ec); }
-
-                            {
-			        SSL_set_mode(ssl_stream->native_handle(), SSL_MODE_AUTO_RETRY);
-                                beast::get_lowest_layer(*ssl_stream).socket().set_option( boost::asio::socket_base::keep_alive(true));
-                                std::lock_guard lp(public_mutex_);
-                                public_ws_ = std::make_unique<websocket_stream>(std::move(*ssl_stream));
-                                public_ws_->auto_fragment(false);
-                                public_ws_->set_option(ws::stream_base::decorator(
-                                    [](ws::request_type& req) {
-                                        req.set(beast::http::field::host, CR_PUBLIC_HOST);
-                                        req.set(beast::http::field::user_agent, USER_AGENT);
-                                        req.set(beast::http::field::sec_websocket_protocol, "json");
-                                    }));
-                            }
-
-                            public_ws_->async_handshake(CR_PUBLIC_HOST, CR_PUBLIC_PATH,
-                                [this, timeout](auto ec) {
-                                    timeout->cancel();
-                                    if (ec) return handle_error("public handshake", ec);
-                                    std::cout << "[CryptoClient#" << instance_id_ << "] Public handshake completed\n";
-                                    public_connected_ = true;
-                                    subscribe_public();
-                                    do_public_read();
-                                });
-                        });
-                });
-        });
-}
-
-/* ---------------- private stream ---------------------------------- */
-void CryptoClient::setup_private_ws()
-{
-    {
-        std::lock_guard lq(private_mutex_);
-        private_ws_   = std::make_unique<websocket_stream>(*private_ioc_, *ssl_ctx_);
-        private_timer_= std::make_unique<net::steady_timer>(*private_ioc_);
-        private_ws_->set_option(ws::stream_base::decorator(
-            [](ws::request_type& req){
+        // Set WebSocket handshake decorator
+        public_ws_->set_option(ws::stream_base::decorator(
+            [](ws::request_type& req) {
+                req.set(beast::http::field::host, CR_PUBLIC_HOST);
                 req.set(beast::http::field::user_agent, USER_AGENT);
-                req.set(beast::http::field::host, CR_PRIVATE_HOST);
+                req.set(beast::http::field::accept, "*/*");
+                req.set(beast::http::field::connection, "upgrade");
+                req.set(beast::http::field::upgrade, "websocket");
+                req.set(beast::http::field::sec_websocket_version, "13");
             }));
+
+        do_public_connect();
     }
 
-    //private_timer_->expires_after(CONNECT_DELAY);
-    private_timer_->async_wait([this](auto ec){
-        if (!ec && running_) do_private_connect();
-    });
-}
+    void CryptoClient::do_public_connect() {
+        if (!running_) return;
 
-void CryptoClient::do_private_connect()
-{
-    std::cout << "[CryptoClient#" << instance_id_ << "] Starting private connect\n";
+        std::cout << "[CryptoClient#" << instance_id_ << "] Connecting to public stream...\n";
 
-    auto timeout = std::make_shared<net::steady_timer>(*private_ioc_);
-    timeout->expires_after(CONNECT_TIMEOUT);
-    timeout->async_wait([this](auto ec) {
-        if (!ec) handle_error("private connect timeout", net::error::timed_out);
-    });
+        public_resolver_ = std::make_unique<tcp::resolver>(*public_ioc_);
 
-    private_resolver_->async_resolve(CR_PRIVATE_HOST, CR_SSL_PORT,
-        [this, timeout](auto ec, tcp::resolver::results_type res) {
-            if (ec) { timeout->cancel(); return handle_error("private resolve", ec); }
+        public_resolver_->async_resolve(CR_PUBLIC_HOST, CR_SSL_PORT,
+            [this](beast::error_code ec, tcp::resolver::results_type results) {
+                if (ec) {
+                    return handle_public_error("resolve", ec);
+                }
 
-            auto stream = std::make_shared<beast::tcp_stream>(*private_ioc_);
-            stream->expires_after(CONNECT_TIMEOUT);
+                auto stream = std::make_shared<beast::tcp_stream>(*public_ioc_);
 
-            beast::get_lowest_layer(*stream).async_connect(res,
-                [this, stream, timeout](auto ec, tcp::endpoint) {
-                    if (ec) { timeout->cancel(); return handle_error("private connect", ec); }
+                // Set TCP keepalive options
+                stream->socket().set_option(boost::asio::socket_base::keep_alive(true));
+                int keepalive = 1;
+                int keepidle = 60;
+                int keepintvl = 30;
+                int keepcnt = 3;
+                
+                setsockopt(stream->socket().native_handle(), SOL_SOCKET, SO_KEEPALIVE, 
+                          &keepalive, sizeof(keepalive));
+                setsockopt(stream->socket().native_handle(), IPPROTO_TCP, TCP_KEEPIDLE,
+                          &keepidle, sizeof(keepidle));
+                setsockopt(stream->socket().native_handle(), IPPROTO_TCP, TCP_KEEPINTVL,
+                          &keepintvl, sizeof(keepintvl));
+                setsockopt(stream->socket().native_handle(), IPPROTO_TCP, TCP_KEEPCNT,
+                          &keepcnt, sizeof(keepcnt));
 
-                    auto ssl_stream = std::make_shared<ssl::stream<beast::tcp_stream>>(std::move(*stream), *ssl_ctx_);
-                    if (!SSL_set_tlsext_host_name(ssl_stream->native_handle(), CR_PRIVATE_HOST)) {
-                        return handle_error("SNI configuration",
-                            beast::error_code(
-                                static_cast<int>(::ERR_get_error()),
-                                boost::asio::error::get_ssl_category()));
-                    }
-                    ssl_stream->async_handshake(ssl::stream_base::client,
-                        [this, ssl_stream, timeout](auto ec) {
-                            if (ec) { timeout->cancel(); return handle_error("private SSL", ec); }
+                stream->async_connect(results,
+                    [this, stream](beast::error_code ec, tcp::resolver::results_type::endpoint_type) {
+                        if (ec) {
+                            return handle_public_error("connect", ec);
+                        }
 
-                            {
-			        SSL_set_mode(ssl_stream->native_handle(), SSL_MODE_AUTO_RETRY);
-                                beast::get_lowest_layer(*ssl_stream).socket().set_option(boost::asio::socket_base::keep_alive(true));
-                                std::lock_guard lq(private_mutex_);
-                                private_ws_ = std::make_unique<websocket_stream>(std::move(*ssl_stream));
-                                private_ws_->set_option(ws::stream_base::decorator(
-                                    [](ws::request_type& req) {
-                                        req.set(beast::http::field::user_agent, USER_AGENT);
-                                        req.set(beast::http::field::host, CR_PRIVATE_HOST);
-                                        req.set(beast::http::field::sec_websocket_protocol, "json");
-                                    }));
+                        auto ssl_stream = std::make_shared<ssl::stream<beast::tcp_stream>>(
+                            std::move(*stream), *ssl_ctx_);
+
+                        // Set SNI hostname
+                        if (!SSL_set_tlsext_host_name(ssl_stream->native_handle(), CR_PUBLIC_HOST)) {
+                            beast::error_code ec{static_cast<int>(::ERR_get_error()),
+                                               net::error::get_ssl_category()};
+                            return handle_public_error("SNI", ec);
+                        }
+
+                        ssl_stream->async_handshake(ssl::stream_base::client,
+                            [this, ssl_stream](beast::error_code ec) {
+                                if (ec) {
+                                    return handle_public_error("SSL handshake", ec);
+                                }
+
+                                std::lock_guard lock(public_mutex_);
+                                public_ws_ = std::make_unique<websocket_stream>(std::move(*ssl_stream));
+                                public_ws_->binary(true);
+
+                                public_ws_->async_handshake(CR_PUBLIC_HOST, CR_PUBLIC_PATH,
+                                    [this](beast::error_code ec) {
+                                        if (ec) {
+                                            return handle_public_error("WS handshake", ec);
+                                        }
+
+                                        std::cout << "[CryptoClient#" << instance_id_ 
+                                                  << "] Public WebSocket connected\n";
+                                        public_connected_ = true;
+                                        start_public_ping();
+                                        subscribe_public();
+                                        do_public_read();
+                                    });
+                            });
+                    });
+            });
+    }
+
+    void CryptoClient::start_public_ping() {
+        if (!running_) return;
+
+        // WebSocket protocol-level ping
+        public_ping_timer_->expires_after(WS_PING_INTERVAL);
+        public_ping_timer_->async_wait([this](beast::error_code ec) {
+            if (ec || !running_) {
+                return;
+            }
+
+            std::lock_guard lock(public_mutex_);
+            if (public_ws_ && public_ws_->is_open()) {
+                public_ws_->async_ping("",
+                    [this](beast::error_code ec) {
+                        if (ec) {
+                            handle_public_error("ping", ec);
+                        } else {
+                            start_public_ping();
+                        }
+                    });
+            }
+        });
+
+        // Application-level heartbeat
+        public_heartbeat_timer_->expires_after(APP_PING_INTERVAL);
+        public_heartbeat_timer_->async_wait([this](beast::error_code ec) {
+            if (ec || !running_) {
+                return;
+            }
+
+            json ping_msg = {
+                {"id", std::to_string(std::time(nullptr))},
+                {"method", "public/ping"}
+            };
+            send_public_msg(std::move(ping_msg));
+            start_public_ping();
+        });
+    }
+
+    void CryptoClient::do_public_read() {
+        if (!running_) return;
+
+        std::lock_guard lock(public_mutex_);
+        if (!public_ws_ || !public_ws_->is_open()) {
+            return;
+        }
+
+        auto timeout = std::make_shared<net::steady_timer>(*public_ioc_);
+        timeout->expires_after(READ_TIMEOUT);
+        timeout->async_wait([this](beast::error_code ec) {
+            if (!ec && running_) {
+                std::lock_guard lock(public_mutex_);
+                if (public_ws_ && public_ws_->is_open()) {
+                    public_ws_->async_close(ws::close_code::normal,
+                        [this](beast::error_code ec) {
+                            if (ec) {
+                                std::cerr << "[CryptoClient#" << instance_id_ 
+                                          << "] Timeout close error: " << ec.message() << "\n";
                             }
-
-                            auto response = std::make_shared<ws::response_type>();
-                            private_ws_->async_handshake(*response, CR_PRIVATE_HOST, CR_PRIVATE_PATH,
-                                [this, response, timeout](auto ec) {
-                                    timeout->cancel();
-                                    if (ec) {
-                                        return handle_error("private handshake", ec, response->result_int());
-                                    }
-                                    std::cout << "[CryptoClient#" << instance_id_ << "] Private handshake completed\n";
-                                    private_connected_ = true;
-                                    authenticate();
-                                    do_private_read();
-                                });
                         });
-                });
+                }
+            }
         });
-}
-/* ------------------------------------------------------------------ */
-/*  Authentication & subscriptions                                    */
-/* ------------------------------------------------------------------ */
-void CryptoClient::authenticate()
-{
-    const long ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
 
-    constexpr char METHOD[] = "public/auth";
-    constexpr char ID[] = "1";
+        public_ws_->async_read(public_buffer_,
+            [this, timeout](beast::error_code ec, std::size_t bytes_transferred) {
+                timeout->cancel();
 
-    json params = json::object();
-    std::string payload = build_payload(METHOD, ID, api_key_, params, ts);
+                if (ec == ws::error::closed || ec == net::error::operation_aborted) {
+                    return;
+                }
 
-    unsigned char digest[32];
-    unsigned int dlen{};
-    HMAC(EVP_sha256(), api_secret_.data(), api_secret_.size(),
-         reinterpret_cast<const unsigned char*>(payload.data()),
-         payload.size(), digest, &dlen);
+                if (ec) {
+                    return handle_public_error("read", ec);
+                }
 
-    std::ostringstream sig;
-    sig << std::hex << std::setfill('0');
-    for (unsigned i = 0; i < dlen; ++i)
-        sig << std::setw(2) << static_cast<int>(digest[i]);
+                try {
+                    std::string data = beast::buffers_to_string(public_buffer_.data());
+                    public_buffer_.consume(bytes_transferred);
 
-    json msg = {
-        {"id", ID},
-        {"method", METHOD},
-        {"api_key", api_key_},
-        {"sig", sig.str()},
-        {"nonce", ts}
-    };
-    std::cout << "[CryptoClient#" << instance_id_ << "] Sending authentication: " << msg.dump() << '\n';
-    send_private_msg(std::move(msg));
-}
+                    json j = json::parse(data, nullptr, false);
+                    if (j.is_discarded()) {
+                        std::cerr << "[CryptoClient#" << instance_id_ 
+                                  << "] Failed to parse message: " << data << "\n";
+                    } else {
+                        handle_public_msg(j);
+                    }
 
-void CryptoClient::subscribe_public()
-{
-    json msg = {
-        {"id", "11"},
-        {"method", "subscribe"},
-        {"params", {
-			   {"channels", {"book." + symbol_ + ".10"}}, 
-			   {"book_subscription_type", "SNAPSHOT"}
-		   }}
-    };
-
-    std::cout << "[CryptoClient#" << instance_id_ << "] Sending public subscription: " << msg.dump() << '\n';
-    send_public_msg(std::move(msg));
-}
-
-void CryptoClient::subscribe_private()
-{
-    send_private_msg({
-        {"id", "12"},
-        {"method", "subscribe"},
-        {"params", {{"channels", {
-            "user.trade." + symbol_,
-            "user.order." + symbol_,
-            "account"
-        }}}}
-    });
-}
-
-/* ------------------------------------------------------------------ */
-/*  Messaging helpers                                                 */
-/* ------------------------------------------------------------------ */
-void CryptoClient::send_private_msg(json&& j)
-{
-    if (!private_q_.push(std::move(j))) {
-        std::cerr << "[CryptoClient#" << instance_id_ << "] private queue full\n";
-        return;
+                    if (running_) {
+                        do_public_read();
+                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "[CryptoClient#" << instance_id_ 
+                              << "] Message processing error: " << e.what() << "\n";
+                    if (running_) {
+                        do_public_read();
+                    }
+                }
+            });
     }
-    if (private_ioc_) net::post(*private_ioc_, [this]{ write_next_private(); });
-}
 
-void CryptoClient::write_next_public()
-{
-    std::lock_guard lp(public_mutex_);
-    if (!public_connected_ || public_writing_ || !public_ws_) return;
+    void CryptoClient::handle_public_error(const std::string& where, beast::error_code ec) {
+        if (!running_) return;
 
-    json j;
-    if (!public_q_.pop(j)) return;                   // nothing to send
+        std::cerr << "[CryptoClient#" << instance_id_ << "] Public error in " 
+                  << where << ": " << ec.message() << "\n";
 
-    public_writing_ = true;
-    const auto dump = j.dump();
+        public_connected_ = false;
 
-    public_ws_->async_write(net::buffer(dump),
-        [this](auto ec, std::size_t){
-            {
-                std::lock_guard lp(public_mutex_);
-                public_writing_ = false;
+        if (ec == net::error::operation_aborted) {
+            return;
+        }
+
+        auto timer = std::make_unique<net::steady_timer>(*public_ioc_);
+        timer->expires_after(RECONNECT_DELAY);
+        timer->async_wait([this](beast::error_code ec) {
+            if (!ec && running_) {
+                do_public_connect();
             }
-            if (ec) handle_error("public write", ec);
-            else if (!public_q_.empty() && running_)
-                net::post(*public_ioc_, [this]{ write_next_public(); });
         });
-}
+    }
 
-void CryptoClient::write_next_private()
-{
-    std::lock_guard lq(private_mutex_);
-    if (!private_connected_ || private_writing_ || !private_ws_) return;
+    void CryptoClient::send_public_msg(json&& j) {
+        if (!running_ || !public_connected_) {
+            return;
+        }
 
-    json j;
-    if (!private_q_.pop(j)) return;
+        std::lock_guard lock(public_mutex_);
+        if (!public_ws_ || !public_ws_->is_open()) {
+            return;
+        }
 
-    private_writing_ = true;
-    const auto dump = j.dump();
+        public_ws_->async_write(net::buffer(j.dump()),
+            [this](beast::error_code ec, std::size_t) {
+                if (ec) {
+                    handle_public_error("write", ec);
+                }
+            });
+    }
 
-    private_ws_->async_write(net::buffer(dump),
-        [this](auto ec, std::size_t){
-            {
-                std::lock_guard lq(private_mutex_);
-                private_writing_ = false;
+    void CryptoClient::subscribe_public() {
+        json msg = {
+            {"id", "1"},
+            {"method", "subscribe"},
+            {"params", {
+                {"channels", {"book." + symbol_ + ".10"}},
+                {"book_subscription_type", "SNAPSHOT"}
+            }}
+        };
+        send_public_msg(std::move(msg));
+    }
+
+    void CryptoClient::handle_public_msg(const json& j) {
+        if (!j.contains("method")) {
+            std::cerr << "[CryptoClient#" << instance_id_ 
+                      << "] Message missing method: " << j.dump() << "\n";
+            return;
+        }
+
+        const std::string method = j["method"];
+        if (method == "public/heartbeat") {
+            if (j.contains("id")) {
+                json response = {
+                    {"id", j["id"]},
+                    {"method", "public/respond-heartbeat"}
+                };
+                send_public_msg(std::move(response));
             }
-            if (ec) handle_error("private write", ec);
-            else if (!private_q_.empty() && running_)
-                net::post(*private_ioc_, [this]{ write_next_private(); });
+        } else if (method == "subscribe" && j.contains("result")) {
+            if (orderbook_cb_) {
+                orderbook_cb_(j["result"]);
+            }
+        }
+    }
+
+    // [Similar implementations for private connection...]
+
+    void CryptoClient::setup_private_ws() {
+        std::lock_guard lock(private_mutex_);
+        private_ws_ = std::make_unique<websocket_stream>(*private_ioc_, *ssl_ctx_);
+        private_ping_timer_ = std::make_unique<net::steady_timer>(*private_ioc_);
+        private_heartbeat_timer_ = std::make_unique<net::steady_timer>(*private_ioc_);
+
+        private_ws_->control_callback(
+            [this](ws::frame_type type, beast::string_view payload) {
+                if (type == ws::frame_type::pong) {
+                    std::cout << "[CryptoClient#" << instance_id_ 
+                              << "] Received private pong\n";
+                }
+            });
+
+        private_ws_->set_option(ws::stream_base::decorator(
+            [](ws::request_type& req) {
+                req.set(beast::http::field::host, CR_PRIVATE_HOST);
+                req.set(beast::http::field::user_agent, USER_AGENT);
+                req.set(beast::http::field::accept, "*/*");
+                req.set(beast::http::field::connection, "upgrade");
+                req.set(beast::http::field::upgrade, "websocket");
+                req.set(beast::http::field::sec_websocket_version, "13");
+            }));
+
+        do_private_connect();
+    }
+
+    void CryptoClient::do_private_connect() {
+        if (!running_) return;
+
+        std::cout << "[CryptoClient#" << instance_id_ << "] Connecting to private stream...\n";
+
+        private_resolver_ = std::make_unique<tcp::resolver>(*private_ioc_);
+
+        private_resolver_->async_resolve(CR_PRIVATE_HOST, CR_SSL_PORT,
+            [this](beast::error_code ec, tcp::resolver::results_type results) {
+                if (ec) {
+                    return handle_private_error("resolve", ec);
+                }
+
+                auto stream = std::make_shared<beast::tcp_stream>(*private_ioc_);
+
+                // Set TCP keepalive
+                stream->socket().set_option(boost::asio::socket_base::keep_alive(true));
+                int keepalive = 1;
+                setsockopt(stream->socket().native_handle(), SOL_SOCKET, SO_KEEPALIVE, 
+                         &keepalive, sizeof(keepalive));
+
+                stream->async_connect(results,
+                    [this, stream](beast::error_code ec, tcp::resolver::results_type::endpoint_type) {
+                        if (ec) {
+                            return handle_private_error("connect", ec);
+                        }
+
+                        auto ssl_stream = std::make_shared<ssl::stream<beast::tcp_stream>>(
+                            std::move(*stream), *ssl_ctx_);
+
+                        if (!SSL_set_tlsext_host_name(ssl_stream->native_handle(), CR_PRIVATE_HOST)) {
+                            beast::error_code ec{static_cast<int>(::ERR_get_error()),
+                                             net::error::get_ssl_category()};
+                            return handle_private_error("SNI", ec);
+                        }
+
+                        ssl_stream->async_handshake(ssl::stream_base::client,
+                            [this, ssl_stream](beast::error_code ec) {
+                                if (ec) {
+                                    return handle_private_error("SSL handshake", ec);
+                                }
+
+                                std::lock_guard lock(private_mutex_);
+                                private_ws_ = std::make_unique<websocket_stream>(std::move(*ssl_stream));
+                                private_ws_->binary(true);
+
+                                private_ws_->async_handshake(CR_PRIVATE_HOST, CR_PRIVATE_PATH,
+                                    [this](beast::error_code ec) {
+                                        if (ec) {
+                                            return handle_private_error("WS handshake", ec);
+                                        }
+
+                                        std::cout << "[CryptoClient#" << instance_id_ 
+                                                  << "] Private WebSocket connected\n";
+                                        private_connected_ = true;
+                                        start_private_ping();
+                                        authenticate();
+                                    });
+                            });
+                    });
+            });
+    }
+
+    void CryptoClient::start_private_ping() {
+        if (!running_) return;
+
+        // WebSocket protocol-level ping
+        private_ping_timer_->expires_after(WS_PING_INTERVAL);
+        private_ping_timer_->async_wait([this](beast::error_code ec) {
+            if (ec || !running_) {
+                return;
+            }
+
+            std::lock_guard lock(private_mutex_);
+            if (private_ws_ && private_ws_->is_open()) {
+                private_ws_->async_ping("",
+                    [this](beast::error_code ec) {
+                        if (ec) {
+                            handle_private_error("ping", ec);
+                        } else {
+                            start_private_ping();
+                        }
+                    });
+            }
         });
-}
 
-/* ------------------------------------------------------------------ */
-/*  Read loops                                                        */
-/* ------------------------------------------------------------------ */
-void CryptoClient::do_public_read()
-{
-    std::lock_guard lp(public_mutex_);
-    if (!public_ws_ || !public_connected_) {
-        std::cerr << "[CryptoClient#" << instance_id_ << "] Public read skipped: not connected\n";
-        return;
-    }
+        // Application-level heartbeat
+        private_heartbeat_timer_->expires_after(APP_PING_INTERVAL);
+        private_heartbeat_timer_->async_wait([this](beast::error_code ec) {
+            if (ec || !running_) {
+                return;
+            }
 
-    auto timeout = std::make_shared<net::steady_timer>(*public_ioc_);
-    timeout->expires_after(std::chrono::seconds(30));
-    timeout->async_wait([this](auto ec) {
-        if (!ec && running_) {
-            std::lock_guard lp(public_mutex_);
-            if (public_ws_) {
-                // Do not close the WebSocket; retry read
-                if (running_) do_public_read();
-            }
-        }
-    });
-
-    public_ws_->async_read(public_buffer_,
-        [this, timeout](auto ec, std::size_t bytes) {
-            timeout->cancel();
-            if (ec) {
-                std::cerr << "[CryptoClient#" << instance_id_ << "] Public read error: " << ec.message() << ", bytes: " << bytes << '\n';
-                return handle_error("public read", ec);
-            }
-            std::cout << "[CryptoClient#" << instance_id_ << "] Public read received: " << bytes << " bytes\n";
-            json j = json::parse(beast::buffers_to_string(public_buffer_.data()), nullptr, false);
-            if (j.is_discarded()) {
-                std::cerr << "[CryptoClient#" << instance_id_ << "] Failed to parse public message: " << beast::buffers_to_string(public_buffer_.data()) << '\n';
-            } else {
-                std::cout << "[CryptoClient#" << instance_id_ << "] Public message: " << j.dump() << '\n';
-                handle_public_msg(j);
-            }
-            public_buffer_.consume(public_buffer_.size());
-            if (running_) do_public_read();
+            json ping_msg = {
+                {"id", std::to_string(std::time(nullptr))},
+                {"method", "public/ping"}
+            };
+            send_private_msg(std::move(ping_msg));
+            start_private_ping();
         });
-}
-
-void CryptoClient::do_private_read()
-{
-    std::lock_guard lq(private_mutex_);
-    if (!private_ws_ || !private_connected_) {
-        std::cerr << "[CryptoClient#" << instance_id_ << "] Private read skipped: not connected\n";
-        return;
     }
 
-    auto timeout = std::make_shared<net::steady_timer>(*private_ioc_);
-    timeout->expires_after(std::chrono::seconds(30));
-    timeout->async_wait([this](auto ec) {
-        if (!ec && running_) {
-            std::lock_guard lq(private_mutex_);
-            if (private_ws_) {
-                if (running_) do_private_read();
-            }
-        }
-    });
+    void CryptoClient::authenticate() {
+        const long ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
 
-    private_ws_->async_read(private_buffer_,
-        [this, timeout](auto ec, std::size_t bytes) {
-            timeout->cancel();
-            if (ec) {
-                std::cerr << "[CryptoClient#" << instance_id_ << "] Private read error: " << ec.message() << ", bytes: " << bytes << '\n';
-                return handle_error("private read", ec);
+        const std::string payload = build_payload("public/auth", "1", api_key_, json::object(), ts);
+
+        unsigned char digest[32];
+        unsigned int dlen{};
+        HMAC(EVP_sha256(), api_secret_.data(), api_secret_.size(),
+             reinterpret_cast<const unsigned char*>(payload.data()),
+             payload.size(), digest, &dlen);
+
+        std::ostringstream sig;
+        sig << std::hex << std::setfill('0');
+        for (unsigned i = 0; i < dlen; ++i) {
+            sig << std::setw(2) << static_cast<int>(digest[i]);
+        }
+
+        json msg = {
+            {"id", "1"},
+            {"method", "public/auth"},
+            {"api_key", api_key_},
+            {"sig", sig.str()},
+            {"nonce", ts}
+        };
+
+        send_private_msg(std::move(msg));
+    }
+
+    void CryptoClient::send_private_msg(json&& j) {
+        if (!running_ || !private_connected_) {
+            return;
+        }
+
+        std::lock_guard lock(private_mutex_);
+        if (!private_ws_ || !private_ws_->is_open()) {
+            return;
+        }
+
+        private_ws_->async_write(net::buffer(j.dump()),
+            [this](beast::error_code ec, std::size_t) {
+                if (ec) {
+                    handle_private_error("write", ec);
+                }
+            });
+    }
+
+    void CryptoClient::handle_private_error(const std::string& where, beast::error_code ec) {
+        if (!running_) return;
+
+        std::cerr << "[CryptoClient#" << instance_id_ << "] Private error in " 
+                  << where << ": " << ec.message() << "\n";
+
+        private_connected_ = false;
+
+        if (ec == net::error::operation_aborted) {
+            return;
+        }
+
+        auto timer = std::make_unique<net::steady_timer>(*private_ioc_);
+        timer->expires_after(RECONNECT_DELAY);
+        timer->async_wait([this](beast::error_code ec) {
+            if (!ec && running_) {
+                do_private_connect();
             }
-            std::cout << "[CryptoClient#" << instance_id_ << "] Private read received: " << bytes << " bytes\n";
-            json j = json::parse(beast::buffers_to_string(private_buffer_.data()), nullptr, false);
-            if (j.is_discarded()) {
-                std::cerr << "[CryptoClient#" << instance_id_ << "] Failed to parse private message: " << beast::buffers_to_string(private_buffer_.data()) << '\n';
-            } else {
-                std::cout << "[CryptoClient#" << instance_id_ << "] Private message: " << j.dump() << '\n';
-                handle_private_msg(j);
-            }
-            private_buffer_.consume(private_buffer_.size());
-            if (running_) do_private_read();
         });
-}
-
-/* ------------------------------------------------------------------ */
-/*  Message dispatch                                                  */
-/* ------------------------------------------------------------------ */
-void CryptoClient::send_public_msg(json&& j)
-{
-    if (j.contains("method") && j["method"] == "public/respond-heartbeat") {
-        std::lock_guard lp(public_mutex_);
-        if (public_connected_ && public_ws_ && !public_writing_) {
-            public_writing_ = true;
-            const auto dump = j.dump();
-            public_ws_->async_write(net::buffer(dump),
-                [this](auto ec, std::size_t) {
-                    std::lock_guard lp(public_mutex_);
-                    public_writing_ = false;
-                    if (ec) handle_error("public write", ec);
-                    else if (!public_q_.empty() && running_)
-                        net::post(*public_ioc_, [this]{ write_next_public(); });
-                });
-        }
-        return;
     }
 
-    if (!public_q_.push(std::move(j))) {
-        std::cerr << "[CryptoClient#" << instance_id_ << "] public queue full\n";
-        return;
+    // Callback setters
+    void CryptoClient::set_orderbook_cb(std::function<void(const json&)> cb) { 
+        orderbook_cb_ = std::move(cb); 
     }
-    if (public_ioc_) net::post(*public_ioc_, [this]{ write_next_public(); });
-}
-
-void CryptoClient::handle_public_msg(const json& j)
-{
-    std::cout << "[CryptoClient#" << instance_id_ << "] Handling public message: " << j.dump() << '\n';
-    if (!j.contains("method")) return;
-
-    const std::string method = j["method"];
-    if (method == "public/heartbeat" || method == "heartbeat") {
-        if (j.contains("id")) {
-            std::cout << "[CryptoClient#" << instance_id_ << "] Received public heartbeat, id: " << j["id"] << '\n';
-            json response = {{"id", j["id"]}, {"method", "public/respond-heartbeat"}};
-            std::cout << "[CryptoClient#" << instance_id_ << "] Sending public heartbeat response: " << response.dump() << '\n';
-            send_public_msg(std::move(response));
-        } else {
-            std::cerr << "[CryptoClient#" << instance_id_ << "] Public heartbeat missing id: " << j.dump() << '\n';
-        }
-        return;
+    void CryptoClient::set_trade_cb(std::function<void(const json&)> cb) { 
+        trade_cb_ = std::move(cb); 
+    }
+    void CryptoClient::set_position_cb(std::function<void(const json&)> cb) { 
+        position_cb_ = std::move(cb); 
+    }
+    void CryptoClient::set_order_cb(std::function<void(const json&)> cb) { 
+        order_cb_ = std::move(cb); 
     }
 
-    if (method == "subscribe" && orderbook_cb_ && j.contains("result") && j["result"].contains("data"))
-        orderbook_cb_(j["result"]["data"]);
-}
-
-void CryptoClient::handle_private_msg(const json& j)
-{
-    std::cout << "[CryptoClient#" << instance_id_ << "] Handling private message: " << j.dump() << '\n';
-    if (!j.contains("method")) return;
-
-    const std::string method = j["method"];
-    if (method == "public/heartbeat" || method == "heartbeat") {
-        if (j.contains("id")) {
-            std::cout << "[CryptoClient#" << instance_id_ << "] Received private heartbeat, id: " << j["id"] << '\n';
-            json response = {{"id", j["id"]}, {"method", "public/respond-heartbeat"}};
-            std::cout << "[CryptoClient#" << instance_id_ << "] Sending private heartbeat response: " << response.dump() << '\n';
-            send_private_msg(std::move(response));
-        } else {
-            std::cerr << "[CryptoClient#" << instance_id_ << "] Private heartbeat missing id: " << j.dump() << '\n';
-        }
-        return;
+    // Trading operations
+    void CryptoClient::place_order(const std::string& side, double price, double size,
+                                 const std::string& client_oid, bool hedge,
+                                 const std::string& type) {
+        json msg = {
+            {"id", "2"},
+            {"method", "private/create-order"},
+            {"params", {
+                {"instrument_name", hedge ? hedge_symbol_ : symbol_},
+                {"side", side},
+                {"type", type},
+                {"price", price},
+                {"quantity", size},
+                {"client_oid", client_oid}
+            }}
+        };
+        send_private_msg(std::move(msg));
     }
 
-    if (method == "public/auth") {
-        if (j.value("code", -1) == 0) {
-            std::cout << "[CryptoClient#" << instance_id_ << "] Authentication successful\n";
-            subscribe_private();
-        } else {
-            std::cerr << "[CryptoClient#" << instance_id_ << "] auth failed: " << j.dump() << '\n';
-        }
-        return;
+    void CryptoClient::cancel_order(const std::string& order_id) {
+        json msg = {
+            {"id", "3"},
+            {"method", "private/cancel-order"},
+            {"params", {{"order_id", order_id}}}
+        };
+        send_private_msg(std::move(msg));
     }
 
-    if (method.rfind("trade", 0) == 0 && trade_cb_)
-        trade_cb_(j["result"]["data"]);
-    else if (method.rfind("order", 0) == 0 && order_cb_)
-        order_cb_(j["result"]["data"]);
-    else if (method == "account" && position_cb_)
-        position_cb_(j["result"]["data"]);
-}
-
-/* ------------------------------------------------------------------ */
-/*  Accessor / callback setters                                       */
-/* ------------------------------------------------------------------ */
-void CryptoClient::set_orderbook_cb(std::function<void(const json&)> cb) { orderbook_cb_ = std::move(cb); }
-void CryptoClient::set_trade_cb    (std::function<void(const json&)> cb) { trade_cb_     = std::move(cb); }
-void CryptoClient::set_position_cb (std::function<void(const json&)> cb) { position_cb_  = std::move(cb); }
-void CryptoClient::set_order_cb    (std::function<void(const json&)> cb) { order_cb_     = std::move(cb); }
-
-/* ------------------------------------------------------------------ */
-/*  Trading helpers                                                   */
-/* ------------------------------------------------------------------ */
-void CryptoClient::place_order(const std::string& side,double price,double size,
-                               const std::string& client_oid,bool hedge,
-                               const std::string& type)
-{
-    send_private_msg({
-        {"id", "20"},
-        {"method", "private/create-order"},
-        {"params", {
-            {"instrument_name", hedge ? hedge_symbol_ : symbol_},
-            {"side", side},
-            {"type", type},
-            {"price", price},
-            {"quantity", size},
-            {"client_oid", client_oid}
-        }}
-    });
-}
-
-void CryptoClient::cancel_order(const std::string& order_id)
-{
-    send_private_msg({
-        {"id", "21"},
-        {"method", "private/cancel-order"},
-        {"params", {{"order_id", order_id}}}
-    });
-}
-
-void CryptoClient::cancel_all_orders()
-{
-    send_private_msg({
-        {"id", "22"},
-        {"method", "private/cancel-all-orders"},
-        {"params", {{"instrument_name", symbol_}}}
-    });
-}
-
-void CryptoClient::get_position()
-{
-    send_private_msg({
-        {"id", "23"},
-        {"method", "private/get-positions"},
-        {"params", {{"instrument_name", symbol_}}}
-    });
-}
-
-/* ------------------------------------------------------------------ */
-/*  Error handler                                                     */
-/* ------------------------------------------------------------------ */
-void CryptoClient::handle_error(const std::string& where,
-                                const beast::error_code& ec,
-                                int http_status)
-{
-    std::cerr << "[CryptoClient#" << instance_id_ << "] " << where
-              << " : " << ec.message() << '\n';
-
-    /* retry on connection-level issues ----------------------------- */
-    if (ec == net::error::connection_refused ||
-        ec == net::error::timed_out           ||
-        ec == ssl::error::stream_truncated)
-    {
-        auto delay = std::chrono::milliseconds(
-            http_status == 429 ? 60'000 : 3'000 * (1 + retry_count_++));
-
-        std::cerr << "[CryptoClient#" << instance_id_ << "] retry " << where
-                  << " in " << delay.count() << "ms\n";
-
-        if (where.find("public") != std::string::npos) {
-            if (public_timer_) {
-                public_timer_->expires_after(delay);
-                public_timer_->async_wait([this](auto ec){
-                    if (!ec && running_) do_public_connect();
-                });
-            }
-        } else {
-            if (private_timer_) {
-                private_timer_->expires_after(delay);
-                private_timer_->async_wait([this](auto ec){
-                    if (!ec && running_) do_private_connect();
-                });
-            }
-        }
-        return;
+    void CryptoClient::cancel_all_orders() {
+        json msg = {
+            {"id", "4"},
+            {"method", "private/cancel-all-orders"},
+            {"params", {{"instrument_name", symbol_}}}
+        };
+        send_private_msg(std::move(msg));
     }
 
-    retry_count_ = 0;    // non-retryable error: reset back-off
-}
+    void CryptoClient::get_position() {
+        json msg = {
+            {"id", "5"},
+            {"method", "private/get-positions"},
+            {"params", {{"instrument_name", symbol_}}}
+        };
+        send_private_msg(std::move(msg));
+    }
 
+    // Utility functions
+    std::string CryptoClient::gen_id() const {
+        static std::atomic<int> counter{0};
+        return std::to_string(counter++);
+    }
+
+    std::string CryptoClient::build_payload(const std::string& method, const std::string& id,
+                                          const std::string& api_key, const json& params, long nonce) const {
+        json payload = {
+            {"id", id},
+            {"method", method},
+            {"api_key", api_key},
+            {"params", params},
+            {"nonce", nonce}
+        };
+        return payload.dump();
+    }
 } // namespace RLTrader
