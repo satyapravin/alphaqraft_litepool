@@ -20,10 +20,10 @@ namespace RLTrader
 /* ------------------------------------------------------------------ */
 /*  Compile-time constants                                            */
 /* ------------------------------------------------------------------ */
-constexpr const char* CR_PUBLIC_HOST  = "uat-stream.3ona.co";
-constexpr const char* CR_PRIVATE_HOST = "uat-stream.3ona.co";
-// constexpr const char* CR_PUBLIC_HOST  = "stream.crypto.com";
-// constexpr const char* CR_PRIVATE_HOST = "stream.crypto.com";
+// constexpr const char* CR_PUBLIC_HOST  = "uat-stream.3ona.co";
+// constexpr const char* CR_PRIVATE_HOST = "uat-stream.3ona.co";
+constexpr const char* CR_PUBLIC_HOST  = "stream.crypto.com";
+constexpr const char* CR_PRIVATE_HOST = "stream.crypto.com";
 
 constexpr const char* CR_PUBLIC_PATH  = "/exchange/v1/market";
 constexpr const char* CR_PRIVATE_PATH = "/exchange/v1/user";
@@ -476,12 +476,6 @@ void CryptoClient::do_public_read()
         if (!ec && running_) {
             std::lock_guard lp(public_mutex_);
             if (public_ws_) {
-                // Send a WebSocket ping to keep the connection alive
-                public_ws_->async_ping("keepalive",
-                    [this](auto ec) {
-                        if (ec) handle_error("public ping", ec);
-                        else std::cout << "[CryptoClient#" << instance_id_ << "] Sent public ping\n";
-                    });
                 // Do not close the WebSocket; retry read
                 if (running_) do_public_read();
             }
@@ -522,11 +516,6 @@ void CryptoClient::do_private_read()
         if (!ec && running_) {
             std::lock_guard lq(private_mutex_);
             if (private_ws_) {
-                private_ws_->async_ping("keepalive",
-                    [this](auto ec) {
-                        if (ec) handle_error("private ping", ec);
-                        else std::cout << "[CryptoClient#" << instance_id_ << "] Sent private ping\n";
-                    });
                 if (running_) do_private_read();
             }
         }

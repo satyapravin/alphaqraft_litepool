@@ -87,10 +87,10 @@ def load_model_and_env():
         num_threads=1,
         is_prod=True,
         is_inverse_instr=True,
-        #api_key="Wd82oXzXWzJRf4ZHpsijXK", # PROD
-        #api_secret="cxakp_SE3VYcB2u336cdcfN5hiBU", #PROD
-        api_key="pd4khWVrKGgRL8HHgbDs1X", # UAT 
-        api_secret="cxaks_gCz5k6k9ucFUB4dQASiKEB", #UAT
+        api_key="Wd82oXzXWzJRf4ZHpsijXK", # PROD
+        api_secret="cxakp_SE3VYcB2u336cdcfN5hiBU", #PROD
+        #api_key="pd4khWVrKGgRL8HHgbDs1X", # UAT 
+        #api_secret="cxaks_gCz5k6k9ucFUB4dQASiKEB", #UAT
         symbol="BTCUSD-PERP",
         hedge_symbol="BTC",
         tick_size=0.1,

@@ -23,8 +23,8 @@ namespace RLTrader
 
 /* ------------------------------------------------------------------ */
 
-//constexpr const char* REST_HOST   = "api.crypto.com";
-constexpr const char* REST_HOST   = "uat-api.3ona.co";
+constexpr const char* REST_HOST   = "api.crypto.com";
+// constexpr const char* REST_HOST   = "uat-api.3ona.co";
 constexpr const char* REST_PORT   = "443";
 constexpr const char* USER_AGENT  = "AlphaQraft_Trading";
 static   constexpr std::chrono::milliseconds REQUEST_DELAY{10'000};
