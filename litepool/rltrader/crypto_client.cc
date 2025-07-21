@@ -229,6 +229,8 @@ void CryptoClient::do_public_connect()
                             if (ec) { timeout->cancel(); return handle_error("public SSL", ec); }
 
                             {
+			        SSL_set_mode(ssl_stream->native_handle(), SSL_MODE_AUTO_RETRY);
+                                beast::get_lowest_layer(*ssl_stream).socket().set_option( boost::asio::socket_base::keep_alive(true));
                                 std::lock_guard lp(public_mutex_);
                                 public_ws_ = std::make_unique<websocket_stream>(std::move(*ssl_stream));
                                 public_ws_->auto_fragment(false);
@@ -307,6 +309,8 @@ void CryptoClient::do_private_connect()
                             if (ec) { timeout->cancel(); return handle_error("private SSL", ec); }
 
                             {
+			        SSL_set_mode(ssl_stream->native_handle(), SSL_MODE_AUTO_RETRY);
+                                beast::get_lowest_layer(*ssl_stream).socket().set_option(boost::asio::socket_base::keep_alive(true));
                                 std::lock_guard lq(private_mutex_);
                                 private_ws_ = std::make_unique<websocket_stream>(std::move(*ssl_stream));
                                 private_ws_->set_option(ws::stream_base::decorator(
