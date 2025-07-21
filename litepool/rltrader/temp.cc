@@ -59,7 +59,8 @@ int main() {
             {"id", 1},
             {"method", "subscribe"},
             {"params", {
-                {"channels", {"book.BTCUSD-PERP.10"}}
+                {"channels", {"book.BTCUSD-PERP.10"}},
+		{"book_subscription_type", "SNAPSHOT"}
             }}
         };
 

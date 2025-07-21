@@ -41,52 +41,52 @@ void CryptoExchange::set_callbacks()
     client_.set_trade_cb    ( [this](const json& j) { on_private_trades(j); } );
 }
 
-void CryptoExchange::on_orderbook(const json& d)
+void CryptoExchange::on_orderbook(const json& data)
 {
-    if (!d.contains("bids") || !d.contains("asks")) return;
+    if (!data[0].contains("bids") || !data[0].contains("asks")) {
+        std::cerr << "[CryptoExchange] Missing bids or asks in orderbook data: " << data.dump() << '\n';
+        return;
+    }
 
     size_t slot{};
-    auto&  book = book_buf_.get_write_slot(slot);
+    auto& book = book_buf_.get_write_slot(slot);
 
     size_t i = 0;
-    for (const auto& b : d["bids"]) {
-        if (i >= 20) break;
-        book.bid_prices[i] = b.value("price",    0.0);
-        book.bid_sizes [i] = b.value("quantity", 0.0);
+    for (const auto& b : data[0]["bids"]) {
+        if (i >= 20 || !b.is_array() || b.size() < 2) break;
+        book.bid_prices[i] = std::stod(b[0].get<std::string>());
+        book.bid_sizes[i] = std::stod(b[1].get<std::string>());
         ++i;
     }
     i = 0;
-    for (const auto& a : d["asks"]) {
-        if (i >= 20) break;
-        book.ask_prices[i] = a.value("price",    0.0);
-        book.ask_sizes [i] = a.value("quantity", 0.0);
+    for (const auto& a : data[0]["asks"]) {
+        if (i >= 20 || !a.is_array() || a.size() < 2) break;
+        book.ask_prices[i] = std::stod(a[0].get<std::string>());
+        book.ask_sizes[i] = std::stod(a[1].get<std::string>());
         ++i;
     }
     book_buf_.commit_write(slot);
 }
 
-void CryptoExchange::on_private_trades(const json& arr)
+void CryptoExchange::on_private_trades(const json& d)
 {
     std::lock_guard lk(fill_mtx_);
-    if (!arr.is_array()) return;
 
-    for (const auto& tr : arr) {
+    for (const auto& tr : d) {
         const std::string tid = tr.value("trade_id", "");
         if (tid.empty() || !seen_trades_.insert(tid).second) continue;
 
         Order o;
-        o.orderId     = tr.value("order_id", "");
-        o.amount      = tr.value("quantity", 0.0);
-        o.price       = tr.value("price",    0.0);
-        o.side        = tr.value("side", "") == "BUY" ? OrderSide::BUY
-                                                      : OrderSide::SELL;
-        o.state       = OrderState::FILLED;
+        o.orderId = tr.value("order_id", "");
+        o.amount = tr.value("traded_quantity", 0.0);
+        o.price = tr.value("traded_price", 0.0);
+        o.side = tr.value("side", "") == "BUY" ? OrderSide::BUY : OrderSide::SELL;
+        o.state = OrderState::FILLED;
         o.microSecond = tr.value("create_time", 0L);
 
         executions_.push_back(o);
     }
 }
-
 /* ---------------- BaseExchange impl ------------------------------- */
 bool CryptoExchange::next_read(size_t& slot, OrderBook& book)
 {
