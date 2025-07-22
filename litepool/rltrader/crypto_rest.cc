@@ -21,7 +21,7 @@ namespace RLTrader
 
 /* ------------------------------------------------------------------ */
 
-constexpr const char* REST_HOST   = "https://api.crypto.com/exchange/v1/";
+constexpr const char* REST_HOST   = "api.crypto.com";
 constexpr const char* REST_PORT   = "443";
 constexpr const char* USER_AGENT  = "AlphaQraft_Trading";
 static constexpr std::chrono::milliseconds REQUEST_DELAY{10'000};
@@ -70,6 +70,7 @@ CryptoREST::CryptoREST(const std::string& api_key,
     try {
         ssl_ctx_.set_default_verify_paths();
         ssl_ctx_.set_verify_mode(ssl::verify_peer);
+        ssl_ctx_.set_verify_callback(ssl::host_name_verification(REST_HOST));
         SSL_CTX_set_options(ssl_ctx_.native_handle(), SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_COMPRESSION);
         SSL_CTX_set_cipher_list(ssl_ctx_.native_handle(), "HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4");
         std::cout << "[CryptoREST] SSL context initialized\n";
@@ -93,31 +94,44 @@ CryptoREST::~CryptoREST()
 void CryptoREST::do_connect()
 {
     std::lock_guard lk(connection_mutex_);
+    std::cout << "[CryptoREST] Starting connection process\n";
 
     try {
-        if (!socket_)
+        // Create new socket if needed
+        if (!socket_) {
             socket_ = std::make_unique<ssl::stream<tcp::socket>>(ioc_, ssl_ctx_);
-
-        tcp::resolver resolver(ioc_);
-        auto results = resolver.resolve(REST_HOST, REST_PORT);
-
-        net::connect(socket_->next_layer(), results.begin(), results.end());
-        
-        if (!SSL_set_tlsext_host_name(socket_->native_handle(), REST_HOST)) {
-	    std::cout << "REST connect failed " << std::endl;
-            boost::system::error_code ec{static_cast<int>(::ERR_get_error()),
-                                         net::error::get_ssl_category()};
-            throw boost::system::system_error{ec};
+            socket_->next_layer().open(tcp::v4());
         }
 
-        socket_->handshake(ssl::stream_base::client);
-        std::cout << "[CryptoREST] Connected to " << REST_HOST << ":" << REST_PORT << "\n";
-    } catch (const std::exception& e) {
-        std::cerr << "[CryptoREST] connect: " << e.what() << '\n';
+        // Set non-blocking mode for timeouts
+        socket_->next_layer().non_blocking(true);
+
+        // Resolve endpoint
+        tcp::resolver resolver(ioc_);
+        auto endpoints = resolver.resolve(REST_HOST, REST_PORT);
+
+        // Connect with timeout
+        boost::system::error_code ec;
+        net::connect(socket_->next_layer(), endpoints.begin(), endpoints.end(), ec);
+        
+        if (ec) {
+            throw boost::system::system_error(ec);
+        }
+
+        // SSL handshake with timeout
+        socket_->handshake(ssl::stream_base::client, ec);
+        if (ec) {
+            throw boost::system::system_error(ec);
+        }
+
+        std::cout << "[CryptoREST] Successfully connected\n";
+    } 
+    catch (const std::exception& e) {
+        std::cerr << "[CryptoREST] Connection failed: " << e.what() << '\n';
         socket_.reset();
+        throw; // Re-throw to prevent silent failures
     }
 }
-
 /* ------------------------------------------------------------------ */
 bool CryptoREST::fetch_position(const std::string& symbol,
                                 double& amount,
