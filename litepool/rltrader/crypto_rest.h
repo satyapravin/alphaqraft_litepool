@@ -3,6 +3,7 @@
 #include <atomic>
 #include <mutex>
 #include <string>
+#include <memory>
 
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
@@ -13,9 +14,8 @@ namespace RLTrader
 {
     namespace net = boost::asio;
     namespace ssl = boost::asio::ssl;
-    using      json = nlohmann::json;
+    using json = nlohmann::json;
 
-    // Thread-safe HTTPS helper (Crypto.com REST V1)
     class CryptoREST
     {
     public:
@@ -23,22 +23,22 @@ namespace RLTrader
                    const std::string& api_secret);
         ~CryptoREST();
 
-        // returns true on success – amount / avgPrice are always written
         bool fetch_position(const std::string& symbol,
-                            double&            amount,
-                            double&            avgPrice);
+                           double& amount,
+                           double& avg_price);
 
     private:
         void do_connect();
+        bool ensure_connection();
 
         const std::string api_key_;
         const std::string api_secret_;
 
         net::io_context ioc_;
-        ssl::context    ssl_ctx_{ssl::context::tlsv12_client};
+        ssl::context ssl_ctx_{ssl::context::tlsv12_client};
 
         std::unique_ptr<ssl::stream<net::ip::tcp::socket>> socket_;
-        std::mutex                                         connection_mutex_;
-        std::atomic<bool>                                  running_{true};
+        std::mutex connection_mutex_;
+        std::atomic<bool> running_{true};
     };
 } // namespace RLTrader
