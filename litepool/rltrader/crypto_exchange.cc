@@ -65,6 +65,8 @@ void CryptoExchange::on_orderbook(const json& data)
         book.ask_sizes[i] = std::stod(a[1].get<std::string>());
         ++i;
     }
+
+    std::cout << "Book written" << std::endl;
     book_buf_.commit_write(slot);
 }
 

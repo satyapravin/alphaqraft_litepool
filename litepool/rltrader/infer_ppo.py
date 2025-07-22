@@ -155,6 +155,7 @@ def main():
     logger = MetricLogger(print_interval=512)
 
     obs, info = env.reset()
+    print("Env reset from infer_ppo")
     hidden = policy.init_hidden_state(batch_size=num_of_envs)
     hidden = tuple(h.to(device) for h in hidden) if isinstance(hidden, tuple) else hidden.to(device)
 

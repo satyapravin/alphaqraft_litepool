@@ -1,5 +1,4 @@
 #include "crypto_client.h"
-#include "crypto_util.h"
 #include <boost/asio/connect.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/ssl.hpp>
@@ -7,6 +6,8 @@
 #include <boost/beast/websocket.hpp>
 #include <boost/beast/websocket/ssl.hpp>
 #include <openssl/hmac.h>
+#include <openssl/evp.h>
+#include <openssl/err.h>
 #include <chrono>
 #include <iomanip>
 #include <iostream>
@@ -17,12 +18,15 @@ namespace RLTrader {
 namespace net = boost::asio;
 namespace beast = boost::beast;
 namespace ws = boost::beast::websocket;
+using tcp = boost::asio::ip::tcp;
+using ssl_socket = boost::asio::ssl::stream<beast::tcp_stream>;
+using websocket_stream = ws::stream<ssl_socket>;
 
 // Constants
-constexpr std::chrono::seconds WS_PING_INTERVAL{1}; // Match temp.cc
+constexpr std::chrono::seconds WS_PING_INTERVAL{1};
 constexpr std::chrono::seconds APP_PING_INTERVAL{30};
 constexpr std::chrono::seconds RECONNECT_DELAY{1};
-constexpr std::chrono::seconds READ_TIMEOUT{60}; // Increased to reduce timeouts
+constexpr std::chrono::seconds READ_TIMEOUT{60};
 
 static constexpr const char* CR_PUBLIC_HOST = "stream.crypto.com";
 static constexpr const char* CR_PRIVATE_HOST = "stream.crypto.com";
@@ -54,12 +58,17 @@ void CryptoClient::start() {
     try {
         public_ioc_ = std::make_unique<boost::asio::io_context>();
         private_ioc_ = std::make_unique<boost::asio::io_context>();
-        public_write_strand_ = boost::asio::make_strand(public_ioc_->get_executor());
-        private_write_strand_ = boost::asio::make_strand(private_ioc_->get_executor());
+        
+        public_write_strand_ = std::make_unique<boost::asio::strand<boost::asio::io_context::executor_type>>(
+            public_ioc_->get_executor());
+        private_write_strand_ = std::make_unique<boost::asio::strand<boost::asio::io_context::executor_type>>(
+            private_ioc_->get_executor());
 
         ssl_ctx_ = std::make_unique<boost::asio::ssl::context>(boost::asio::ssl::context::tlsv12_client);
         ssl_ctx_->set_default_verify_paths();
         ssl_ctx_->set_verify_mode(boost::asio::ssl::verify_peer);
+        SSL_CTX_set_options(ssl_ctx_->native_handle(), SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_COMPRESSION);
+        SSL_CTX_set_cipher_list(ssl_ctx_->native_handle(), "HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4");
 
         public_work_ = std::make_unique<boost::asio::executor_work_guard<
             boost::asio::io_context::executor_type>>(public_ioc_->get_executor());
@@ -100,7 +109,7 @@ void CryptoClient::stop() {
         std::lock_guard lock(public_mutex_);
         if (public_ws_ && public_ws_->is_open()) {
             public_ws_->async_close(ws::close_code::normal,
-                boost::asio::bind_executor(public_write_strand_,
+                boost::asio::bind_executor(*public_write_strand_,
                     [this](beast::error_code ec) {
                         if (ec) {
                             std::cerr << "[CryptoClient#" << instance_id_
@@ -113,7 +122,7 @@ void CryptoClient::stop() {
         std::lock_guard lock(private_mutex_);
         if (private_ws_ && private_ws_->is_open()) {
             private_ws_->async_close(ws::close_code::normal,
-                boost::asio::bind_executor(private_write_strand_,
+                boost::asio::bind_executor(*private_write_strand_,
                     [this](beast::error_code ec) {
                         if (ec) {
                             std::cerr << "[CryptoClient#" << instance_id_
@@ -189,17 +198,16 @@ void CryptoClient::do_public_connect() {
     public_resolver_ = std::make_unique<tcp::resolver>(*public_ioc_);
 
     public_resolver_->async_resolve(CR_PUBLIC_HOST, CR_SSL_PORT,
-        boost::asio::bind_executor(public_write_strand_,
+        boost::asio::bind_executor(*public_write_strand_,
             [this](const boost::system::error_code& ec, tcp::resolver::results_type results) {
                 if (ec) {
                     return handle_public_error("resolve", ec);
                 }
 
                 auto stream = std::make_shared<beast::tcp_stream>(*public_ioc_);
-                stream->socket().set_option(boost::asio::socket_base::keep_alive(true));
 
                 stream->async_connect(results,
-                    boost::asio::bind_executor(public_write_strand_,
+                    boost::asio::bind_executor(*public_write_strand_,
                         [this, stream](const boost::system::error_code& ec, tcp::resolver::results_type::endpoint_type) {
                             if (ec) {
                                 return handle_public_error("connect", ec);
@@ -215,7 +223,7 @@ void CryptoClient::do_public_connect() {
                             }
 
                             ssl_stream->async_handshake(net::ssl::stream_base::client,
-                                boost::asio::bind_executor(public_write_strand_,
+                                boost::asio::bind_executor(*public_write_strand_,
                                     [this, ssl_stream](const boost::system::error_code& ec) {
                                         if (ec) {
                                             return handle_public_error("SSL handshake", ec);
@@ -226,7 +234,7 @@ void CryptoClient::do_public_connect() {
                                         public_ws_->binary(true);
 
                                         public_ws_->async_handshake(CR_PUBLIC_HOST, CR_PUBLIC_PATH,
-                                            boost::asio::bind_executor(public_write_strand_,
+                                            boost::asio::bind_executor(*public_write_strand_,
                                                 [this](const boost::system::error_code& ec) {
                                                     if (ec) {
                                                         return handle_public_error("WS handshake", ec);
@@ -249,7 +257,7 @@ void CryptoClient::start_public_ping() {
 
     public_ping_timer_->expires_after(WS_PING_INTERVAL);
     public_ping_timer_->async_wait(
-        boost::asio::bind_executor(public_write_strand_,
+        boost::asio::bind_executor(*public_write_strand_,
             [this](const boost::system::error_code& ec) {
                 if (ec || !running_) {
                     return;
@@ -258,7 +266,7 @@ void CryptoClient::start_public_ping() {
                 std::lock_guard lock(public_mutex_);
                 if (public_ws_ && public_ws_->is_open()) {
                     public_ws_->async_ping("",
-                        boost::asio::bind_executor(public_write_strand_,
+                        boost::asio::bind_executor(*public_write_strand_,
                             [this](const boost::system::error_code& ec) {
                                 if (ec) {
                                     handle_public_error("ping", ec);
@@ -271,7 +279,7 @@ void CryptoClient::start_public_ping() {
 
     public_heartbeat_timer_->expires_after(APP_PING_INTERVAL);
     public_heartbeat_timer_->async_wait(
-        boost::asio::bind_executor(public_write_strand_,
+        boost::asio::bind_executor(*public_write_strand_,
             [this](const boost::system::error_code& ec) {
                 if (ec || !running_) {
                     return;
@@ -284,7 +292,7 @@ void CryptoClient::start_public_ping() {
                 send_public_msg(std::move(ping_msg));
                 public_heartbeat_timer_->expires_after(APP_PING_INTERVAL);
                 public_heartbeat_timer_->async_wait(
-                    boost::asio::bind_executor(public_write_strand_,
+                    boost::asio::bind_executor(*public_write_strand_,
                         [this](const boost::system::error_code& ec) {
                             if (ec || !running_) return;
                             start_public_ping();
@@ -305,13 +313,13 @@ void CryptoClient::do_public_read() {
     auto timeout = std::make_shared<net::steady_timer>(*public_ioc_);
     timeout->expires_after(READ_TIMEOUT);
     timeout->async_wait(
-        boost::asio::bind_executor(public_write_strand_,
+        boost::asio::bind_executor(*public_write_strand_,
             [this](const boost::system::error_code& ec) {
                 if (!ec && running_) {
                     std::lock_guard lock(public_mutex_);
                     if (public_ws_ && public_ws_->is_open()) {
                         public_ws_->async_close(ws::close_code::normal,
-                            boost::asio::bind_executor(public_write_strand_,
+                            boost::asio::bind_executor(*public_write_strand_,
                                 [this](const boost::system::error_code& ec) {
                                     if (ec) {
                                         std::cerr << "[CryptoClient#" << instance_id_
@@ -323,7 +331,7 @@ void CryptoClient::do_public_read() {
             }));
 
     public_ws_->async_read(public_buffer_,
-        boost::asio::bind_executor(public_write_strand_,
+        boost::asio::bind_executor(*public_write_strand_,
             [this, timeout](const boost::system::error_code& ec, std::size_t bytes_transferred) {
                 timeout->cancel();
 
@@ -376,7 +384,7 @@ void CryptoClient::handle_public_error(const std::string& where, beast::error_co
     auto timer = std::make_unique<net::steady_timer>(*public_ioc_);
     timer->expires_after(RECONNECT_DELAY);
     timer->async_wait(
-        boost::asio::bind_executor(public_write_strand_,
+        boost::asio::bind_executor(*public_write_strand_,
             [this](const boost::system::error_code& ec) {
                 if (!ec && running_) {
                     do_public_connect();
@@ -396,11 +404,11 @@ void CryptoClient::send_public_msg(json&& j) {
         return;
     }
 
-    boost::asio::post(public_write_strand_,
+    boost::asio::post(*public_write_strand_,
         [this, msg = j.dump()]() {
             std::cout << "[CryptoClient#" << instance_id_ << "] Sending public message: " << msg << "\n";
             public_ws_->async_write(net::buffer(msg),
-                boost::asio::bind_executor(public_write_strand_,
+                boost::asio::bind_executor(*public_write_strand_,
                     [this](const boost::system::error_code& ec, std::size_t) {
                         if (ec) {
                             handle_public_error("write", ec);
@@ -414,7 +422,7 @@ void CryptoClient::subscribe_public() {
         {"id", "1"},
         {"method", "subscribe"},
         {"params", {
-            {"channels", {"book." + symbol_ + ".10"}},
+            {"channels", {"book." + symbol_ + ".50"}},
             {"book_subscription_type", "SNAPSHOT"}
         }}
     };
@@ -479,17 +487,16 @@ void CryptoClient::do_private_connect() {
     private_resolver_ = std::make_unique<tcp::resolver>(*private_ioc_);
 
     private_resolver_->async_resolve(CR_PRIVATE_HOST, CR_SSL_PORT,
-        boost::asio::bind_executor(private_write_strand_,
+        boost::asio::bind_executor(*private_write_strand_,
             [this](const boost::system::error_code& ec, tcp::resolver::results_type results) {
                 if (ec) {
                     return handle_private_error("resolve", ec);
                 }
 
                 auto stream = std::make_shared<beast::tcp_stream>(*private_ioc_);
-                stream->socket().set_option(boost::asio::socket_base::keep_alive(true));
 
                 stream->async_connect(results,
-                    boost::asio::bind_executor(private_write_strand_,
+                    boost::asio::bind_executor(*private_write_strand_,
                         [this, stream](const boost::system::error_code& ec, tcp::resolver::results_type::endpoint_type) {
                             if (ec) {
                                 return handle_private_error("connect", ec);
@@ -505,7 +512,7 @@ void CryptoClient::do_private_connect() {
                             }
 
                             ssl_stream->async_handshake(net::ssl::stream_base::client,
-                                boost::asio::bind_executor(private_write_strand_,
+                                boost::asio::bind_executor(*private_write_strand_,
                                     [this, ssl_stream](const boost::system::error_code& ec) {
                                         if (ec) {
                                             return handle_private_error("SSL handshake", ec);
@@ -516,7 +523,7 @@ void CryptoClient::do_private_connect() {
                                         private_ws_->binary(true);
 
                                         private_ws_->async_handshake(CR_PRIVATE_HOST, CR_PRIVATE_PATH,
-                                            boost::asio::bind_executor(private_write_strand_,
+                                            boost::asio::bind_executor(*private_write_strand_,
                                                 [this](const boost::system::error_code& ec) {
                                                     if (ec) {
                                                         return handle_private_error("WS handshake", ec);
@@ -538,7 +545,7 @@ void CryptoClient::start_private_ping() {
 
     private_ping_timer_->expires_after(WS_PING_INTERVAL);
     private_ping_timer_->async_wait(
-        boost::asio::bind_executor(private_write_strand_,
+        boost::asio::bind_executor(*private_write_strand_,
             [this](const boost::system::error_code& ec) {
                 if (ec || !running_) {
                     return;
@@ -547,7 +554,7 @@ void CryptoClient::start_private_ping() {
                 std::lock_guard lock(private_mutex_);
                 if (private_ws_ && private_ws_->is_open()) {
                     private_ws_->async_ping("",
-                        boost::asio::bind_executor(private_write_strand_,
+                        boost::asio::bind_executor(*private_write_strand_,
                             [this](const boost::system::error_code& ec) {
                                 if (ec) {
                                     handle_private_error("ping", ec);
@@ -560,7 +567,7 @@ void CryptoClient::start_private_ping() {
 
     private_heartbeat_timer_->expires_after(APP_PING_INTERVAL);
     private_heartbeat_timer_->async_wait(
-        boost::asio::bind_executor(private_write_strand_,
+        boost::asio::bind_executor(*private_write_strand_,
             [this](const boost::system::error_code& ec) {
                 if (ec || !running_) {
                     return;
@@ -573,7 +580,7 @@ void CryptoClient::start_private_ping() {
                 send_private_msg(std::move(ping_msg));
                 private_heartbeat_timer_->expires_after(APP_PING_INTERVAL);
                 private_heartbeat_timer_->async_wait(
-                    boost::asio::bind_executor(private_write_strand_,
+                    boost::asio::bind_executor(*private_write_strand_,
                         [this](const boost::system::error_code& ec) {
                             if (ec || !running_) return;
                             start_private_ping();
@@ -617,16 +624,16 @@ void CryptoClient::send_private_msg(json&& j) {
     }
 
     std::lock_guard lock(private_mutex_);
-    if (!private_ws_ || !private_ws_->is ateş
+    if (!private_ws_ || !private_ws_->is_open()) {
         std::cerr << "[CryptoClient#" << instance_id_ << "] Private WebSocket not open, dropping message\n";
         return;
     }
 
-    boost::asio::post(private_write_strand_,
+    boost::asio::post(*private_write_strand_,
         [this, msg = j.dump()]() {
             std::cout << "[CryptoClient#" << instance_id_ << "] Sending private message: " << msg << "\n";
             private_ws_->async_write(net::buffer(msg),
-                boost::asio::bind_executor(private_write_strand_,
+                boost::asio::bind_executor(*private_write_strand_,
                     [this](const boost::system::error_code& ec, std::size_t) {
                         if (ec) {
                             handle_private_error("write", ec);
@@ -650,7 +657,7 @@ void CryptoClient::handle_private_error(const std::string& where, beast::error_c
     auto timer = std::make_unique<net::steady_timer>(*private_ioc_);
     timer->expires_after(RECONNECT_DELAY);
     timer->async_wait(
-        boost::asio::bind_executor(private_write_strand_,
+        boost::asio::bind_executor(*private_write_strand_,
             [this](const boost::system::error_code& ec) {
                 if (!ec && running_) {
                     do_private_connect();
@@ -671,13 +678,13 @@ void CryptoClient::do_private_read() {
     auto timeout = std::make_shared<net::steady_timer>(*private_ioc_);
     timeout->expires_after(READ_TIMEOUT);
     timeout->async_wait(
-        boost::asio::bind_executor(private_write_strand_,
+        boost::asio::bind_executor(*private_write_strand_,
             [this](const boost::system::error_code& ec) {
                 if (!ec && running_) {
                     std::lock_guard lock(private_mutex_);
                     if (private_ws_ && private_ws_->is_open()) {
                         private_ws_->async_close(ws::close_code::normal,
-                            boost::asio::bind_executor(private_write_strand_,
+                            boost::asio::bind_executor(*private_write_strand_,
                                 [this](const boost::system::error_code& ec) {
                                     if (ec) {
                                         std::cerr << "[CryptoClient#" << instance_id_
@@ -689,7 +696,7 @@ void CryptoClient::do_private_read() {
             }));
 
     private_ws_->async_read(private_buffer_,
-        boost::asio::bind_executor(private_write_strand_,
+        boost::asio::bind_executor(*private_write_strand_,
             [this, timeout](const boost::system::error_code& ec, std::size_t bytes_transferred) {
                 timeout->cancel();
 
@@ -730,7 +737,7 @@ void CryptoClient::do_private_read() {
 void CryptoClient::subscribe_private() {
     private_heartbeat_timer_->expires_after(std::chrono::seconds(2));
     private_heartbeat_timer_->async_wait(
-        boost::asio::bind_executor(private_write_strand_,
+        boost::asio::bind_executor(*private_write_strand_,
             [this](const boost::system::error_code& ec) {
                 if (ec || !running_) {
                     return;
@@ -765,7 +772,8 @@ void CryptoClient::handle_private_msg(const json& j) {
         }
     } else if (method == "public/auth" && j.contains("result")) {
         std::cout << "[CryptoClient#" << instance_id_ << "] Authentication successful\n";
-        do_private_read(); // Start reading after authentication
+        subscribe_private();
+        do_private_read();
     } else if (method == "subscribe" && j.contains("result")) {
         if (j["result"].contains("channel")) {
             const std::string channel = j["result"]["channel"];
@@ -783,12 +791,15 @@ void CryptoClient::handle_private_msg(const json& j) {
 void CryptoClient::set_orderbook_cb(std::function<void(const json&)> cb) {
     orderbook_cb_ = std::move(cb);
 }
+
 void CryptoClient::set_trade_cb(std::function<void(const json&)> cb) {
     trade_cb_ = std::move(cb);
 }
+
 void CryptoClient::set_position_cb(std::function<void(const json&)> cb) {
     position_cb_ = std::move(cb);
 }
+
 void CryptoClient::set_order_cb(std::function<void(const json&)> cb) {
     order_cb_ = std::move(cb);
 }
