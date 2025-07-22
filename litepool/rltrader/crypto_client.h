@@ -13,6 +13,8 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <queue>
+#include <condition_variable>
 
 namespace RLTrader {
 
@@ -65,6 +67,7 @@ private:
     // Message handling
     void send_public_msg(json&& j);
     void send_private_msg(json&& j);
+    void run_private_write_thread();
     void handle_public_msg(const json& j);
     void handle_private_msg(const json& j);
     void handle_public_error(const std::string& where, boost::beast::error_code ec);
@@ -117,6 +120,13 @@ private:
     std::mutex private_mutex_;
     std::thread private_thread_;
     std::unique_ptr<boost::asio::strand<boost::asio::io_context::executor_type>> private_write_strand_;
+
+    // Thread-safe queue for private messages
+    std::queue<json> private_msg_queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    std::thread private_write_thread_;
+    std::atomic<bool> write_thread_running_{false};
 
     // SSL context
     std::unique_ptr<boost::asio::ssl::context> ssl_ctx_;

@@ -13,8 +13,28 @@
 #include <iostream>
 #include <sstream>
 #include <map>
+#include <string>
+#include <algorithm>
 
 namespace RLTrader {
+
+std::string removeTrailingZeros(std::string s) {
+    size_t decimalPos = s.find('.');
+
+    if (decimalPos == std::string::npos || decimalPos == s.length() - 1) {
+        return s;
+    }
+
+    while (s.back() == '0' && s.length() > decimalPos + 1) {
+        s.pop_back();
+    }
+
+    if (s.back() == '.') {
+        s.pop_back();
+    }
+
+    return s;
+}
 
 namespace net = boost::asio;
 namespace beast = boost::beast;
@@ -43,7 +63,8 @@ CryptoClient::CryptoClient(std::string api_key, std::string api_secret,
       api_secret_(std::move(api_secret)),
       symbol_(std::move(symbol)),
       hedge_symbol_(hedge_symbol.empty() ? symbol_ : std::move(hedge_symbol)),
-      instance_id_(gen_id()) {
+      instance_id_(gen_id()),
+      write_thread_running_(false) {
     std::cout << "[CryptoClient#" << instance_id_ << "] Created with API key length: "
               << api_key_.size() << ", secret length: " << api_secret_.size() << "\n";
 }
@@ -86,6 +107,11 @@ void CryptoClient::start() {
             private_ioc_->run();
         });
 
+        write_thread_running_ = true;
+        private_write_thread_ = std::thread([this] {
+            run_private_write_thread();
+        });
+
         setup_public_ws();
         setup_private_ws();
 
@@ -100,6 +126,9 @@ void CryptoClient::stop() {
     if (!running_.exchange(false)) {
         return;
     }
+
+    write_thread_running_ = false;
+    queue_cv_.notify_all(); // Wake up write thread to exit
 
     if (public_ping_timer_) public_ping_timer_->cancel();
     if (private_ping_timer_) private_ping_timer_->cancel();
@@ -138,6 +167,7 @@ void CryptoClient::stop() {
 
     if (public_thread_.joinable()) public_thread_.join();
     if (private_thread_.joinable()) private_thread_.join();
+    if (private_write_thread_.joinable()) private_write_thread_.join();
 
     {
         std::lock_guard lock(public_mutex_);
@@ -156,6 +186,13 @@ void CryptoClient::stop() {
         private_heartbeat_timer_.reset();
         private_work_.reset();
         private_ioc_.reset();
+    }
+
+    {
+        std::lock_guard lock(queue_mutex_);
+        while (!private_msg_queue_.empty()) {
+            private_msg_queue_.pop();
+        }
     }
 
     ssl_ctx_.reset();
@@ -414,8 +451,6 @@ void CryptoClient::send_public_msg(json&& j) {
                         if (ec) {
                             std::cerr << "[CryptoClient#" << instance_id_ << "] Write error: " << ec.message() << "\n";
                             handle_public_error("write", ec);
-                        } else {
-                            std::cout << "[CryptoClient#" << instance_id_ << "] Successfully wrote " << bytes_written << " bytes\n";
                         }
                     }));
         });
@@ -457,8 +492,6 @@ void CryptoClient::handle_public_msg(const json& j) {
         } else {
             std::cout << "[CryptoClient#" << instance_id_ << "] Orderbook callback not set\n";
         }
-    } else {
-        std::cout << "[CryptoClient#" << instance_id_ << "] Public unhandled method: " << method << j.dump() << "\n";
     }
 }
 
@@ -601,6 +634,79 @@ void CryptoClient::start_private_ping() {
             }));
 }
 
+void CryptoClient::send_private_msg(json&& j) {
+    if (!running_ || !private_connected_) {
+        std::cerr << "[CryptoClient#" << instance_id_ << "] Private stream not connected, dropping message\n";
+        return;
+    }
+
+    {
+        std::lock_guard lock(queue_mutex_);
+        private_msg_queue_.push(std::move(j));
+    }
+    queue_cv_.notify_one();
+}
+
+void CryptoClient::run_private_write_thread() {
+    while (write_thread_running_) {
+        json msg;
+        {
+            std::unique_lock lock(queue_mutex_);
+            queue_cv_.wait(lock, [this] { return !private_msg_queue_.empty() || !write_thread_running_; });
+
+            if (!write_thread_running_ && private_msg_queue_.empty()) {
+                return;
+            }
+
+            if (private_msg_queue_.empty()) {
+                continue;
+            }
+
+            msg = std::move(private_msg_queue_.front());
+            private_msg_queue_.pop();
+        }
+
+        std::string msg_str = msg.dump();
+        std::string msg_id = msg.contains("id") ? msg["id"].dump() : "unknown";
+
+        std::cout << "[CryptoClient#" << instance_id_ << "] Sending private message ID: " << msg_id << ": " << msg_str << "\n";
+
+        // Run the async_write in the private_ioc_ context
+        boost::asio::post(*private_ioc_,
+            [this, msg_str, msg_id]() {
+                std::lock_guard lock(private_mutex_);
+                if (!private_ws_ || !private_ws_->is_open()) {
+                    std::cerr << "[CryptoClient#" << instance_id_ << "] Private WebSocket not open, dropping message ID: " << msg_id << "\n";
+                    return;
+                }
+
+                private_ws_->async_write(net::buffer(msg_str),
+                    boost::asio::bind_executor(*private_write_strand_,
+                        [this, msg_id](const boost::system::error_code& ec, std::size_t bytes_written) {
+                            if (ec) {
+                                std::cerr << "[CryptoClient#" << instance_id_ << "] Write error for message ID: " << msg_id << ": " << ec.message() << "\n";
+                                handle_private_error("write", ec);
+                            }
+                        }));
+            });
+
+        // Wait for the write to complete before processing the next message
+        std::mutex write_mutex;
+        std::condition_variable write_cv;
+        bool write_completed = false;
+
+        boost::asio::post(*private_ioc_,
+            [&write_mutex, &write_cv, &write_completed]() {
+                std::lock_guard lock(write_mutex);
+                write_completed = true;
+                write_cv.notify_one();
+            });
+
+        std::unique_lock lock(write_mutex);
+        write_cv.wait(lock, [&write_completed] { return write_completed; });
+    }
+}
+
 std::string CryptoClient::build_payload(const std::string& method, const int id,
                                        const std::string& api_key, const json& params, long nonce) const {
     std::string param_string;
@@ -621,20 +727,13 @@ std::string CryptoClient::build_payload(const std::string& method, const int id,
 void CryptoClient::authenticate() {
     const long ts_milli = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    const long ts_seconds = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
 
-    // Ensure ASCII encoding
-    std::string ascii_secret = api_secret_;
-    std::cout << "[CryptoClient#" << instance_id_ << "] API secret length: " << ascii_secret.size() << "\n";
-
-    // Try milliseconds first
     json params = json::object();
     std::string payload = build_payload("public/auth", 1, api_key_, params, ts_milli);
     
     unsigned char digest[32];
     unsigned int dlen{};
-    HMAC(EVP_sha256(), ascii_secret.data(), ascii_secret.size(),
+    HMAC(EVP_sha256(), api_secret_.data(), api_secret_.size(),
          reinterpret_cast<const unsigned char*>(payload.data()),
          payload.size(), digest, &dlen);
 
@@ -654,35 +753,6 @@ void CryptoClient::authenticate() {
         {"params", params}
     };
     send_private_msg(std::move(msg));
-}
-
-void CryptoClient::send_private_msg(json&& j) {
-    if (!running_ || !private_connected_) {
-        std::cerr << "[CryptoClient#" << instance_id_ << "] Private stream not connected, dropping message\n";
-        return;
-    }
-
-    std::lock_guard lock(private_mutex_);
-    if (!private_ws_ || !private_ws_->is_open()) {
-        std::cerr << "[CryptoClient#" << instance_id_ << "] Private WebSocket not open, dropping message\n";
-        return;
-    }
-
-    std::string msg = j.dump();
-    boost::asio::post(*private_write_strand_,
-        [this, msg]() {
-            std::cout << "[CryptoClient#" << instance_id_ << "] Sending private message: " << msg << "\n";
-            private_ws_->async_write(net::buffer(msg),
-                boost::asio::bind_executor(*private_write_strand_,
-                    [this](const boost::system::error_code& ec, std::size_t bytes_written) {
-                        if (ec) {
-                            std::cerr << "[CryptoClient#" << instance_id_ << "] Write error: " << ec.message() << "\n";
-                            handle_private_error("write", ec);
-                        } else {
-                            std::cout << "[CryptoClient#" << instance_id_ << "] Successfully wrote " << bytes_written << " bytes\n";
-                        }
-                    }));
-        });
 }
 
 void CryptoClient::handle_private_error(const std::string& where, beast::error_code ec) {
@@ -797,7 +867,6 @@ void CryptoClient::subscribe_private() {
                 json msg = {
                     {"id", 2},
                     {"method", "subscribe"},
-                    {"api_key", api_key_},
                     {"nonce", ts},
                     {"params", params}
                 };
@@ -808,6 +877,18 @@ void CryptoClient::subscribe_private() {
 void CryptoClient::handle_private_msg(const json& j) {
     if (j.contains("code") && j["code"] != 0) {
         std::cerr << "[CryptoClient#" << instance_id_ << "] Server error: " << j.dump() << "\n";
+        if (j["method"] == "public/auth" && !private_authenticated_) {
+            std::cerr << "[CryptoClient#" << instance_id_ << "] Authentication failed, retrying...\n";
+            boost::asio::post(*private_ioc_, [this]() {
+                boost::asio::steady_timer timer(*private_ioc_);
+                timer.expires_after(AUTH_RETRY_DELAY);
+                timer.async_wait([this](const boost::system::error_code& ec) {
+                    if (!ec && running_) {
+                        authenticate();
+                    }
+                });
+            });
+        }
         return;
     }
     if (!j.contains("method")) {
@@ -841,8 +922,6 @@ void CryptoClient::handle_private_msg(const json& j) {
                 trade_cb_(j["result"]);
             }
         }
-    } else {
-        std::cout << "[CryptoClient#" << instance_id_ << "] Unhandled private method: " << method << "\n";
     }
 }
 
@@ -865,13 +944,19 @@ void CryptoClient::set_order_cb(std::function<void(const json&)> cb) {
 void CryptoClient::place_order(const std::string& side, double price, double size,
                               const std::string& client_oid, bool hedge,
                               const std::string& type) {
+    auto sqty = std::to_string(size);
+    auto sprice = std::to_string(price);
+    sqty = removeTrailingZeros(sqty);
+    sprice = removeTrailingZeros(sprice);
+
     json params = {
         {"instrument_name", hedge ? hedge_symbol_ : symbol_},
         {"side", side},
         {"type", type},
-        {"price", price},
-        {"quantity", size},
-        {"client_oid", client_oid}
+        {"price", sprice},
+        {"quantity", sqty},
+        {"client_oid", client_oid},
+	{"exec_inst", {"POST_ONLY"}}
     };
 
     const long ts = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -893,8 +978,6 @@ void CryptoClient::place_order(const std::string& side, double price, double siz
     json msg = {
         {"id", 2},
         {"method", "private/create-order"},
-        {"api_key", api_key_},
-        {"sig", sig.str()},
         {"nonce", ts},
         {"params", params}
     };
@@ -922,8 +1005,6 @@ void CryptoClient::cancel_order(const std::string& order_id) {
     json msg = {
         {"id", 3},
         {"method", "private/cancel-order"},
-        {"api_key", api_key_},
-        {"sig", sig.str()},
         {"nonce", ts},
         {"params", params}
     };
@@ -951,8 +1032,6 @@ void CryptoClient::cancel_all_orders() {
     json msg = {
         {"id", 4},
         {"method", "private/cancel-all-orders"},
-        {"api_key", api_key_},
-        {"sig", sig.str()},
         {"nonce", ts},
         {"params", params}
     };
@@ -980,8 +1059,6 @@ void CryptoClient::get_position() {
     json msg = {
         {"id", 5},
         {"method", "private/get-positions"},
-        {"api_key", api_key_},
-        {"sig", sig.str()},
         {"nonce", ts},
         {"params", params}
     };

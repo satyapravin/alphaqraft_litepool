@@ -1,13 +1,11 @@
 #pragma once
 
-#include <atomic>
-#include <mutex>
 #include <string>
+#include <mutex>
 #include <memory>
 
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
-#include <boost/beast/core/flat_buffer.hpp>
 #include <nlohmann/json.hpp>
 
 namespace RLTrader
@@ -30,7 +28,11 @@ namespace RLTrader
     private:
         void do_connect();
         bool ensure_connection();
-
+        static std::string build_payload(const std::string& method, 
+                                       int id, 
+                                       const std::string& api_key,
+                                       const json& params, 
+                                       long nonce);
         const std::string api_key_;
         const std::string api_secret_;
 
@@ -39,6 +41,5 @@ namespace RLTrader
 
         std::unique_ptr<ssl::stream<net::ip::tcp::socket>> socket_;
         std::mutex connection_mutex_;
-        std::atomic<bool> running_{true};
     };
-} // namespace RLTrader
+}

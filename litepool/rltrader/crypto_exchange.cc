@@ -79,8 +79,8 @@ void CryptoExchange::on_private_trades(const json& d)
 
         Order o;
         o.orderId = tr.value("order_id", "");
-        o.amount = tr.value("traded_quantity", 0.0);
-        o.price = tr.value("traded_price", 0.0);
+        o.amount = std::stod(tr.value("traded_quantity", "0.0"));
+        o.price = std::stod(tr.value("traded_price", "0.0"));
         o.side = tr.value("side", "") == "BUY" ? OrderSide::BUY : OrderSide::SELL;
         o.state = OrderState::FILLED;
         o.microSecond = tr.value("create_time", 0L);

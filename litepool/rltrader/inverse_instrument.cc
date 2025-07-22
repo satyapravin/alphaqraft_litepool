@@ -9,19 +9,19 @@ InverseInstrument::InverseInstrument(const std::string& symbol, const double& ti
     : BaseInstrument(symbol, tickSize, minAmount, makerFee, takerFee) {}
 
 double InverseInstrument::getPositionFromAmount(const double& amount, const double& price) {
-    return amount / price;
+    return amount;
 }
 
 double InverseInstrument::getLeverage(const double& amount, const double& equity, const double& price) {
-    return amount / price / equity;
+    return amount / equity;
 }
 
 double InverseInstrument::getTradeAmount(const double &amount, const double &refPrice) {
-    return std::round(amount * refPrice / minAmount) * minAmount;
+    return std::round(amount / minAmount) * minAmount;
 }
 
 double InverseInstrument::pnl(const double& qty, const double& entryPrice, const double& exitPrice) const {
-    return entryPrice < tickSize ? 0.0 : (qty / entryPrice - qty / exitPrice);
+    return entryPrice < tickSize ? 0.0 : qty * (exitPrice - entryPrice) / exitPrice;
 }
 
 double InverseInstrument::equity(const double& mid, const double& balance, const double& position,
@@ -32,9 +32,9 @@ double InverseInstrument::equity(const double& mid, const double& balance, const
 double InverseInstrument::fees(const double& qty, const double& price, bool isMaker) const {
     if (isMaker)
     {
-        return abs(qty) * this->makerFee / price;
+        return abs(qty) * this->makerFee;
     }
     else {
-        return abs(qty) * this->takerFee / price;
+        return abs(qty) * this->takerFee;
     }
 }

@@ -94,7 +94,7 @@ def load_model_and_env():
         symbol="BTCUSD-PERP",
         hedge_symbol="BTC",
         tick_size=0.1,
-        min_amount=10,
+        min_amount=0.0001,
         maker_fee=-0.00004,          # === matches training script ===
         taker_fee=0.0005,
         foldername="./test_files/",

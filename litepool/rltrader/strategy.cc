@@ -56,7 +56,7 @@ void Strategy::quote(const double& bid_spread,
 	auto posInfo = position.getPositionInfo(bid_prices[0], ask_prices[0]);
 	auto leverage = posInfo.leverage;
         auto initBalance = position.getInitialBalance();
-        	
+        if (bid_prices[0] < 0.0001 || ask_prices[0] < 0.0001) return; 	
 	auto mid_price = (bid_prices[0] + ask_prices[0]) * 0.5;
 	target_inventory = 0.05 * target + 0.95 * target_inventory;
 	target_inventory = target_inventory > 0 ? std::min(target_inventory, 0.25) : std::max(target_inventory, -0.25);
@@ -79,10 +79,12 @@ void Strategy::quote(const double& bid_spread,
 	ask_size_0 = instrument.getTradeAmount(ask_size_0, ask_price);
 	
 	if (bid_size_0 >= minAmount && leverage < 5) {
+	    std::cout << "Strategy placing BUY with quantity " << bid_size_0 << " and price " << bid_price << std::endl;
 	    this->exchange.quote(std::to_string(++order_id), OrderSide::BUY, bid_price, bid_size_0);
 	}
 	    
 	if (ask_size_0 >= minAmount && leverage > -5) {
+	    std::cout << "Strategy placing SELL with quantity " << ask_size_0 <<  " and price " << ask_price << std::endl;
             this->exchange.quote(std::to_string(++order_id), OrderSide::SELL, ask_price, ask_size_0);
 	}
 }
