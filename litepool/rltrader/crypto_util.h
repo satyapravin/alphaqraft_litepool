@@ -42,7 +42,7 @@ namespace RLTrader
 
     // Builds the full pre-hash payload
     inline std::string build_payload(const std::string& method,
-                                     const std::string& id,
+                                     const int id,
                                      const std::string& api_key,
                                      const json&        params,
                                      long               nonce)

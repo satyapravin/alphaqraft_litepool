@@ -77,7 +77,7 @@ private:
 
     // Utilities
     std::string gen_id() const;
-    std::string build_payload(const std::string& method, const std::string& id,
+    std::string build_payload(const std::string& method, const int id,
                               const std::string& api_key, const json& params, long nonce) const;
 
     // Members
@@ -90,6 +90,7 @@ private:
     std::atomic<bool> running_{false};
     bool public_connected_{false};
     bool private_connected_{false};
+    bool private_authenticated_{false};
 
     // Public stream resources
     std::unique_ptr<boost::asio::io_context> public_ioc_;

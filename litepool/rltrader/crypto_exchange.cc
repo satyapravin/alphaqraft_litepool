@@ -66,7 +66,6 @@ void CryptoExchange::on_orderbook(const json& data)
         ++i;
     }
 
-    std::cout << "Book written" << std::endl;
     book_buf_.commit_write(slot);
 }
 

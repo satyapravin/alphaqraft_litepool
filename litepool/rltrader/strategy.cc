@@ -27,8 +27,9 @@ void Strategy::reset() {
 	double initQty = 0;
 	double avgPrice = 0;
 	this->target_inventory = 0;
+        std::cout << "Fetching Positions" << std::endl;
 	this->exchange.fetchPosition(initQty, avgPrice, false);
-
+        std::cout << "Finished fetch Positions" << std::endl;
 	if (!exchange.isDummy()) {
             std::cout << "initial quantity=" << initQty << std::endl;
             std::cout << "initial price=" << avgPrice << std::endl;
