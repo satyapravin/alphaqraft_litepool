@@ -15,7 +15,7 @@ namespace RLTrader
     namespace net = boost::asio;
     namespace ssl = boost::asio::ssl;
     using json = nlohmann::json;
-
+    
     class CryptoREST
     {
     public:
