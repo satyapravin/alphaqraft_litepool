@@ -73,18 +73,18 @@ void CryptoExchange::on_private_trades(const json& d)
 {
     std::lock_guard lk(fill_mtx_);
 
-    for (const auto& tr : d) {
+    for (const auto& tr : d["data"]) {
         const std::string tid = tr.value("trade_id", "");
         if (tid.empty() || !seen_trades_.insert(tid).second) continue;
-
+        if (tr.value("instrument_name", "") != symbol_) continue;
         Order o;
         o.orderId = tr.value("order_id", "");
-        o.amount = std::stod(tr.value("traded_quantity", "0.0"));
-        o.price = std::stod(tr.value("traded_price", "0.0"));
+        o.amount = std::abs(std::stod(tr.value("traded_quantity", "0.0")));
+        o.price = std::abs(std::stod(tr.value("traded_price", "0.0")));
         o.side = tr.value("side", "") == "BUY" ? OrderSide::BUY : OrderSide::SELL;
         o.state = OrderState::FILLED;
         o.microSecond = tr.value("create_time", 0L);
-
+        std::cout << "TRADE RECEIVED " << o.amount << " " << o.price << std::endl;
         executions_.push_back(o);
     }
 }

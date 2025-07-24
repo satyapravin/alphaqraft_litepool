@@ -444,7 +444,6 @@ void CryptoClient::send_public_msg(json&& j) {
     std::string msg = j.dump();
     boost::asio::post(*public_write_strand_,
         [this, msg]() {
-            std::cout << "[CryptoClient#" << instance_id_ << "] Sending public message: " << msg << "\n";
             public_ws_->async_write(net::buffer(msg),
                 boost::asio::bind_executor(*public_write_strand_,
                     [this](const boost::system::error_code& ec, std::size_t bytes_written) {
@@ -669,8 +668,6 @@ void CryptoClient::run_private_write_thread() {
         std::string msg_str = msg.dump();
         std::string msg_id = msg.contains("id") ? msg["id"].dump() : "unknown";
 
-        std::cout << "[CryptoClient#" << instance_id_ << "] Sending private message ID: " << msg_id << ": " << msg_str << "\n";
-
         // Run the async_write in the private_ioc_ context
         boost::asio::post(*private_ioc_,
             [this, msg_str, msg_id]() {
@@ -720,7 +717,6 @@ std::string CryptoClient::build_payload(const std::string& method, const int id,
         }
     }
     std::string signing_string = method + std::to_string(id) + api_key + param_string + std::to_string(nonce);
-    std::cout << "[CryptoClient#" << instance_id_ << "] Signing string: " << signing_string << "\n";
     return signing_string;
 }
 
@@ -742,7 +738,6 @@ void CryptoClient::authenticate() {
     for (unsigned i = 0; i < dlen; ++i) {
         raw_hmac << std::setw(2) << static_cast<int>(digest[i]);
     }
-    std::cout << "[CryptoClient#" << instance_id_ << "] Auth raw HMAC (milli): " << raw_hmac.str() << "\n";
 
     json msg = {
         {"id", 1},

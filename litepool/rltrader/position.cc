@@ -62,6 +62,8 @@ void Position::onFill(const Order& order)
         throw std::runtime_error("Invalid order amount");
     }
 
+    std::cout << "POSITION FILL " << order.side << std::endl;
+
     if (order.side == OrderSide::BUY) {
         trade_info.average_buy_price *= trade_info.buy_amount;
         trade_info.buy_trades++;
