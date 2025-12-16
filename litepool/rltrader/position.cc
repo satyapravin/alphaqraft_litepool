@@ -36,13 +36,15 @@ PositionInfo Position::getPositionInfo(const double& bidPrice, const double& ask
     info.balance = this->balance;
     info.inventoryPnL = this->inventoryPnL(mid);
     info.averagePrice = this->averagePrice;
-    info.tradingPnL = this->balance - this->initialBalance;
+    info.realizedPnL = this->balance - this->initialBalance;
     info.netPosition = this->instrument.getPositionFromAmount(netAmount, mid);
     info.leverage = 0;
     info.fees = totalFee;
     
     if (this->averagePrice > instrument.getTickSize()) {
-        info.leverage = this->instrument.getLeverage(netAmount, balance + info.inventoryPnL, mid);
+        // Equity = balance + unrealized_pnl - fees
+        double equity = balance + info.inventoryPnL - totalFee;
+        info.leverage = this->instrument.getLeverage(netAmount, equity, mid);
     }
 
     return info;
@@ -62,7 +64,6 @@ void Position::onFill(const Order& order)
         throw std::runtime_error("Invalid order amount");
     }
 
-    std::cout << "POSITION FILL " << order.side << std::endl;
 
     if (order.side == OrderSide::BUY) {
         trade_info.average_buy_price *= trade_info.buy_amount;
@@ -81,7 +82,9 @@ void Position::onFill(const Order& order)
     double pnl = 0;
     double sideSign = order.side == OrderSide::BUY ? 1.0 : -1.0;
 
-    if (std::abs(netAmount) < 0.00000001) {
+    // Use 1% of minAmount as threshold for "no position"
+    const double positionThreshold = instrument.getMinAmount() * 0.01;
+    if (std::abs(netAmount) < positionThreshold) {
         averagePrice = order.price;
         netAmount = order.amount * sideSign;
     }

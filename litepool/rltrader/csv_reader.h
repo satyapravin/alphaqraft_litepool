@@ -35,11 +35,11 @@ namespace RLTrader {
         std::unordered_map<std::string, double> data{};
 
         double getBestBidPrice() const {
-            return data.find("bids[0].price")->second;
+            return data.at("bids[0].price");
         }
 
         double getBestAskPrice() const {
-            return data.find("asks[0].price")->second;
+            return data.at("asks[0].price");
         }
     };
 

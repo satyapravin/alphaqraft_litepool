@@ -13,7 +13,9 @@ double InverseInstrument::getPositionFromAmount(const double& amount, const doub
 }
 
 double InverseInstrument::getLeverage(const double& amount, const double& equity, const double& price) {
-    return amount / equity;
+    // amount is in USD contracts, equity is in BTC
+    // Convert to same units: notional_BTC / equity_BTC
+    return amount / (equity * price);
 }
 
 double InverseInstrument::getTradeAmount(const double &amount, const double &refPrice) {
@@ -21,7 +23,9 @@ double InverseInstrument::getTradeAmount(const double &amount, const double &ref
 }
 
 double InverseInstrument::pnl(const double& qty, const double& entryPrice, const double& exitPrice) const {
-    return entryPrice < tickSize ? 0.0 : qty * (exitPrice - entryPrice) / exitPrice;
+    // Inverse PnL formula: qty * (1/entry - 1/exit) in BTC
+    // = qty * (exit - entry) / (entry * exit)
+    return entryPrice < tickSize ? 0.0 : qty * (exitPrice - entryPrice) / (entryPrice * exitPrice);
 }
 
 double InverseInstrument::equity(const double& mid, const double& balance, const double& position,
@@ -30,11 +34,12 @@ double InverseInstrument::equity(const double& mid, const double& balance, const
 }
 
 double InverseInstrument::fees(const double& qty, const double& price, bool isMaker) const {
+    // Fee in BTC = (contract_value_in_BTC) * fee_rate = (qty / price) * fee_rate
     if (isMaker)
     {
-        return abs(qty) * this->makerFee;
+        return abs(qty) * this->makerFee / price;
     }
     else {
-        return abs(qty) * this->takerFee;
+        return abs(qty) * this->takerFee / price;
     }
 }

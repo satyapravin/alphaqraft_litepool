@@ -38,8 +38,8 @@ namespace RLTrader
         std::vector<Order> getUnackedOrders() const override
         { throw std::runtime_error("N/A"); }
 
-        void quote (std::string oid, OrderSide s,const double& price,const double& amt) override;
-        void market(std::string oid, OrderSide s,const double& price,const double& amt,bool hedge) override;
+        void quote(const std::string& order_id, OrderSide side, double price, double amount) override;
+        void market(const std::string& order_id, OrderSide side, double price, double amount, bool hedge) override;
 
     private:
         /* internal helpers ------------------------------------------- */

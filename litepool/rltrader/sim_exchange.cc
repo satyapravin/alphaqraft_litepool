@@ -2,10 +2,13 @@
 #include <vector>
 #include <cassert>
 #include <sstream>
-#include <iostream>
 #include "orderbook.h"
 
-using namespace RLTrader;
+namespace RLTrader {
+
+namespace {
+    constexpr size_t MAX_BOOK_LEVELS = 20;
+}
 
 std::vector<std::string> SimExchange::bid_price_labels(0);
 std::vector<std::string> SimExchange::ask_price_labels(0);
@@ -14,7 +17,7 @@ std::vector<std::string> SimExchange::ask_size_labels(0);
 bool SimExchange::init = SimExchange::initialize();
 
 bool SimExchange::initialize() {
-	for (int ii = 0; ii < 20; ++ii) {
+	for (size_t ii = 0; ii < MAX_BOOK_LEVELS; ++ii) {
 		std::ostringstream bid_price_lbl;
 		bid_price_lbl << "bids[" << ii << "].price";
 		std::ostringstream ask_price_lbl;
@@ -39,14 +42,19 @@ void SimExchange::toBook(const std::unordered_map<std::string, double>& lob, Ord
 		if (lob.find(bid_price_label) != lob.end()) {
 			book.bid_prices[ii] = lob.at(SimExchange::bid_price_labels[ii]);
 			book.ask_prices[ii] = lob.at(SimExchange::ask_price_labels[ii]);
-			book.bid_sizes[ii]= lob.at(SimExchange::bid_size_labels[ii]);
+			book.bid_sizes[ii] = lob.at(SimExchange::bid_size_labels[ii]);
 			book.ask_sizes[ii] = lob.at(SimExchange::ask_size_labels[ii]);
+		} else {
+			book.bid_prices[ii] = 0.0;
+			book.ask_prices[ii] = 0.0;
+			book.bid_sizes[ii] = 0.0;
+			book.ask_sizes[ii] = 0.0;
 		}
 		ii++;
 	}
 }
 
-SimExchange::SimExchange(const std::string& filename, long delay, int start_read, int max_read) :dataReader(filename, start_read, max_read), delay(delay) {
+SimExchange::SimExchange(const std::string& filename, long delay, int start_read, int max_read) :dataReader(filename, start_read, max_read), delay(delay), current_timestamp(0) {
 	bid_quotes.clear();
 	ask_quotes.clear();
 	executions.clear();
@@ -61,13 +69,17 @@ void SimExchange::reset() {
 	this->bid_quotes.clear();
 	this->ask_quotes.clear();
 	this->timed_buffer.clear();
+	current_timestamp = 0;  // Reset cached timestamp
 }
 
 bool SimExchange::next_read(size_t& slot, OrderBook& book) {
     if (this->dataReader.hasNext()) {
         this->dataReader.next();
     	slot = 0;
-    	toBook(this->dataReader.current().data, book);
+    	const DataRow& current_row = this->dataReader.current();
+    	// Cache timestamp when iterator is valid
+    	current_timestamp = current_row.id;
+    	toBook(current_row.data, book);
         this->execute();
     } else {
         return false;
@@ -103,10 +115,10 @@ void SimExchange::fetchPosition(double &posAmount, double &avgPrice, bool is_hed
 	avgPrice = 0;
 }
 
-void SimExchange::quote(std::string order_id, OrderSide side, const double& price, const double& amount) {
+void SimExchange::quote(const std::string& order_id, OrderSide side, double price, double amount) {
 	Order order{};
 	order.is_taker = false;
-	order.microSecond = this->dataReader.getTimeStamp();
+	order.microSecond = current_timestamp;  // Use cached timestamp instead of getTimeStamp()
 	order.amount = amount;
 	order.orderId = order_id;
 	order.price = price;
@@ -115,10 +127,10 @@ void SimExchange::quote(std::string order_id, OrderSide side, const double& pric
 	this->addToBuffer(order);
 }
 
-void SimExchange::market(std::string order_id, OrderSide side, const double &price, const double &amount, bool is_hedge) {
+void SimExchange::market(const std::string& order_id, OrderSide side, double price, double amount, bool /*is_hedge*/) {
 	Order order{};
 	order.is_taker = true;
-	order.microSecond = this->dataReader.getTimeStamp();
+	order.microSecond = current_timestamp;  // Use cached timestamp instead of getTimeStamp()
 	order.amount = amount;
 	order.orderId = order_id;
 	order.price = price;
@@ -140,7 +152,7 @@ void SimExchange::cancel(std::map<std::string, Order>& quotes) {
 		   && snd.state != OrderState::CANCELLED
 		   && snd.state != OrderState::CANCELLED_ACK) {
 			snd.state = OrderState::CANCELLED;
-			snd.microSecond = this->dataReader.getTimeStamp();
+			snd.microSecond = current_timestamp;  // Use cached timestamp instead of getTimeStamp()
 			this->addToBuffer(snd);
 		   }
 	}
@@ -148,9 +160,11 @@ void SimExchange::cancel(std::map<std::string, Order>& quotes) {
 
 void SimExchange::processPending(const DataRow& obs) {
 	std::vector<long long> delete_stamps;
-	std::vector<Order> bids;
-	std::vector<Order> asks;
-
+	std::vector<Order> bids_to_add;
+	std::vector<Order> asks_to_add;
+	
+	const double best_ask = obs.data.at("asks[0].price");
+	const double best_bid = obs.data.at("bids[0].price");
 
 	for (auto& [timestamp, orders] : timed_buffer) {
 		if (obs.id >= timestamp + delay) {
@@ -158,56 +172,41 @@ void SimExchange::processPending(const DataRow& obs) {
 
 				if (order.state == OrderState::NEW) {
 					if (order.side == OrderSide::BUY) {
-						if (order.price < obs.data.at("asks[0].price") || order.is_taker) {
+						if (order.is_taker) {
+							// Market order: accept and fill immediately in execute()
 							order.state = OrderState::NEW_ACK;
-							bids.push_back(order);
+							bids_to_add.push_back(order);
 						}
+						else if (order.price < best_ask) {
+							// Passive limit order: price below ask, accepted
+							order.state = OrderState::NEW_ACK;
+							bids_to_add.push_back(order);
+						}
+						// else: POST_ONLY order would cross (price >= ask), reject silently
 					}
 					else {
-						if (order.price > obs.data.at("bids[0].price") || order.is_taker) {
+						if (order.is_taker) {
+							// Market order: accept and fill immediately in execute()
 							order.state = OrderState::NEW_ACK;
-							asks.push_back(order);
+							asks_to_add.push_back(order);
 						}
-					}
-				}
-				else if (order.state == OrderState::AMEND) {
-					if (order.side == OrderSide::BUY) {
-						auto& quotes = this->bid_quotes;
-					
-						if (quotes.find(order.orderId) != quotes.end()) {
-							quotes[order.orderId].state = OrderState::AMEND_ACK;
-							quotes[order.orderId] = order;
+						else if (order.price > best_bid) {
+							// Passive limit order: price above bid, accepted
+							order.state = OrderState::NEW_ACK;
+							asks_to_add.push_back(order);
 						}
-					}
-					else {
-						auto& quotes = this->ask_quotes;
-						if (quotes.find(order.orderId) != quotes.end()) {
-							quotes[order.orderId].state = OrderState::AMEND_ACK;
-							quotes[order.orderId] = order;
-						}
+						// else: POST_ONLY order would cross (price <= bid), reject silently
 					}
 				}
 				else if (order.state == OrderState::CANCELLED) {
-
-					if (order.side == OrderSide::BUY) {
-						auto it = this->bid_quotes.find(order.orderId);
-
-						if (it != this->bid_quotes.end()) {
-							it->second.state = OrderState::CANCELLED_ACK;
-							this->bid_quotes.erase(order.orderId);
-						}
-					}
-					else {
-						auto it = this->ask_quotes.find(order.orderId);
-
-						if (it != this->ask_quotes.end()) {
-							it->second.state = OrderState::CANCELLED_ACK;
-							this->ask_quotes.erase(order.orderId);
-						}
+					auto& quotes = (order.side == OrderSide::BUY) ? this->bid_quotes : this->ask_quotes;
+					auto it = quotes.find(order.orderId);
+					if (it != quotes.end()) {
+						it->second.state = OrderState::CANCELLED_ACK;
+						quotes.erase(it);
 					}
 				}
-				else {
-					assert(order.state == OrderState::FILLED);
+				else if (order.state == OrderState::FILLED) {
 					executions.push_back(order);
 				}
 			}
@@ -216,14 +215,15 @@ void SimExchange::processPending(const DataRow& obs) {
 		}
 	}
 
-	for (auto timestamp : delete_stamps)
+	for (auto timestamp : delete_stamps) {
 		timed_buffer.erase(timestamp);
+	}
 
-	for (const auto& order : bids) {
+	for (const auto& order : bids_to_add) {
 		this->bid_quotes[order.orderId] = order;
 	}
 
-	for(const auto& order: asks) {
+	for (const auto& order : asks_to_add) {
 		this->ask_quotes[order.orderId] = order;
 	}
 }
@@ -242,37 +242,49 @@ void SimExchange::addToBuffer(const Order& order) {
 }
 
 void SimExchange::execute() {
+	// Get current observation - this should be valid since next_read() just called next()
 	const DataRow& obs = this->dataReader.current();
 	this->processPending(obs);
 
 	std::vector<std::string> bids_filled;
 	std::vector<std::string> asks_filled;
+	
+	// Get best bid/ask from current observation instead of calling getDouble()
+	// This avoids iterator state issues if getDouble() is called when iterator is invalid
+	const double best_ask = obs.data.count("asks[0].price") > 0 ? obs.data.at("asks[0].price") : 0.0;
+	const double best_bid = obs.data.count("bids[0].price") > 0 ? obs.data.at("bids[0].price") : 0.0;
 
+	// BUY orders fill when ask crosses down to our price
 	for (auto& [order_id, order] : this->bid_quotes) {
-		if (order.side == OrderSide::BUY && order.price > 0.00001 + this->dataReader.getDouble("bids[0].price") || order.is_taker) {
+		// Taker: fill immediately at best ask
+		// Maker: fill when best_ask <= our_bid (someone willing to sell at our price)
+		if (order.is_taker || best_ask <= order.price) {
 			order.state = OrderState::FILLED;
-			if (order.is_taker) order.price = this->dataReader.getDouble("asks[0].price");
+			order.price = order.is_taker ? best_ask : order.price;  // Taker at ask, maker at limit
 			bids_filled.push_back(order_id);
 			this->addToBuffer(order);
 		}
 	}
 
-
-	for(auto& [order_id, order] : this->ask_quotes) {
-		if (order.side == OrderSide::SELL && order.price + 0.00001 < this->dataReader.getDouble("asks[0].price") || order.is_taker) {
+	// SELL orders fill when bid crosses up to our price
+	for (auto& [order_id, order] : this->ask_quotes) {
+		// Taker: fill immediately at best bid
+		// Maker: fill when best_bid >= our_ask (someone willing to buy at our price)
+		if (order.is_taker || best_bid >= order.price) {
 			order.state = OrderState::FILLED;
-			if (order.is_taker) order.price = this->dataReader.getDouble("bids[0].price");
+			order.price = order.is_taker ? best_bid : order.price;  // Taker at bid, maker at limit
 			asks_filled.push_back(order_id);
 			this->addToBuffer(order);
 		}
 	}
 
-
-	for (auto& order_id : bids_filled) {
+	for (const auto& order_id : bids_filled) {
 		this->bid_quotes.erase(order_id);
 	}
 
-	for (auto& order_id : asks_filled) {
+	for (const auto& order_id : asks_filled) {
 		this->ask_quotes.erase(order_id);
 	}
 }
+
+} // namespace RLTrader

@@ -7,7 +7,7 @@ namespace RLTrader {
         double netPosition = 0;
         double balance = 0;
         double averagePrice = 0;
-        double tradingPnL = 0;
+        double realizedPnL = 0;  // Gross realized PnL (before fees)
         double inventoryPnL = 0;
         double leverage = 0;
 	double fees = 0;

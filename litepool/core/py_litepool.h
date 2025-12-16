@@ -258,7 +258,10 @@ template <typename LitePool>
 std::vector<std::string> PyLitePool<LitePool>::py_action_keys =
     PyLitePool<LitePool>::PySpec::py_action_keys;
 
-py::object abc_meta = py::module::import("abc").attr("ABCMeta");
+inline py::object& get_abc_meta() {
+  static py::object abc_meta = py::module::import("abc").attr("ABCMeta");
+  return abc_meta;
+}
 
 /**
  * Call this macro in the translation unit of each litepool instance
@@ -266,7 +269,7 @@ py::object abc_meta = py::module::import("abc").attr("ABCMeta");
  * The static bool status is local to the translation unit.
  */
 #define REGISTER(MODULE, SPEC, LITEPOOL)                              \
-  py::class_<SPEC>(MODULE, "_" #SPEC, py::metaclass(abc_meta))       \
+  py::class_<SPEC>(MODULE, "_" #SPEC, py::metaclass(get_abc_meta()))  \
       .def(py::init<const typename SPEC::ConfigValues&>())           \
       .def_readonly("_config_values", &SPEC::py_config_values)       \
       .def_readonly("_state_spec", &SPEC::py_state_spec)             \
@@ -276,7 +279,7 @@ py::object abc_meta = py::module::import("abc").attr("ABCMeta");
       .def_readonly_static("_config_keys", &SPEC::py_config_keys)    \
       .def_readonly_static("_default_config_values",                 \
                            &SPEC::py_default_config_values);         \
-  py::class_<LITEPOOL>(MODULE, "_" #LITEPOOL, py::metaclass(abc_meta)) \
+  py::class_<LITEPOOL>(MODULE, "_" #LITEPOOL, py::metaclass(get_abc_meta())) \
       .def(py::init<const SPEC&>())                                  \
       .def_readonly("_spec", &LITEPOOL::py_spec)                      \
       .def("_recv", &LITEPOOL::PyRecv)                                \

@@ -23,7 +23,6 @@
 #include <thread>
 #include <utility>
 #include <vector>
-#include <iostream>
 #include <threadpool/ThreadPool.h>
 #include "litepool/core/action_buffer_queue.h"
 #include "litepool/core/array.h"
@@ -52,7 +51,6 @@ class AsyncLitePool : public LitePool<typename Env::Spec> {
   std::unique_ptr<ActionBufferQueue> action_buffer_queue_;
   std::unique_ptr<StateBufferQueue> state_buffer_queue_;
   std::vector<std::unique_ptr<Env>> envs_;
-  std::vector<std::atomic<int>> stepping_env_;
   std::chrono::duration<double> dur_send_, dur_recv_, dur_send_all_;
 
   template <typename V>
@@ -128,6 +126,7 @@ class AsyncLitePool : public LitePool<typename Env::Spec> {
         }
       });
     }
+#ifdef __linux__
     if (spec.config["thread_affinity_offset"_] >= 0) {
       std::size_t thread_affinity_offset =
           spec.config["thread_affinity_offset"_];
@@ -140,6 +139,7 @@ class AsyncLitePool : public LitePool<typename Env::Spec> {
                                &cpuset);
       }
     }
+#endif
   }
 
   ~AsyncLitePool() override {

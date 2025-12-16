@@ -45,9 +45,8 @@ pybind11_add_module(rltrader_litepool rltrader_litepool.h rltrader_litepool.cc
                                       strategy.cc doctest.h strategy.h
                                       orderbook.h orderbook_buffer.h
                                       market_signal_builder.h market_signal_builder.cc
-                                      position_signal_builder.h position_signal_builder.cc
-                                      trade_signal_builder.h trade_signal_builder.cc
                                       env_adaptor.h env_adaptor.cc
+                                      amm_simulator.h amm_simulator.cc
                                       norm_macro.h rl_macros.h
 )
 
@@ -73,9 +72,8 @@ add_executable(rltradertest rltrader_litepool_test.cc
                                       strategy.cc doctest.h strategy.h
                                       orderbook.h orderbook_buffer.h
                                       market_signal_builder.h market_signal_builder.cc
-                                      position_signal_builder.h position_signal_builder.cc
-                                      trade_signal_builder.h trade_signal_builder.cc
                                       env_adaptor.h env_adaptor.cc
+                                      amm_simulator.h amm_simulator.cc
                                       norm_macro.h rl_macros.h
                                       rl_macros.h
                                       norm_macro.h

@@ -1,0 +1,118 @@
+#pragma once
+#include <cmath>
+#include <deque>
+#include <algorithm>
+
+namespace RLTrader {
+
+/**
+ * AMM V3-style simulator with ROLLING concentrated liquidity range.
+ * Simulates a Uniswap V3-like LP position that follows the market price.
+ * 
+ * The LP range smoothly tracks the market price using EMA, ensuring
+ * the position is always active and generating meaningful flow signals.
+ * 
+ * Used to generate inventory flow signals from market data:
+ * - net_flow: Cumulative (buys - sells) in quote currency
+ * - flow_imbalance: buy_vol / total_vol over recent window
+ * - inventory_delta: Normalized change in LP holdings relative to centered position
+ */
+struct AmmFlowSignals {
+    double net_flow;           // Cumulative (buys - sells), normalized
+    double flow_imbalance;     // buy_vol / total_vol over window [-1, 1] centered
+    double inventory_delta;    // Position in range: -1 (all base) to +1 (all quote)
+};
+
+class AmmV3Simulator {
+public:
+    // Configuration
+    static constexpr double RANGE_WIDTH = 0.40;      // 40% total range (±20%)
+    static constexpr double FEE_RATE = 0.0005;       // 5 bps (0.05% pool)
+    static constexpr int FLOW_WINDOW = 100;          // Steps for imbalance calc
+    static constexpr double LIQUIDITY_USD = 100000;  // Virtual liquidity
+    static constexpr double RANGE_EMA_ALPHA = 0.02;  // Rolling range smoothing (slower = smoother)
+    
+    AmmV3Simulator() : initialized_(false) {}
+    
+    /**
+     * Initialize/reset the simulator with a new price.
+     * Sets up concentrated liquidity range around the price.
+     */
+    void reset(double initial_price);
+    
+    /**
+     * Step the simulator with new market price.
+     * Simulates arbitrage and tracks flow.
+     * 
+     * @param market_price Current mid price from orderbook
+     * @return Flow signals for RL observation
+     */
+    AmmFlowSignals step(double market_price);
+    
+    // Getters
+    double getReserveX() const { return reserve_x_; }
+    double getReserveY() const { return reserve_y_; }
+    double getCurrentPrice() const { return current_price_; }
+    bool isInitialized() const { return initialized_; }
+    
+private:
+    bool initialized_;
+    
+    // Rolling range center (EMA of market price)
+    double center_price_ema_;
+    
+    // Position parameters (V3 concentrated liquidity)
+    double liquidity_;     // L in V3 math (constant value)
+    double price_lower_;   // pa (lower bound of range) - rolling
+    double price_upper_;   // pb (upper bound of range) - rolling
+    double sqrt_pa_;       // cached sqrt(pa)
+    double sqrt_pb_;       // cached sqrt(pb)
+    
+    // Current state
+    double reserve_x_;     // Base asset (e.g., BTC)
+    double reserve_y_;     // Quote asset (e.g., USD)
+    double current_price_;
+    
+    // Flow tracking
+    double cumulative_net_flow_;
+    std::deque<double> recent_buys_;
+    std::deque<double> recent_sells_;
+    double window_buy_vol_;
+    double window_sell_vol_;
+    
+    // Normalization
+    double max_observed_flow_;
+    
+    /**
+     * Update rolling range center using EMA of market price.
+     * Recomputes range bounds [center * 0.8, center * 1.2].
+     */
+    void updateRollingRange(double market_price);
+    
+    /**
+     * Compute reserves given current price using V3 math.
+     * For price p in range [pa, pb] with liquidity L:
+     *   x = L * (sqrt(pb) - sqrt(p)) / (sqrt(p) * sqrt(pb))
+     *   y = L * (sqrt(p) - sqrt(pa))
+     */
+    void computeReserves(double price);
+    
+    /**
+     * Simulate arbitrage trade to move AMM price toward target.
+     * Returns the trade size (positive = buy, negative = sell).
+     */
+    double simulateArbitrage(double target_price);
+    
+    /**
+     * Update flow tracking with a new trade.
+     */
+    void updateFlowTracking(double trade_size);
+    
+    /**
+     * Compute position within range: -1 (all base) to +1 (all quote).
+     */
+    double computeRangePosition(double price);
+};
+
+} // namespace RLTrader
+

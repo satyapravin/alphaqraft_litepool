@@ -280,7 +280,7 @@ TEST_CASE("testing the normal position") {
 		CHECK(info.balance == Approx(2000));
 		CHECK(info.inventoryPnL == Approx(0.0));
 		CHECK(info.leverage == Approx(0.0));
-		CHECK(info.tradingPnL == Approx(0.0));
+		CHECK(info.realizedPnL == Approx(0.0));
 		CHECK(tradeInfo.buy_trades == Approx(0.0));
 		CHECK(tradeInfo.sell_trades == Approx(0.0));
 		CHECK(tradeInfo.buy_amount == Approx(0.0));
@@ -305,7 +305,7 @@ TEST_CASE("testing the normal position") {
 		CHECK(info.balance == Approx(2000));
 		CHECK(info.inventoryPnL == Approx(0.015));
 		CHECK(info.leverage == Approx(0.000507496));
-		CHECK(info.tradingPnL == Approx(0.0));
+		CHECK(info.realizedPnL == Approx(0.0));
 		TradeInfo& tradeInfo = pos.getTradeInfo();
 		CHECK(tradeInfo.buy_trades == 1);
 		CHECK(tradeInfo.sell_trades == 0);
@@ -331,7 +331,7 @@ TEST_CASE("testing the normal position") {
 			CHECK(info.averagePrice == Approx(1000.0));
 			CHECK(info.balance == Approx(2000));
 			CHECK(info.inventoryPnL == Approx(1.5 * ii));
-			CHECK(info.tradingPnL == Approx(0.0));
+			CHECK(info.realizedPnL == Approx(0.0));
 			TradeInfo& tradeInfo = pos.getTradeInfo();
 			CHECK(tradeInfo.buy_trades == ii);
 			CHECK(tradeInfo.sell_trades == 0);
@@ -356,7 +356,7 @@ TEST_CASE("testing the normal position") {
 		CHECK(info.balance == Approx(2003));
 		CHECK(info.inventoryPnL == Approx(1.5));
 		CHECK(info.leverage == Approx(0.0506361));
-		CHECK(info.tradingPnL == Approx(3));
+		CHECK(info.realizedPnL == Approx(3));
 		TradeInfo& tradeInfo = pos.getTradeInfo();
 		CHECK(tradeInfo.sell_trades == 1);
 		CHECK(tradeInfo.buy_trades == 3);
@@ -379,7 +379,7 @@ TEST_CASE("testing the inverse position") {
 		CHECK(info.balance == Approx(0.1));
 		CHECK(info.inventoryPnL == Approx(0.0));
 		CHECK(info.leverage == Approx(0.0));
-		CHECK(info.tradingPnL == Approx(0.0));
+		CHECK(info.realizedPnL == Approx(0.0));
 		CHECK(tradeInfo.buy_trades == Approx(0.0));
 		CHECK(tradeInfo.sell_trades == Approx(0.0));
 		CHECK(tradeInfo.buy_amount == Approx(0.0));
@@ -403,7 +403,7 @@ TEST_CASE("testing the inverse position") {
 		CHECK(info.balance == Approx(0.1));
 		CHECK(info.inventoryPnL == Approx(0.000147783));
 		CHECK(info.leverage == Approx(0.09837678));
-		CHECK(info.tradingPnL == Approx(0.0));
+		CHECK(info.realizedPnL == Approx(0.0));
 		TradeInfo& tradeInfo = pos.getTradeInfo();
 		CHECK(tradeInfo.buy_trades == 1);
         CHECK(tradeInfo.sell_trades == 0);
@@ -428,7 +428,7 @@ TEST_CASE("testing the inverse position") {
 			CHECK(info.averagePrice == Approx(1000.0));
 			CHECK(info.balance == Approx(0.1));
 			CHECK(info.inventoryPnL == Approx(0.000147783 * ii));
-			CHECK(info.tradingPnL == Approx(0.0));
+			CHECK(info.realizedPnL == Approx(0.0));
 			TradeInfo& tradeInfo = pos.getTradeInfo();
 			CHECK(tradeInfo.buy_trades == ii);
 			CHECK(tradeInfo.sell_trades == 0);
@@ -452,7 +452,7 @@ TEST_CASE("testing the inverse position") {
 		CHECK(info.balance == Approx(0.10022167));
 		CHECK(info.inventoryPnL == Approx(0.000147783 * 1.5));
 		CHECK(info.leverage == Approx(0.14713094));
-		CHECK(info.tradingPnL == Approx(0.0002216487));
+		CHECK(info.realizedPnL == Approx(0.0002216487));
 		TradeInfo& tradeInfo = pos.getTradeInfo();
 		CHECK(tradeInfo.sell_trades == 1);
 		CHECK(tradeInfo.buy_trades == 3);
@@ -477,7 +477,7 @@ TEST_CASE("testing the inverse position") {
 			CHECK(info.averagePrice == Approx(1000.0));
 			CHECK(info.balance == Approx(0.1));
 			CHECK(info.inventoryPnL == Approx(-0.000147783 * ii));
-			CHECK(info.tradingPnL == Approx(0.0));
+			CHECK(info.realizedPnL == Approx(0.0));
 			TradeInfo& tradeInfo = pos.getTradeInfo();
 			CHECK(tradeInfo.sell_trades == ii);
 			CHECK(tradeInfo.buy_trades == 0);
@@ -501,7 +501,7 @@ TEST_CASE("testing the inverse position") {
 		CHECK(info.balance == Approx(0.099778325));
 		CHECK(info.inventoryPnL == Approx(-0.000147783 * 1.5));
 		CHECK(info.leverage == Approx(-0.1484413656));
-		CHECK(info.tradingPnL == Approx(-0.00022167487));
+		CHECK(info.realizedPnL == Approx(-0.00022167487));
 	}
 
 	SUBCASE("Equal buy and sell order") {
@@ -520,7 +520,7 @@ TEST_CASE("testing the inverse position") {
 			CHECK(info.balance == Approx(0.1));
 			CHECK(info.inventoryPnL == Approx(0.000147783));
 			CHECK(info.leverage == Approx(0.09837678));
-			CHECK(info.tradingPnL == Approx(0.0));
+			CHECK(info.realizedPnL == Approx(0.0));
 		}
 
 		Order order;
@@ -537,7 +537,7 @@ TEST_CASE("testing the inverse position") {
 		CHECK(info.balance == Approx(0.10014778325));
 		CHECK(info.inventoryPnL == Approx(0));
 		CHECK(info.leverage == Approx(0));
-		CHECK(info.tradingPnL == Approx(0.00014778325));
+		CHECK(info.realizedPnL == Approx(0.00014778325));
 	}
 
 	SUBCASE("Equal sell and buy order") {
@@ -556,7 +556,7 @@ TEST_CASE("testing the inverse position") {
 			CHECK(info.balance == Approx(0.1));
 			CHECK(info.inventoryPnL == Approx(0));
 			CHECK(info.leverage == Approx(-0.09852216748768472));
-			CHECK(info.tradingPnL == Approx(0.0));
+			CHECK(info.realizedPnL == Approx(0.0));
 		}
 
 		Order order;
@@ -573,7 +573,7 @@ TEST_CASE("testing the inverse position") {
 		CHECK(info.balance == Approx(0.10014778325));
 		CHECK(info.inventoryPnL == Approx(0));
 		CHECK(info.leverage == Approx(0));
-		CHECK(info.tradingPnL == Approx(0.00014778325));
+		CHECK(info.realizedPnL == Approx(0.00014778325));
 	}
 
 	SUBCASE("Buy more than initial sell order") {
@@ -592,7 +592,7 @@ TEST_CASE("testing the inverse position") {
 			CHECK(info.balance == Approx(0.1));
 			CHECK(info.inventoryPnL == Approx(0));
 			CHECK(info.leverage == Approx(-0.09852216748768472));
-			CHECK(info.tradingPnL == Approx(0.0));
+			CHECK(info.realizedPnL == Approx(0.0));
 		}
 
 		Order order;
@@ -609,7 +609,7 @@ TEST_CASE("testing the inverse position") {
 		CHECK(info.balance == Approx(0.10014778325));
 		CHECK(info.inventoryPnL == Approx(0.0001477832));
 		CHECK(info.leverage == Approx(0.09823182));
-		CHECK(info.tradingPnL == Approx(0.00014778325));
+		CHECK(info.realizedPnL == Approx(0.00014778325));
 	}
 }
 

@@ -46,9 +46,9 @@ namespace RLTrader {
             throw std::runtime_error("Unimplemented");
         }
 
-        void quote(std::string order_id, OrderSide side, const double& price, const double& amount) override;
+        void quote(const std::string& order_id, OrderSide side, double price, double amount) override;
 
-        void market(std::string order_id, OrderSide side, const double& price, const double& amount, bool is_hedge) override;
+        void market(const std::string& order_id, OrderSide side, double price, double amount, bool is_hedge) override;
 
     private:
         void set_callbacks();
@@ -68,7 +68,6 @@ namespace RLTrader {
         std::string hedge_symbol;
         std::mutex fill_mutex;
 	std::unordered_set<std::string> processed_trades;
-        std::atomic<long> orders_count;
     };
 
 } // RLTrader

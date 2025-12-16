@@ -47,13 +47,14 @@ namespace RLTrader {
 
          std::vector<Order> getUnackedOrders() const override;
 
-         void quote(std::string order_id, OrderSide side, const double& price, const double& amount) override;
+         void quote(const std::string& order_id, OrderSide side, double price, double amount) override;
 
-         void market(std::string order_id, OrderSide side, const double& price, const double& amount, bool hedge) override;
+         void market(const std::string& order_id, OrderSide side, double price, double amount, bool hedge) override;
 
     private:
         CsvReader dataReader; // reader
         long delay;           // Delay to process timed buffer  
+        long long current_timestamp;  // Cache current timestamp to avoid iterator state issues
         std::map<std::string, Order> bid_quotes;  // Active buy orders
         std::map<std::string, Order> ask_quotes;  // Active sell orders
         std::vector<Order> executions;       // Executed orders

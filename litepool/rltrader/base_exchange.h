@@ -39,8 +39,8 @@ namespace RLTrader {
 
         [[nodiscard]] virtual std::vector<Order> getUnackedOrders() const = 0;
 
-        virtual void quote(std::string order_id, OrderSide side, const double& price, const double& amount) = 0;
+        virtual void quote(const std::string& order_id, OrderSide side, double price, double amount) = 0;
 
-        virtual void market(std::string order_id, OrderSide side, const double& price, const double& amount, bool hedge) = 0;
+        virtual void market(const std::string& order_id, OrderSide side, double price, double amount, bool hedge) = 0;
     };
 }

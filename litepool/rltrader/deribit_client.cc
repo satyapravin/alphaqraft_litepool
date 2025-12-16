@@ -87,16 +87,10 @@ void DeribitClient::stop() {
     }
 
     if (market_timer_) {
-        market_timer_->cancel(ec);
-        if (ec && ec != boost::asio::error::operation_aborted) {
-            std::cerr << "Market timer cancel error: " << ec.message() << std::endl;
-        }
+        market_timer_->cancel();
     }
     if (trading_timer_) {
-        trading_timer_->cancel(ec);
-        if (ec && ec != boost::asio::error::operation_aborted) {
-            std::cerr << "Trading timer cancel error: " << ec.message() << std::endl;
-        }
+        trading_timer_->cancel();
     }
 
     if (market_work_) {

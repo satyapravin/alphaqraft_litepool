@@ -16,10 +16,8 @@
 #define LITEPOOL_RLTRADER_RLTRADER_LITEPOOL_H_
 
 #include <memory>
-#include <deque>
 #include <vector>
 #include <algorithm>
-#include <iostream>
 #include <tuple>
 #include "litepool/core/async_litepool.h"
 #include "litepool/core/env.h"
@@ -53,29 +51,38 @@ class RlTraderEnvFns {
                     "foldername"_.Bind(std::string("./train_files/")),
                     "balance"_.Bind(1.0),
                     "start"_.Bind<int>(0),
-                    "max"_.Bind<int>(72000));
+                    "max"_.Bind<int>(72000),
+                    "ticks_per_step"_.Bind<int>(5));  // Advance 5 ticks per RL step
   }
 
   template <typename Config>
   static decltype(auto) StateSpec(const Config& conf) {
-    return MakeDict("obs"_.Bind(Spec<double>({242*2})),
+    return MakeDict("obs"_.Bind(Spec<double>({16})),  // 13 market signals + 3 AMM flow signals
                     "info:mid_price"_.Bind(Spec<double>({-1})),
                     "info:balance"_.Bind(Spec<double>({-1})),
                     "info:unrealized_pnl"_.Bind(Spec<double>({-1})),
                     "info:realized_pnl"_.Bind(Spec<double>({-1})),
                     "info:leverage"_.Bind(Spec<double>({-1})),
                     "info:trade_count"_.Bind(Spec<double>({-1})),
-                    "info:inventory_drawdown"_.Bind(Spec<double>({-1})),
                     "info:drawdown"_.Bind(Spec<double>({-1})),
                     "info:fees"_.Bind((Spec<double>({-1}))),
                     "info:mid_diff"_.Bind((Spec<double>({-1}))),
-                    "info:done"_.Bind((Spec<bool>({-1}))));
+                    "info:done"_.Bind((Spec<bool>({-1}))),
+                    "info:net_position_usd"_.Bind(Spec<double>({-1})),
+                    "info:net_amount_btc"_.Bind(Spec<double>({-1})),
+                    // Terminal info from completed episode (available after auto-reset)
+                    "info:final_realized_pnl"_.Bind(Spec<double>({-1})),
+                    "info:final_unrealized_pnl"_.Bind(Spec<double>({-1})),
+                    "info:final_trade_count"_.Bind(Spec<double>({-1})),
+                    "info:final_fees"_.Bind(Spec<double>({-1})),
+                    "info:final_net_amount_btc"_.Bind(Spec<double>({-1})));
   }
 
   template <typename Config>
   static decltype(auto) ActionSpec(const Config& conf) {
-    return MakeDict("action"_.Bind(Spec<float>({5}, {{ -1., -1., -1., -1., -1. },
-				                     {  1.,  1.,  1.,  1.,  1. }})));
+    // Simplified 4-action space: spread, size, skew, should_requote
+    return MakeDict("action"_.Bind(Spec<float>({4}, {{ -1., -1., -1., -1. },
+                                                     {  1.,  1.,  1.,  1. }})));
   }
 };
 
@@ -100,10 +107,32 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   double balance = 0;
   int start_read = 0;
   int max_read = 0;
+  int ticks_per_step = 5;
   long long steps = 0;
-  double previous_reward = 0;
-  double max_reward = 0;
-  double max_drawdown = 0;
+  
+  // Reward tracking
+  double prev_realized_pnl = 0.0;
+  double prev_unrealized_from_anchor = 0.0;
+  double price_anchor_ma = 0.0;  // Rolling MA of price (slow-moving "fair value")
+  bool price_anchor_initialized = false;
+  double prev_trade_count = 0.0;  // Track trades for bonus
+  double initial_balance_ = 0.0; // Store initial balance for consistent reward scaling
+  
+  // Reward hyperparameters
+  static constexpr double PRICE_MA_ALPHA = 0.002;     // Slow MA: ~500 step half-life
+  static constexpr double TRADE_BONUS = 0.05;         // Bonus per trade
+  static constexpr double REQUOTE_PENALTY = 0.0001;   // Very small penalty for RL-chosen requotes that don't lead to trades
+  // Note: No inventory penalty - skew action + auto-skew handle inventory management
+  
+  // Terminal info cache (stores metrics before reset for episode logging)
+  std::unordered_map<std::string, double> terminal_info_;
+  bool has_terminal_info_ = false;
+  
+  // Track fills from previous step to force requote if orders were filled
+  bool had_fills_prev_step_ = false;
+  
+  // Track if RL chose to requote (not forced by auto-requote logic) for penalty
+  bool rl_chose_requote_ = false;
 
   std::unique_ptr<RLTrader::BaseInstrument> instr_ptr;
   std::unique_ptr<RLTrader::BaseExchange> exchange_ptr;
@@ -124,7 +153,8 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
                                               foldername(spec.config["foldername"_]),
                                               balance(spec.config["balance"_]),
                                               start_read(spec.config["start"_]),
-                                              max_read(spec.config["max"_])
+                                              max_read(spec.config["max"_]),
+                                              ticks_per_step(spec.config["ticks_per_step"_])
   {
 
     RLTrader::BaseInstrument* instr_raw_ptr = nullptr;
@@ -143,46 +173,100 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     } else {
       int idx = env_id % 64;
       std::string filename = foldername + std::to_string(idx + 1) + ".csv";
-      std::cout << filename << std::endl;
       exch_raw_ptr = new RLTrader::SimExchange(filename, 250, start_read, max_read);
     }
 
     instr_ptr.reset(instr_raw_ptr);
     exchange_ptr.reset(exch_raw_ptr);
-    strategy_ptr = std::make_unique<RLTrader::Strategy>(*instr_ptr, *exchange_ptr, balance, 20);
-    adaptor_ptr = std::make_unique<RLTrader::EnvAdaptor>(*strategy_ptr, *exchange_ptr);
+    RLTrader::StrategyConfig config;  // Use default config
+    config.base_spread_bps = 0.0;  // 0 bps base spread - will use minimum 1 tick spread
+    config.min_size_pct = 0.5;     // Minimum order size: 0.5% (50 bps) of balance
+    config.max_size_pct = 2.0;     // Maximum order size: 2% of balance
+    strategy_ptr = std::make_unique<RLTrader::Strategy>(*instr_ptr, *exchange_ptr, balance, 20, config);
+    adaptor_ptr = std::make_unique<RLTrader::EnvAdaptor>(*strategy_ptr, *exchange_ptr, ticks_per_step);
   }
 
   void Reset() override {
-    previous_reward = 0.0;
-    max_drawdown = 0.0;
-    max_reward = 0.0;
+    prev_realized_pnl = 0.0;
+    prev_unrealized_from_anchor = 0.0;
+    price_anchor_ma = 0.0;
+    price_anchor_initialized = false;
+    prev_trade_count = 0.0;
+    initial_balance_ = balance;  // Store initial balance for consistent reward scaling
     steps = 0;
+    had_fills_prev_step_ = false;  // Reset fill tracking
+    rl_chose_requote_ = false;     // Reset requote tracking
     adaptor_ptr->reset();
     isDone = false;
+    // Note: Don't clear terminal_info_ here - it gets cleared after WriteState uses it
     WriteState();
   }
 
   void Step(const Action& action_dict) override { 
-      double bid_spread = static_cast<double>(action_dict["action"_][0]);
-      double ask_spread = static_cast<double>(action_dict["action"_][1]);
-      double bid_size   = static_cast<double>(action_dict["action"_][2]);
-      double ask_size   = static_cast<double>(action_dict["action"_][3]);
-      double target_inv = static_cast<double>(action_dict["action"_][4]);
-      adaptor_ptr->quote(bid_spread, ask_spread, bid_size, ask_size, target_inv);
+      RLTrader::RLAction action;
+      // Simplified 4-action space
+      action.spread         = static_cast<double>(action_dict["action"_][0]);
+      action.size           = static_cast<double>(action_dict["action"_][1]);
+      action.skew           = static_cast<double>(action_dict["action"_][2]);
+      action.should_requote = static_cast<double>(action_dict["action"_][3]);
+      
+      // Force requote on first step (steps == 0) to place initial orders
+      // After reset, there are no orders, so we must requote to place them
+      if (steps == 0) {
+          action.should_requote = 1.0;  // Force requote on first step
+      }
+      
+      // Auto-requote if:
+      // 1. No active orders in the market (orders were cancelled or never placed)
+      // 2. Previous step had fills (orders were executed, need to replace them)
+      bool has_active_orders = !exchange_ptr->getBidOrders().empty() || 
+                               !exchange_ptr->getAskOrders().empty();
+      bool forced_requote = (steps == 0) || !has_active_orders || had_fills_prev_step_;
+      if (forced_requote) {
+          action.should_requote = 1.0;  // Force requote
+      }
+      
+      // Track if RL chose to requote (not forced) for penalty
+      rl_chose_requote_ = !forced_requote && (action.should_requote > 0.0);
+      
+      // Only requote if should_requote > 0, otherwise continue with existing quotes
+      if (action.should_requote > 0.0) {
+          adaptor_ptr->quote(action);
+      }
+      
+      // Check for fills BEFORE next() processes them (getFills() clears them)
+      // This tells us if there were fills from orders placed in previous steps
+      auto fills_before_next = exchange_ptr->getFills();
+      bool had_fills_this_step = !fills_before_next.empty();
+      
+      // Process fills manually (same logic as strategy.next())
+      // Note: adaptor_ptr->next() will call strategy.next() which calls getFills() again,
+      // but since we already consumed them, it will get empty fills (which is fine)
+      for (const auto& fill_order : fills_before_next) {
+          strategy_ptr->getPosition().onFill(fill_order);
+      }
+      
+      // Process time advancement and state updates
       isDone = !adaptor_ptr->next();
       ++steps;
+      
+      // Store fills info for next step's requote decision
+      had_fills_prev_step_ = had_fills_this_step;
+      
+      // Cache terminal info BEFORE reset can happen
+      // This info will be exposed as final_info:* when done=true
+      if (isDone) {
+          adaptor_ptr->getInfo(terminal_info_);
+          has_terminal_info_ = true;
+      }
+      
       WriteState();
   }
 
   void WriteState() {
-    std::array<double, 242*2> data;
+    std::array<double, RLTrader::OBS_DIM> data;
     adaptor_ptr->getState(data);
     State state = Allocate(1);
-
-    if (!isDone) {
-      assert(data.size() == 242*2);
-    }
     
     std::unordered_map<std::string, double> info;
     adaptor_ptr->getInfo(info);
@@ -196,22 +280,78 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     state["info:fees"_] = info["fees"];
     state["info:mid_diff"_] = info["mid_diff"];
     state["info:done"_] = isDone;
-    auto current_reward = info["realized_pnl"] + info["unrealized_pnl"] - info["fees"];
-    auto net_reward = current_reward - previous_reward;
-    if (net_reward > max_reward) max_reward = net_reward;
-    auto drawdown = net_reward - max_reward;
-
-    if (drawdown < max_drawdown) max_drawdown = drawdown;
-
-    if (steps % 64 == 0) {
-	state["reward"_] = net_reward + 0.1 * max_drawdown;
-        state["reward"_] *= 10000.0;
-        previous_reward = current_reward;
-	max_reward = 0.0;
-	max_drawdown = 0.0;
+    state["info:net_position_usd"_] = info["net_position_usd"];
+    state["info:net_amount_btc"_] = info["net_amount_btc"];
+    
+    // Expose terminal info from completed episode (for episode logging)
+    // This is populated when isDone becomes true, before auto-reset
+    if (has_terminal_info_) {
+        state["info:final_realized_pnl"_] = terminal_info_["realized_pnl"];
+        state["info:final_unrealized_pnl"_] = terminal_info_["unrealized_pnl"];
+        state["info:final_trade_count"_] = terminal_info_["trade_count"];
+        state["info:final_fees"_] = terminal_info_["fees"];
+        state["info:final_net_amount_btc"_] = terminal_info_["net_amount_btc"];
+        // Clear after use (will be repopulated when next episode ends)
+        has_terminal_info_ = false;
+        terminal_info_.clear();
     } else {
-	state["reward"_] = info["leverage"] * (info["mid_price"] - info["average_price"]) / (1.0 + info["mid_price"]);
+        state["info:final_realized_pnl"_] = 0.0;
+        state["info:final_unrealized_pnl"_] = 0.0;
+        state["info:final_trade_count"_] = 0.0;
+        state["info:final_fees"_] = 0.0;
+        state["info:final_net_amount_btc"_] = 0.0;
     }
+    
+    // === Reward Calculation with Rolling MA Anchor ===
+    double mid_price = info["mid_price"];
+    double leverage = info["leverage"];
+    
+    // 1. Initialize or update price anchor (slow-moving MA = "fair value")
+    if (!price_anchor_initialized && mid_price > 0) {
+        price_anchor_ma = mid_price;
+        price_anchor_initialized = true;
+    } else if (mid_price > 0) {
+        price_anchor_ma = PRICE_MA_ALPHA * mid_price + (1.0 - PRICE_MA_ALPHA) * price_anchor_ma;
+    }
+    
+    // 2. Realized PnL delta (clean, from closed trades)
+    double realized_delta = info["realized_pnl"] - prev_realized_pnl;
+    prev_realized_pnl = info["realized_pnl"];
+    
+    // 3. Unrealized PnL relative to rolling anchor (using INITIAL balance for consistent scaling)
+    //    U = leverage * initial_balance * (price - anchor) / anchor
+    //    Since leverage ≈ position_value / initial_balance, this gives:
+    //    U ≈ position_value * price_deviation (consistent units)
+    //    - Long (leverage > 0) when price > anchor → positive reward
+    //    - Short (leverage < 0) when price < anchor → positive reward
+    double unrealized_from_anchor = 0.0;
+    if (price_anchor_ma > 0 && initial_balance_ > 0) {
+        double price_deviation = (mid_price - price_anchor_ma) / price_anchor_ma;
+        unrealized_from_anchor = leverage * initial_balance_ * price_deviation;
+    }
+    double unrealized_delta = unrealized_from_anchor - prev_unrealized_from_anchor;
+    prev_unrealized_from_anchor = unrealized_from_anchor;
+    
+    // 4. Trade bonus (encourages market participation)
+    double trade_bonus = 0.0;
+    double current_trade_count = info["trade_count"];
+    bool had_trades_this_step = (current_trade_count > prev_trade_count);
+    if (had_trades_this_step) {
+        trade_bonus = TRADE_BONUS * (current_trade_count - prev_trade_count);
+    }
+    prev_trade_count = current_trade_count;
+    
+    // 5. Requote penalty (only penalize if requote didn't lead to trades)
+    // If trades happened, the requote was justified - no penalty
+    double requote_penalty = (rl_chose_requote_ && !had_trades_this_step) ? REQUOTE_PENALTY : 0.0;
+    
+    // Total reward: profit from trades + mark-to-anchor gains + trade bonus - requote penalty
+    // No inventory penalty - skew action + auto-skew in strategy handle inventory management
+    double reward = realized_delta + unrealized_delta + trade_bonus - requote_penalty;
+    state["reward"_] = reward;
+    
+    // Reset requote flag for next step
+    rl_chose_requote_ = false;
     state["obs"_].Assign(data.begin(), data.size());
   }
 

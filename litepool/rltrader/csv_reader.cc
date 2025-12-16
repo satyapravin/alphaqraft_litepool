@@ -14,6 +14,8 @@ bool CsvReader::hasNext() {
     bool retval = this->iterator.hasNext();
     if (!retval) {
         if (more_data) {
+            // Continue reading sequentially from current file position
+            // (start_line parameter is ignored when headers already exist)
             this->readCSV(0);
             this->iterator.populate(&rows);
             return this->iterator.hasNext();
@@ -63,7 +65,6 @@ void CsvReader::reset() {
     this->filestream.open(filename, std::ios::in);
     this->readCSV(start_line);
     this->iterator.populate(&rows);
-    this->iterator.next();
 }
 
 void CsvReader::readCSV(int start_line) {
@@ -99,39 +100,39 @@ void CsvReader::readCSV(int start_line) {
 
         rows.clear();
         int num_lines = 0;
-while (std::getline(filestream, line)) {
-    ++num_reads;
-    std::istringstream lineStream(line);
-    std::string cell;
+        while (std::getline(filestream, line)) {
+            ++num_reads;
+            std::istringstream lineStream(line);
+            std::string cell;
 
-    if (!std::getline(lineStream, cell, ',')) {
-        continue;  // Skip malformed lines
-    }
+            if (!std::getline(lineStream, cell, ',')) {
+                continue;  // Skip malformed lines
+            }
 
-    long long id = std::stoll(cell);
-    std::vector<double> values = parseLineToDoubles(line);
+            long long id = std::stoll(cell);
+            std::vector<double> values = parseLineToDoubles(line);
 
-    if (values.size() != headers.size()) {
-        LOG(WARNING) << "Skipping malformed line: " << line;
-        continue;  // Skip malformed lines
-    }
+            if (values.size() != headers.size()) {
+                LOG(WARNING) << "Skipping malformed line: " << line;
+                continue;  // Skip malformed lines
+            }
 
-    std::unordered_map<std::string, double> data;
-    for (size_t i = 0; i < values.size(); ++i) {
-        data[headers[i]] = values[i];
-    }
+            std::unordered_map<std::string, double> data;
+            for (size_t i = 0; i < values.size(); ++i) {
+                data[headers[i]] = values[i];
+            }
 
-    rows.emplace_back(id, data);  // Crash occurs here
+            rows.emplace_back(id, data);
 
-    if (++num_lines >= 2500) {
-        batch_read = true;
-        break;
-    }
+            if (++num_lines >= 2500) {
+                batch_read = true;
+                break;
+            }
 
-    if (num_reads > max_read) {
-        break;
-    }
-}
+            if (num_reads > max_read) {
+                break;
+            }
+        }
 
         if (!batch_read) {
             more_data = false;
