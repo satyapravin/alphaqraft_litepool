@@ -85,7 +85,10 @@ void CsvReader::readCSV(int start_line) {
 
             std::istringstream headerStream(line);
             std::string header;
-            std::getline(headerStream, header, ','); // Skip the first header (ID)
+            std::getline(headerStream, header, ','); // Skip exchange
+            std::getline(headerStream, header, ','); // Skip symbol
+            std::getline(headerStream, header, ','); // Skip timestamp (will be used as ID)
+            std::getline(headerStream, header, ','); // Skip local_timestamp
 
             while (std::getline(headerStream, header, ',')) {
                 headers.push_back(header);
@@ -105,11 +108,23 @@ void CsvReader::readCSV(int start_line) {
             std::istringstream lineStream(line);
             std::string cell;
 
+            // Skip exchange (1st column)
+            if (!std::getline(lineStream, cell, ',')) {
+                continue;  // Skip malformed lines
+            }
+            
+            // Skip symbol (2nd column)
             if (!std::getline(lineStream, cell, ',')) {
                 continue;  // Skip malformed lines
             }
 
+            // Use timestamp (3rd column) as ID
+            if (!std::getline(lineStream, cell, ',')) {
+                continue;  // Skip malformed lines
+            }
             long long id = std::stoll(cell);
+            
+            // Skip local_timestamp (4th column) in parseLineToDoubles
             std::vector<double> values = parseLineToDoubles(line);
 
             if (values.size() != headers.size()) {
@@ -147,7 +162,10 @@ std::vector<double> CsvReader::parseLineToDoubles(const std::string& line) {
     std::istringstream stream(line);
     std::string cell;
     std::vector<double> results;
-    std::getline(stream, cell, ','); // Skip the first token (ID)
+    std::getline(stream, cell, ','); // Skip exchange
+    std::getline(stream, cell, ','); // Skip symbol
+    std::getline(stream, cell, ','); // Skip timestamp
+    std::getline(stream, cell, ','); // Skip local_timestamp
 
     while (std::getline(stream, cell, ',')) {
         results.push_back(std::stod(cell));

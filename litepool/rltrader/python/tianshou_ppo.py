@@ -1,10 +1,12 @@
 """
 Simple PPO training for GLFT market making.
-- 13-signal observations
-- 7-action outputs: 6 continuous quote parameters + 1 binary requote decision
-  * Actions 0-5: bid_spread, ask_spread, bid_size, ask_size, target_inventory, skew
-  * Action 6: should_requote (binary decision: >0 = requote, <=0 = continue)
+- 16-signal observations (13 market signals + 3 AMM flow signals)
+- 5-action outputs: 4 continuous quote parameters + 1 binary requote decision
+  * Actions 0-3: bid_spread, ask_spread, skew, target_inventory (continuous)
+  * Action 4: should_requote (binary decision: >0 = requote, <=0 = continue)
+- Order size uses min_size_pct by default (no RL control)
 - Separate policy heads: Normal distribution for quotes, Bernoulli for requote
+- Target inventory is smoothed with EMA to prevent flickering
 - CPU-friendly, no recurrence, no OT
 """
 import numpy as np
@@ -15,7 +17,6 @@ import litepool
 from simple_actor_critic import SimpleActorCritic
 from simple_ppo_policy import SimplePPOPolicy
 from simple_collector import SimpleCollector
-from vec_normalizer import VecNormalize
 from goal_manager import NetPnlGoalManager
 from metric_logger import MetricLogger
 
@@ -23,16 +24,19 @@ from metric_logger import MetricLogger
 device = torch.device("cpu")
 print(f"Using device: {device}")
 
-# === Configuration ===
-NUM_ENVS = 6           # Match number of training data files
-NUM_THREADS = 6        # Leave cores for main process (10 cores total)
-N_STEPS = 4096         # Steps per rollout (increased from 1024 for more stable training)
-UPDATE_EPOCHS = 10     # PPO epochs per update
+# === Configuration ===s
+NUM_ENVS = 3           # Match number of training data files
+NUM_THREADS = 3        # Leave cores for main process (10 cores total)
+N_STEPS = 2048         # Steps per rollout
+UPDATE_EPOCHS = 5      # PPO epochs per update
 MINIBATCH_SIZE = 256   # Minibatch size for updates
 TOTAL_EPOCHS = 10000   # Total training epochs
 LEARNING_RATE = 1e-4
-GAMMA = 0.997  # ~300 step horizon for 3-5 minute trading (was 0.99 = 100 steps)
+GAMMA = 0.997  # ~333 step effective horizon (~3 minutes at 500ms/step) - balances immediate vs long-term rewards
 GAE_LAMBDA = 0.95
+BASE_SPREAD_BPS = 1.0  # Base spread in basis points (2 bps = $20 on $100k BTC - reasonable for crypto)
+MIN_SIZE_PCT = 1.0      # Minimum order size as % of balance (must match env config)
+MAX_SIZE_PCT = 5.0     # Maximum order size as % of balance (must match env config)
 
 # === Environment setup ===
 print("Creating environment...")
@@ -50,27 +54,23 @@ env = litepool.make(
     hedge_symbol="BTC_USDC-18APR25",
     tick_size=0.5,
     min_amount=0.0001,
-    maker_fee=0,
+    maker_fee=-0.000025,
     taker_fee=0.0005,
     foldername="/home/pravin/dev/alphaqraft_litepool/data/training/",
     balance=100000.0,  # Starting capital: $100,000 USD
                        # With BTC ~$100k, 2% of $100k = $2,000 = ~0.02 BTC per order
     start=1,
-    max=20480,  # Match rollout: 20480 ticks / 5 = 4096 RL steps = N_STEPS
+    max=36000,  # 1-hour episodes: 36000 ticks / 5 = 7200 RL steps (episodes span ~3.5 rollouts)
+    base_spread_bps=BASE_SPREAD_BPS,  # Base spread in basis points
+    min_size_pct=MIN_SIZE_PCT,        # Minimum order size as % of balance
+    max_size_pct=MAX_SIZE_PCT,        # Maximum order size as % of balance
 )
 env.spec.id = "RlTrader-v0"
 
-# Observation normalization
-env = VecNormalize(
-    env,
-    device=device,
-    num_envs=NUM_ENVS,
-    norm_obs=True,
-    norm_reward=False,
-    clip_obs=10.0,
-    clip_reward=10.0,
-    gamma=GAMMA,
-)
+# All observation signals are already bounded to [-1, 1]:
+# - Market signals (13): all use tanh or are bounded by construction
+# - AMM signals (3): all clamped or bounded to [-1, 1]
+# No normalization needed!
 
 # === Model setup ===
 print("Creating model...")
@@ -78,12 +78,13 @@ torch.manual_seed(42)
 np.random.seed(42)
 
 # Model with separate heads:
-# - Continuous head (Normal): 6 quote parameters
+# - Continuous head (Normal): 4 quote parameters (bid_spread, ask_spread, skew, target_inventory)
 # - Binary head (Bernoulli): 1 requote decision
+# - 3 hidden layers with LayerNorm for stable training
 model = SimpleActorCritic(
     obs_dim=16,  # 13 market signals + 3 AMM flow signals
-    action_dim=4,  # 3 quote params (spread, size, skew) + 1 requote decision
-    hidden_dim=64,
+    action_dim=5,  # 4 quote params (bid_spread, ask_spread, skew, target_inventory) + 1 requote decision
+    hidden_dim=128,  # Increased from 64 for better representation of market dynamics
 )
 print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -94,12 +95,14 @@ policy = SimplePPOPolicy(
     gamma=GAMMA,
     gae_lambda=GAE_LAMBDA,
     clip_eps=0.2,
-    vf_coef=0.5,
-    ent_coef=0.01,  # Reduced - log_std is clamped now to prevent entropy explosion
+    vf_coef=0.1,  # Reduced from 0.5 - value loss was dominating (2748+), this should help balance
+    ent_coef=0.05,  # Reduced - log_std is clamped now to prevent entropy explosion
     max_grad_norm=1.0,  # Increased for stability
 )
 
-REWARD_SCALE = 1000.0  # Scale up tiny rewards (~0.0001) to meaningful magnitude
+REWARD_SCALE = 100.0  # Reduced from 1000.0 - value loss was too high (64k-138k)
+                      # With GAMMA=0.997 over 4096 steps, returns accumulate quickly
+                      # Lower scale makes value function easier to learn while preserving gradients
 
 collector = SimpleCollector(
     env=env,
@@ -129,8 +132,7 @@ def save_checkpoint(epoch, global_step):
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': policy.optimizer.state_dict(),
     }, checkpoint_dir / "checkpoint.pth")
-    # Save reward normalization stats
-    env.save(results_dir / "vecnorm.pth")
+    # Note: VecNormalize removed - all signals are already bounded to [-1, 1] in C++
 
 
 def load_checkpoint():
@@ -141,10 +143,7 @@ def load_checkpoint():
     checkpoint = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     policy.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    # Load reward normalization stats
-    vecnorm_path = results_dir / "vecnorm.pth"
-    if vecnorm_path.exists():
-        env.load(vecnorm_path)
+    # Note: VecNormalize removed - all signals are already bounded to [-1, 1] in C++
     return checkpoint['epoch'], checkpoint['global_step']
 
 
@@ -211,27 +210,34 @@ def train():
         
         # Diagnostic: Check requote decisions and PnL
         actions_np = batch['actions'].detach().cpu().numpy()
-        requote_actions = actions_np[:, 3]  # Last action (index 3) is requote decision
+        requote_actions = actions_np[:, 4]  # Last action (index 4) is requote decision
         requote_rate = (requote_actions > 0).mean()  # Fraction of steps that requoted
         
         # Check quote parameter statistics (only when requoting)
-        requote_mask = actions_np[:, 3] > 0
+        requote_mask = actions_np[:, 4] > 0
         if requote_mask.sum() > 0:
-            quote_actions = actions_np[requote_mask, :3]  # First 3 actions: spread, size, skew
-            avg_spread = quote_actions[:, 0].mean()
-            avg_size = quote_actions[:, 1].mean()
+            quote_actions = actions_np[requote_mask, :4]  # First 4 actions: bid_spread, ask_spread, skew, target_inventory
+            avg_bid_spread = quote_actions[:, 0].mean()
+            avg_ask_spread = quote_actions[:, 1].mean()
             avg_skew = quote_actions[:, 2].mean()
+            avg_target_inv = quote_actions[:, 3].mean()
         else:
-            avg_spread = 0.0
-            avg_size = 0.0
+            avg_bid_spread = 0.0
+            avg_ask_spread = 0.0
             avg_skew = 0.0
+            avg_target_inv = 0.0
         
         # Extract info for diagnostics - average across all environments from last step
         avg_realized_pnl = 0.0
         avg_unrealized_pnl = 0.0
         avg_trade_count = 0.0
+        buy_delta = 0.0
+        sell_delta = 0.0
+        actual_placed_bid_spread_bps = 0.0
+        actual_placed_ask_spread_bps = 0.0
         if batch['infos'] and len(batch['infos']) > 0:
-            # Get last step's info (should have values from all environments)
+            # Get first and last step's info to calculate deltas
+            first_info = batch['infos'][0]
             last_info = batch['infos'][-1]
             
             # Helper to extract and average value across all environments
@@ -257,28 +263,190 @@ def train():
                 
                 return np.mean(values) if values else default
             
+            # Helper to extract values for delta calculation (sum across all envs)
+            def safe_get_sum(info, key, default=0.0):
+                values = []
+                if isinstance(info, list):
+                    # List of environment info dicts
+                    for env_info in info:
+                        if isinstance(env_info, dict):
+                            val = env_info.get(key, default)
+                            if isinstance(val, (list, np.ndarray)) and len(val) > 0:
+                                values.extend([float(v) for v in val])
+                            elif val is not None:
+                                values.append(float(val))
+                elif isinstance(info, dict):
+                    val = info.get(key, default)
+                    if isinstance(val, (list, np.ndarray)) and len(val) > 0:
+                        values = [float(v) for v in val]
+                    elif val is not None:
+                        values = [float(val)]
+                
+                return np.sum(values) if values else default
+            
             avg_realized_pnl = safe_get_avg(last_info, 'realized_pnl', 0.0)
             avg_unrealized_pnl = safe_get_avg(last_info, 'unrealized_pnl', 0.0)
-            avg_trade_count = safe_get_avg(last_info, 'trade_count', 0.0)
+            
+            # Get buy/sell counts to diagnose inventory accumulation
+            def get_counts(info_list, key):
+                """Extract count per environment for a given key."""
+                counts = []
+                if isinstance(info_list, list):
+                    for env_info in info_list:
+                        if isinstance(env_info, dict):
+                            val = env_info.get(key, 0.0)
+                            if isinstance(val, (list, np.ndarray)):
+                                counts.extend([float(v) for v in val])
+                            else:
+                                counts.append(float(val))
+                elif isinstance(info_list, dict):
+                    val = info_list.get(key, 0.0)
+                    if isinstance(val, (list, np.ndarray)):
+                        counts = [float(v) for v in val]
+                    else:
+                        counts = [float(val)]
+                return counts if counts else [0.0]
+            
+            # Handle resets for buy/sell counts (same logic as trade_count)
+            buy_delta = 0.0
+            sell_delta = 0.0
+            first_buys = get_counts(first_info, 'buy_trades')
+            last_buys = get_counts(last_info, 'buy_trades')
+            first_sells = get_counts(first_info, 'sell_trades')
+            last_sells = get_counts(last_info, 'sell_trades')
+            
+            n_envs = max(len(first_buys), len(last_buys))
+            for i in range(n_envs):
+                first_buy = first_buys[i] if i < len(first_buys) else 0.0
+                last_buy = last_buys[i] if i < len(last_buys) else 0.0
+                buy_delta += last_buy if last_buy < first_buy else (last_buy - first_buy)
+                
+                first_sell = first_sells[i] if i < len(first_sells) else 0.0
+                last_sell = last_sells[i] if i < len(last_sells) else 0.0
+                sell_delta += last_sell if last_sell < first_sell else (last_sell - first_sell)
+            
+            # Calculate trade count delta (trades in this batch/epoch)
+            # trade_count is cumulative, but resets to 0 when episode ends
+            # Need to handle per-environment to avoid negative deltas from resets
+            def get_trade_counts(info_list):
+                """Extract trade_count per environment, handling arrays and lists."""
+                counts = []
+                if isinstance(info_list, list):
+                    for env_info in info_list:
+                        if isinstance(env_info, dict):
+                            val = env_info.get('trade_count', 0.0)
+                            if isinstance(val, (list, np.ndarray)):
+                                counts.extend([float(v) for v in val])
+                            else:
+                                counts.append(float(val))
+                elif isinstance(info_list, dict):
+                    val = info_list.get('trade_count', 0.0)
+                    if isinstance(val, (list, np.ndarray)):
+                        counts = [float(v) for v in val]
+                    else:
+                        counts = [float(val)]
+                return counts if counts else [0.0]
+            
+            first_counts = get_trade_counts(first_info)
+            last_counts = get_trade_counts(last_info)
+            
+            # Calculate delta per environment, handling resets (when count decreases)
+            # If last < first, it means a reset happened - count only the new trades
+            total_delta = 0.0
+            n_envs = max(len(first_counts), len(last_counts))
+            for i in range(n_envs):
+                first_val = first_counts[i] if i < len(first_counts) else 0.0
+                last_val = last_counts[i] if i < len(last_counts) else 0.0
+                
+                if last_val >= first_val:
+                    # Normal case: no reset, or reset happened but we're counting new trades
+                    total_delta += (last_val - first_val)
+                else:
+                    # Reset happened: last_val is from new episode, just count it
+                    total_delta += last_val
+            
+            avg_trade_count = total_delta
         
         if avg_reward > best_reward:
             best_reward = avg_reward
             torch.save(model.state_dict(), results_dir / "best_model.pth")
         
         # Calculate actual quote parameters (for diagnostics)
-        # spread: [-1, 1] -> multiplier [0.5, 1.5] on base_spread_bps (0.0 bps, min 1 tick enforced)
-        # size: [-1, 1] -> [min_size_pct, max_size_pct] (0.5% to 2%)
+        # bid_spread/ask_spread: [-1, 1] -> linear mapping to [MIN_SPREAD_MULT, MAX_SPREAD_MULT]
+        # Must match strategy.cc: mid_mult + action * range_mult
+        # size: fixed at MIN_SIZE_PCT (no RL control)
+        MIN_SPREAD_MULT = 0.2  # Must match strategy.h
+        MAX_SPREAD_MULT = 3.0  # Must match strategy.h
+        MID_MULT = (MAX_SPREAD_MULT + MIN_SPREAD_MULT) / 2.0  # 1.6
+        RANGE_MULT = (MAX_SPREAD_MULT - MIN_SPREAD_MULT) / 2.0  # 1.4
+        
         if requote_mask.sum() > 0:
-            quote_actions = actions_np[requote_mask, :3]
-            # Spread: action [-1,1] -> multiplier [0.5, 1.5] -> actual spread = 0.0 bps * multiplier = 0
-            # But code enforces minimum 1 tick spread, so actual will be ~1 tick
-            spread_mult = 1.0 + quote_actions[:, 0].mean() * 0.5
-            actual_spread_bps = 0.0 * spread_mult  # Will be clamped to 1 tick minimum in C++
-            # Size: action [-1,1] -> [0.5%, 2%] of balance
-            size_pct = 0.5 + (1.0 + quote_actions[:, 1].mean()) * 0.5 * (2.0 - 0.5)
+            quote_actions = actions_np[requote_mask, :4]  # bid_spread, ask_spread, skew, target_inventory
+            # Bid spread: linear mapping to match C++ calculation
+            bid_spread_actions = quote_actions[:, 0]
+            bid_spread_mult = MID_MULT + bid_spread_actions * RANGE_MULT  # action [-1,1] → mult [0.2, 3.0]
+            actual_bid_spread_bps = BASE_SPREAD_BPS * bid_spread_mult.mean()
+            
+            # Ask spread: linear mapping
+            ask_spread_actions = quote_actions[:, 1]
+            ask_spread_mult = MID_MULT + ask_spread_actions * RANGE_MULT  # action [-1,1] → mult [0.2, 3.0]
+            actual_ask_spread_bps = BASE_SPREAD_BPS * ask_spread_mult.mean()
+            
+            # Average spread for logging (show bid/ask separately to diagnose)
+            actual_spread_bps = (actual_bid_spread_bps + actual_ask_spread_bps) / 2.0
+            size_pct = MIN_SIZE_PCT  # Fixed at minimum size
         else:
-            actual_spread_bps = 0.0
-            size_pct = 0.0
+            actual_bid_spread_bps = BASE_SPREAD_BPS * MID_MULT
+            actual_ask_spread_bps = BASE_SPREAD_BPS * MID_MULT
+            actual_spread_bps = BASE_SPREAD_BPS * MID_MULT
+            size_pct = MIN_SIZE_PCT
+        
+        # Calculate ACTUAL effective spreads from placed prices (accounts for skew and clamping)
+        # This shows what was actually placed, not just what the action suggested
+        actual_placed_bid_spread_bps = 0.0
+        actual_placed_ask_spread_bps = 0.0
+        if batch['infos'] and len(batch['infos']) > 0:
+            last_info = batch['infos'][-1]
+            mid_prices = []
+            bid_prices = []
+            ask_prices = []
+            
+            def extract_prices(info_list, key):
+                prices = []
+                if isinstance(info_list, list):
+                    for env_info in info_list:
+                        if isinstance(env_info, dict):
+                            val = env_info.get(key, 0.0)
+                            if isinstance(val, (list, np.ndarray)):
+                                prices.extend([float(v) for v in val])
+                            else:
+                                prices.append(float(val))
+                elif isinstance(info_list, dict):
+                    val = info_list.get(key, 0.0)
+                    if isinstance(val, (list, np.ndarray)):
+                        prices = [float(v) for v in val]
+                    else:
+                        prices = [float(val)]
+                return prices
+            
+            mid_prices = extract_prices(last_info, 'last_mid_price')
+            bid_prices = extract_prices(last_info, 'last_bid_price')
+            ask_prices = extract_prices(last_info, 'last_ask_price')
+            
+            # Calculate effective spreads from actual placed prices
+            valid_spreads = []
+            for i in range(min(len(mid_prices), len(bid_prices), len(ask_prices))):
+                mid = mid_prices[i]
+                bid = bid_prices[i]
+                ask = ask_prices[i]
+                if mid > 0 and bid > 0 and ask > 0:
+                    bid_spread_bps = ((mid - bid) / mid) * 10000.0
+                    ask_spread_bps = ((ask - mid) / mid) * 10000.0
+                    valid_spreads.append((bid_spread_bps, ask_spread_bps))
+            
+            if valid_spreads:
+                actual_placed_bid_spread_bps = np.mean([s[0] for s in valid_spreads])
+                actual_placed_ask_spread_bps = np.mean([s[1] for s in valid_spreads])
         
         print(f"Epoch {epoch:5d} | "
               f"Step {global_step:8d} | "
@@ -286,8 +454,9 @@ def train():
               f"ReqRate {requote_rate:.2%} | "
               f"R.PnL {avg_realized_pnl:8.4f} | "
               f"U.PnL {avg_unrealized_pnl:8.4f} | "
-              f"Trades {avg_trade_count:6.0f} | "
-              f"Spread {actual_spread_bps:4.2f}bps | "
+              f"Trades {avg_trade_count:6.0f} (B:{buy_delta:.0f}/S:{sell_delta:.0f}) | "
+              f"BidSprd {actual_bid_spread_bps:4.2f}bps AskSprd {actual_ask_spread_bps:4.2f}bps | "
+              f"Actual: Bid {actual_placed_bid_spread_bps:4.2f}bps Ask {actual_placed_ask_spread_bps:4.2f}bps | "
               f"Size {size_pct:4.2f}% | "
               f"Loss {total_loss/n_updates:7.4f} | "
               f"PL {total_policy_loss/n_updates:7.4f} | "
@@ -334,7 +503,7 @@ def train():
     
     # Final save
     torch.save(model.state_dict(), results_dir / "final_model.pth")
-    env.save(results_dir / "vecnorm.pth")
+    # Note: VecNormalize removed - all signals are already bounded to [-1, 1] in C++
     print(f"Training complete! Best reward: {best_reward:.4f}")
 
 
@@ -345,9 +514,12 @@ if __name__ == "__main__":
     print(f"Environments: {NUM_ENVS}")
     print(f"Threads: {NUM_THREADS}")
     print(f"Steps per rollout: {N_STEPS}")
-    print(f"Observations: 13 signals (6 spread + 4 volume + 3 volatility)")
-    print(f"Actions: 7 (6 continuous quote params + 1 binary requote decision)")
-    print(f"  Quote params: bid_spread, ask_spread, bid_size, ask_size, target_inventory, skew")
+    print(f"Observations: 16 signals (13 market + 3 AMM flow signals)")
+    print(f"Actions: 5 (4 continuous quote params + 1 binary requote decision)")
+    print(f"  Quote params: bid_spread, ask_spread, skew, target_inventory (continuous)")
+    print(f"  Order size: fixed at min_size_pct ({MIN_SIZE_PCT}%) - no RL control")
     print(f"  Requote: binary decision (>0 = requote, <=0 = continue)")
+    print(f"  Note: target_inventory is smoothed with EMA (alpha=0.05) to prevent flickering")
+    print(f"Strategy config: base_spread_bps={BASE_SPREAD_BPS} bps, min_size={MIN_SIZE_PCT}%, max_size={MAX_SIZE_PCT}%")
     print("=" * 60)
     train()

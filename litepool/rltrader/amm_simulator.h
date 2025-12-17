@@ -31,6 +31,7 @@ public:
     static constexpr int FLOW_WINDOW = 100;          // Steps for imbalance calc
     static constexpr double LIQUIDITY_USD = 100000;  // Virtual liquidity
     static constexpr double RANGE_EMA_ALPHA = 0.02;  // Rolling range smoothing (slower = smoother)
+    static constexpr double NET_FLOW_EMA_ALPHA = 0.05;  // EMA for net flow signal
     
     AmmV3Simulator() : initialized_(false) {}
     
@@ -39,6 +40,12 @@ public:
      * Sets up concentrated liquidity range around the price.
      */
     void reset(double initial_price);
+    
+    /**
+     * Clear initialized state so next step() will auto-initialize.
+     * Call this at episode boundaries.
+     */
+    void clear() { initialized_ = false; }
     
     /**
      * Step the simulator with new market price.
@@ -73,15 +80,18 @@ private:
     double reserve_y_;     // Quote asset (e.g., USD)
     double current_price_;
     
-    // Flow tracking
-    double cumulative_net_flow_;
-    std::deque<double> recent_buys_;
-    std::deque<double> recent_sells_;
-    double window_buy_vol_;
-    double window_sell_vol_;
+    // Flow tracking (per-step, not per-trade)
+    struct StepFlow {
+        double buy_vol = 0.0;
+        double sell_vol = 0.0;
+    };
+    std::deque<StepFlow> recent_flows_;  // Track buy/sell per step
+    double window_buy_vol_;               // Sum of buys in window
+    double window_sell_vol_;              // Sum of sells in window
     
-    // Normalization
-    double max_observed_flow_;
+    // EMA-based net flow tracking (avoids range normalization issues)
+    double net_flow_ema_;                 // EMA of trade direction signal
+    double net_flow_magnitude_ema_;       // EMA of trade magnitude for normalization
     
     /**
      * Update rolling range center using EMA of market price.

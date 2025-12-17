@@ -52,7 +52,8 @@ void EnvAdaptor::reset() {
     this->strategy.reset();
     std::fill_n(state.begin(), state.size(), 0);
     mid_price_deque.clear();
-    // AMM simulator will auto-initialize on first step with valid price
+    // Reset AMM simulator so it auto-initializes on first step with valid price
+    amm_simulator.clear();
 }
 
 
@@ -82,11 +83,20 @@ void EnvAdaptor::computeInfo(OrderBook &book) {
     info["realized_pnl"] = posInfo.realizedPnL;
     info["leverage"] = posInfo.leverage;
     info["trade_count"] = static_cast<double>(tradeInfo.buy_trades + tradeInfo.sell_trades);
+    info["buy_trades"] = static_cast<double>(tradeInfo.buy_trades);
+    info["sell_trades"] = static_cast<double>(tradeInfo.sell_trades);
+    info["buy_amount"] = tradeInfo.buy_amount;
+    info["sell_amount"] = tradeInfo.sell_amount;
     info["drawdown"] = drawdown;
     info["fees"] = posInfo.fees;
     info["average_price"] = posInfo.averagePrice;
     info["net_position_usd"] = posInfo.netPosition;  // USD value of position
     info["net_amount_btc"] = strategy.getPosition().getNetAmount();  // BTC amount of position
+    
+    // Last placed quote prices for diagnostics (to verify actual spreads)
+    info["last_bid_price"] = strategy.getLastBidPrice();
+    info["last_ask_price"] = strategy.getLastAskPrice();
+    info["last_mid_price"] = strategy.getLastMidPrice();
 }
 
 

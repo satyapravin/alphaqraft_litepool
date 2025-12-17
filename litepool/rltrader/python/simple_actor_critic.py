@@ -4,37 +4,44 @@ Simple MLP Actor-Critic with separate heads:
 - Continuous heads for quote parameters (Normal)
 No recurrence needed since signals already capture temporal dynamics.
 
-Simplified 4-action space:
-- spread: [-1, 1] symmetric spread control
-- size: [-1, 1] order size control
-- skew: [-1, 1] asymmetry for inventory management
-- requote: binary decision to update quotes
+5-action space:
+- bid_spread: [-1, 1] -> [0.2x, 3.0x] base spread multiplier for bid
+- ask_spread: [-1, 1] -> [0.2x, 3.0x] base spread multiplier for ask
+- skew: [-1, 1] asymmetry for inventory management (shifts reservation price)
+- target_inventory: [-1, 1] desired inventory level (smoothed with EMA)
+- requote: binary decision to update quotes (>0 = requote)
 """
+import numpy as np
 import torch
 import torch.nn as nn
 
 
 class SimpleActorCritic(nn.Module):
-    def __init__(self, obs_dim=16, action_dim=4, hidden_dim=64):
+    def __init__(self, obs_dim=16, action_dim=5, hidden_dim=128):
         super().__init__()
-        assert action_dim == 4, "Expected 4 actions: 3 quote params (spread, size, skew) + 1 requote"
+        assert action_dim == 5, "Expected 5 actions: 4 continuous (bid_spread, ask_spread, skew, target_inventory) + 1 binary (requote)"
         
-        # Shared feature extractor
+        # Shared feature extractor (3 layers for better representation)
         self.shared = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),  # LayerNorm for stable training
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
         )
         
         # Separate heads for quote parameters (continuous) and requote decision (binary)
-        self.quote_mean = nn.Linear(hidden_dim, 3)  # 3 continuous: spread, size, skew
-        self.quote_log_std = nn.Parameter(torch.zeros(3))  # Learnable std for quote params
+        self.quote_mean = nn.Linear(hidden_dim, 4)  # 4 continuous: bid_spread, ask_spread, skew, target_inventory
+        self.quote_log_std = nn.Parameter(torch.zeros(4))  # Learnable std for quote params
         
         self.requote_logit = nn.Linear(hidden_dim, 1)  # Binary requote decision
         
-        # Critic head (value function)
-        self.critic = nn.Linear(hidden_dim, 1)
+        # Critic head (separate layer for value to reduce interference)
+        self.critic_hidden = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.critic = nn.Linear(hidden_dim // 2, 1)
         
         # Initialize weights
         self._init_weights()
@@ -42,14 +49,16 @@ class SimpleActorCritic(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=0.01)
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))  # Standard for ReLU
                 nn.init.zeros_(m.bias)
-        # Quote output layer - use slightly larger gain for exploration
-        nn.init.orthogonal_(self.quote_mean.weight, gain=0.1)
+        # Quote output layer - small init for stable start
+        nn.init.orthogonal_(self.quote_mean.weight, gain=0.01)
+        nn.init.zeros_(self.quote_mean.bias)
         # Requote output layer - strongly bias AGAINST requoting to let orders persist longer
         nn.init.orthogonal_(self.requote_logit.weight, gain=0.01)
         nn.init.constant_(self.requote_logit.bias, -3.0)  # ~5% requote probability initially (sigmoid(-3) ≈ 0.05)
-        # Critic output layer
+        # Critic layers
+        nn.init.orthogonal_(self.critic_hidden.weight, gain=np.sqrt(2))
         nn.init.orthogonal_(self.critic.weight, gain=1.0)
     
     def forward(self, obs):
@@ -57,7 +66,7 @@ class SimpleActorCritic(nn.Module):
         Args:
             obs: [batch_size, obs_dim] observation tensor
         Returns:
-            quote_dist: Normal distribution for quote parameters [batch_size, 3]
+            quote_dist: Normal distribution for quote parameters [batch_size, 4] (bid_spread, ask_spread, skew, target_inventory)
             requote_dist: Bernoulli distribution for requote decision [batch_size]
             value: Value estimate [batch_size]
         """
@@ -95,8 +104,9 @@ class SimpleActorCritic(nn.Module):
         requote_logit = torch.where(torch.isnan(requote_logit), torch.zeros_like(requote_logit), requote_logit)
         requote_dist = torch.distributions.Bernoulli(logits=requote_logit)
         
-        # Value
-        value = self.critic(features).squeeze(-1)
+        # Value (separate pathway to reduce actor-critic interference)
+        critic_features = torch.relu(self.critic_hidden(features))
+        value = self.critic(critic_features).squeeze(-1)
         # Clamp value to prevent extreme values
         value = torch.clamp(value, -100.0, 100.0)
         value = torch.where(torch.isnan(value), torch.zeros_like(value), value)
@@ -111,7 +121,7 @@ class SimpleActorCritic(nn.Module):
             obs: observation (numpy or tensor)
             deterministic: if True, return mean/probability > 0.5 for requote
         Returns:
-            action: numpy array [4] - [spread, size, skew, requote]
+            action: numpy array [5] - [bid_spread, ask_spread, skew, target_inventory, requote]
             log_prob: log probability of action
             value: value estimate
         """
@@ -153,7 +163,7 @@ class SimpleActorCritic(nn.Module):
         
         Args:
             obs: [batch_size, obs_dim]
-            actions: [batch_size, 4] - [spread, size, skew, requote]
+            actions: [batch_size, 5] - [bid_spread, ask_spread, skew, target_inventory, requote]
         Returns:
             log_probs: [batch_size]
             values: [batch_size]
@@ -161,9 +171,9 @@ class SimpleActorCritic(nn.Module):
         """
         quote_dist, requote_dist, values = self.forward(obs)
         
-        # Split actions: first 3 are quote params, last is requote
-        quote_actions = actions[:, :3]
-        requote_actions = actions[:, 3]
+        # Split actions: first 4 are quote params (bid_spread, ask_spread, skew, target_inventory), last is requote
+        quote_actions = actions[:, :4]
+        requote_actions = actions[:, 4]
         
         # Convert requote from {-1, 1} back to {0, 1} for Bernoulli
         requote_binary = (requote_actions + 1.0) / 2.0

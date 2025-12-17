@@ -21,15 +21,31 @@ namespace RLTrader {
     // Snapshot of key metrics from a single orderbook update
     struct BookSnapshot {
         double mid_price = 0;
+        double market_spread_bps = 0;     // (ask - bid) / mid * 10000 (in basis points)
         double volume_imbalance = 0;      // (bid_vol - ask_vol) / (bid_vol + ask_vol) over 10 levels
         double total_bid_volume = 0;      // Total bid volume over 10 levels
         double total_ask_volume = 0;      // Total ask volume over 10 levels
         double best_bid_price = 0;        // Best bid price (for OFI calculation)
         double best_ask_price = 0;        // Best ask price (for OFI calculation)
         
-        // Normalized spreads (stored for mean/volatility computation)
-        double bid_spread = 0;            // (VWAP_bid - mid) / mid * 100
-        double ask_spread = 0;            // (VWAP_ask - mid) / mid * 100
+        // Book depth: distance from mid to VWAP (always positive)
+        double bid_depth_bps = 0;         // (mid - VWAP_bid) / mid * 10000
+        double ask_depth_bps = 0;         // (VWAP_ask - mid) / mid * 10000
+    } __attribute((packed));
+
+    // Spread/depth signals - ALL BOUNDED TO [-1, 1]
+    struct spread_signal_repository {
+        // Market spread: how wide is the current bid-ask spread
+        double market_spread = 0;             // [0, 1] normalized spread (tight=0, wide=1)
+        
+        // Book depth signals (both positive = more depth further from mid)
+        double bid_depth = 0;                 // [0, 1] how deep is bid side
+        double ask_depth = 0;                 // [0, 1] how deep is ask side
+        double depth_imbalance = 0;           // [-1, 1] (bid-ask)/(bid+ask) depth
+        
+        // Dynamics over window
+        double spread_change = 0;             // [-1, 1] spread widening (+) or tightening (-)
+        double depth_change = 0;              // [-1, 1] depth increasing (+) or decreasing (-)
     } __attribute((packed));
 
     // Volume and order flow signals - ALL BOUNDED TO [-1, 1]
@@ -39,32 +55,17 @@ namespace RLTrader {
         
         // Accumulated signals over 5 snapshots (500ms window)
         double volume_imbalance_mean = 0;     // [-1, 1] Mean imbalance
-        double volume_imbalance_trend = 0;    // [-1, 1] tanh(newest - oldest)
+        double volume_imbalance_trend = 0;    // [-1, 1] (newest - oldest) / 2
         
-        // Order Flow Imbalance (EMA-smoothed, tanh-bounded)
-        double ofi_cumulative = 0;            // [-1, 1] tanh(EMA of OFI)
-    } __attribute((packed));
-
-    // Spread signals for quote placement - ALL BOUNDED TO [-1, 1]
-    struct spread_signal_repository {
-        // Current snapshot (tanh-scaled)
-        double bid_spread = 0;                // [-1, 1] tanh((VWAP_bid - mid) / mid * 1000)
-        double ask_spread = 0;                // [-1, 1] tanh((VWAP_ask - mid) / mid * 1000)
-        
-        // Bid spread dynamics over 5 snapshots
-        double bid_spread_mean = 0;           // [-1, 1] tanh(mean * scale)
-        double bid_spread_volatility = 0;     // [-1, 1] tanh(CV), CV = σ/|μ|
-        
-        // Ask spread dynamics over 5 snapshots
-        double ask_spread_mean = 0;           // [-1, 1] tanh(mean * scale)
-        double ask_spread_volatility = 0;     // [-1, 1] tanh(CV), CV = σ/|μ|
+        // Order Flow Imbalance (EMA-smoothed)
+        double ofi = 0;                       // [-1, 1] EMA of normalized OFI
     } __attribute((packed));
 
     // Volatility regime signals - ALL BOUNDED TO [-1, 1]
     struct volatility_signal_repository {
-        double vol_short = 0;                 // [-1, 1] tanh(vol_1s * scale), short-term volatility
-        double vol_long = 0;                  // [-1, 1] tanh(vol_1m * scale), long-term volatility
-        double vol_ratio = 0;                 // [-1, 1] tanh(short/long - 1), spike detector
+        double vol_short = 0;                 // [0, 1] short-term volatility (normalized)
+        double vol_long = 0;                  // [0, 1] long-term volatility (normalized)
+        double vol_regime = 0;                // [-1, 1] -1=calm, 0=normal, +1=volatile
     } __attribute((packed));
 
 class MarketSignalBuilder {
@@ -84,7 +85,7 @@ private:
     // Compute all signals from accumulated snapshots
     void compute_signals();
     
-    // Compute spread signals
+    // Compute spread/depth signals
     void compute_spread_signals();
     
     // Compute volume/imbalance signals
@@ -95,6 +96,9 @@ private:
     
     // Helper: compute volatility from returns
     double compute_volatility(int window);
+    
+    // Helper: sigmoid normalization to [0, 1] with configurable midpoint
+    static double sigmoid_normalize(double x, double midpoint, double steepness);
 
 private:
     // Circular buffer to store last 5 snapshots
@@ -102,8 +106,13 @@ private:
     int snapshot_count_ = 0;
     int snapshot_index_ = 0;
     
-    // Cumulative OFI over window
-    double cumulative_ofi_ = 0;
+    // EMA for OFI (replaces cumulative which could saturate)
+    double ofi_ema_ = 0;
+    static constexpr double OFI_EMA_ALPHA = 0.2;  // ~5 sample half-life
+    
+    // EMA for volatility baseline
+    double vol_baseline_ema_ = 0;
+    static constexpr double VOL_BASELINE_ALPHA = 0.01;  // ~100 sample half-life
     
     // Mid-price history for volatility (longer window)
     std::deque<double> mid_price_history_;

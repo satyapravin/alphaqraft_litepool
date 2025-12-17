@@ -25,7 +25,10 @@ class SimpleCollector:
         self.reward_scale = reward_scale
         self.log_episodes = log_episodes
         
-        self.n_envs = env.num_envs
+        # Infer n_envs from observation shape (will be set on first reset)
+        # Try to get it from env attribute, otherwise infer from obs shape
+        self.n_envs = getattr(env, 'num_envs', None)
+        
         self.obs = None
         self.dones = None
         self.episode_count = 0
@@ -38,6 +41,19 @@ class SimpleCollector:
             batch: dict with trajectory data and computed advantages/returns
         """
         n_steps = self.n_steps
+        
+        # Initialize if first call
+        if self.obs is None:
+            self.obs, info = self.env.reset()
+            # Infer n_envs from observation shape if not already set
+            if self.n_envs is None:
+                if isinstance(self.obs, np.ndarray):
+                    self.n_envs = self.obs.shape[0] if len(self.obs.shape) > 1 else 1
+                else:
+                    self.n_envs = 1
+            self.dones = np.zeros(self.n_envs, dtype=bool)
+        
+        # Ensure n_envs is set (should be set by now)
         n_envs = self.n_envs
         
         # Storage
@@ -48,11 +64,6 @@ class SimpleCollector:
         rewards_list = []
         dones_list = []
         infos_list = []
-        
-        # Initialize if first call
-        if self.obs is None:
-            self.obs, info = self.env.reset()
-            self.dones = np.zeros(n_envs, dtype=bool)
         
         # Rollout
         for _ in range(n_steps):
@@ -113,8 +124,9 @@ class SimpleCollector:
             'values': values.view(-1),
             'advantages': advantages.view(-1),
             'returns': returns.view(-1),
-            'rewards': rewards,  # Scaled rewards for logging
+            'rewards': rewards,  # Scaled rewards for logging [n_steps, n_envs]
             'rewards_raw': rewards_raw,  # Raw rewards for diagnostics
+            'dones': dones,  # Done flags [n_steps, n_envs] for goal_manager
             'infos': infos_list,
         }
         

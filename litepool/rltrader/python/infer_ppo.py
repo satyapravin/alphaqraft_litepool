@@ -15,7 +15,6 @@ import litepool
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
-from vec_normalizer import VecNormalize
 from simple_actor_critic import SimpleActorCritic
 from metric_logger import MetricLogger
 
@@ -78,25 +77,16 @@ def load_model_and_env():
     )
     env.spec.id = "RlTrader-v0"
 
-    env = VecNormalize(
-        env,
-        device=device,
-        num_envs=NUM_ENVS,
-        obs_dim=16,
-        norm_obs=True,
-        norm_reward=False,
-        clip_obs=10.0,
-        gamma=0.99,
-    )
-
-    # Note: VecNormalize no longer needs saved stats since all signals 
-    # are bounded to [-1, 1] in C++. Just optional clipping for safety.
+    # All observation signals are already bounded to [-1, 1]:
+    # - Market signals (13): all use tanh or are bounded by construction
+    # - AMM signals (3): all clamped or bounded to [-1, 1]
+    # No normalization needed!
     results_dir = Path("results")
 
     # Model
     model = SimpleActorCritic(
         obs_dim=16,
-        action_dim=4,
+        action_dim=5,  # 4 continuous (spread, size, skew, target_inventory) + 1 binary (requote)
         hidden_dim=64,
     )
     model.eval()

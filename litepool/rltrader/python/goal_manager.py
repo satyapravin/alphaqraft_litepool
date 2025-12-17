@@ -1,6 +1,6 @@
 import collections
 from typing import Dict, List, Any
-
+import numpy as np
 import torch
 
 
@@ -19,6 +19,17 @@ class NetPnlGoalManager:
         # env_id -> last distance value  (resets to 0 at episode end)
         self.prev_dist: Dict[int, float] = collections.defaultdict(float)
 
+    def _safe_get(self, info: dict, key: str, env_id: int, default: float = 0.0) -> float:
+        """Safely extract value from info dict, handling arrays and scalars."""
+        val = info.get(key)
+        if val is None:
+            return default
+        if isinstance(val, (np.ndarray, list)):
+            if env_id < len(val):
+                return float(val[env_id])
+            return default
+        return float(val)
+
     # ------------------------------------------------------------------
     # Main entry point – call once immediately after `collector.collect`
     # ------------------------------------------------------------------
@@ -28,11 +39,11 @@ class NetPnlGoalManager:
 
         batch keys used:
             • rewards : torch.Tensor [T, B]
-            • infos   : List[ List[dict] ]  length T, inner length B
-                         each dict contains at least realised, unrealised, fees
-                         optionally 'net_pnl' and/or 'done'
+            • dones   : torch.Tensor [T, B] - done flags from env.step()
+            • infos   : List[dict] length T, each dict has arrays indexed by env_id
         """
         rew   = batch["rewards"]          # [T, B]  torch tensor
+        dones = batch["dones"]            # [T, B]  torch tensor
         infos = batch["infos"]            # Python list, len T
         T, B  = rew.shape
         shaped = torch.zeros_like(rew)
@@ -46,9 +57,17 @@ class NetPnlGoalManager:
             done_flags: List[bool] = []
 
             for t in range(T):
-                net = (infos[t]["realized_pnl"][env_id] + infos[t]["unrealized_pnl"][env_id] - infos[t]["fees"][env_id])
-                pnl_list.append(float(net))
-                done_flags.append(bool(infos[t]["done"][env_id]))
+                info_t = infos[t] if t < len(infos) else {}
+                if not isinstance(info_t, dict):
+                    info_t = {}
+                
+                realized = self._safe_get(info_t, "realized_pnl", env_id, 0.0)
+                unrealized = self._safe_get(info_t, "unrealized_pnl", env_id, 0.0)
+                fees = self._safe_get(info_t, "fees", env_id, 0.0)
+                
+                net = realized + unrealized - fees
+                pnl_list.append(net)
+                done_flags.append(bool(dones[t, env_id]))
 
             pnl = torch.tensor(pnl_list, dtype=rew.dtype, device=self.device)  # [T]
 

@@ -30,7 +30,6 @@ private:
     double max_unrealized_pnl = 0;
     double max_realized_pnl = 0;
     double drawdown = 0;
-    long num_trades = 0;
     std::deque<double> mid_price_deque;
     std::unique_ptr<MarketSignalBuilder> market_builder;
     AmmV3Simulator amm_simulator;  // AMM flow signal generator

@@ -38,7 +38,7 @@ class SimplePPOPolicy:
             obs: [batch_size, obs_dim] numpy array
             deterministic: if True, return mean actions and threshold requote
         Returns:
-            actions: [batch_size, 7] numpy array - [6 quote params, 1 requote decision]
+            actions: [batch_size, 5] numpy array - [4 quote params (bid_spread, ask_spread, skew, target_inv), 1 requote]
             log_probs: [batch_size] numpy array
             values: [batch_size] numpy array
         """
@@ -102,8 +102,9 @@ class SimplePPOPolicy:
             }
         
         # Clip advantages and returns to prevent numerical instability
+        # With REWARD_SCALE=100 and GAMMA=0.997, returns should be more manageable
         advantages = torch.clamp(advantages, -10.0, 10.0)
-        returns = torch.clamp(returns, -100.0, 100.0)
+        returns = torch.clamp(returns, -500.0, 500.0)  # Reduced from 1000 since REWARD_SCALE is now 100
         
         # Normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)

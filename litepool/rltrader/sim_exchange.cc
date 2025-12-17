@@ -163,6 +163,10 @@ void SimExchange::processPending(const DataRow& obs) {
 	std::vector<Order> bids_to_add;
 	std::vector<Order> asks_to_add;
 	
+	// Safety check: ensure price data exists before accessing
+	if (obs.data.count("asks[0].price") == 0 || obs.data.count("bids[0].price") == 0) {
+		return;  // Skip processing if market data is missing
+	}
 	const double best_ask = obs.data.at("asks[0].price");
 	const double best_bid = obs.data.at("bids[0].price");
 
@@ -249,13 +253,23 @@ void SimExchange::execute() {
 	std::vector<std::string> bids_filled;
 	std::vector<std::string> asks_filled;
 	
-	// Get best bid/ask from current observation instead of calling getDouble()
-	// This avoids iterator state issues if getDouble() is called when iterator is invalid
+	// Get best bid/ask from current observation
+	// IMPORTANT: Check for valid prices (> 0) to avoid filling on missing data
 	const double best_ask = obs.data.count("asks[0].price") > 0 ? obs.data.at("asks[0].price") : 0.0;
 	const double best_bid = obs.data.count("bids[0].price") > 0 ? obs.data.at("bids[0].price") : 0.0;
+	
+	// Skip fill checking if market data is invalid
+	if (best_ask <= 0 || best_bid <= 0) {
+		return;
+	}
 
 	// BUY orders fill when ask crosses down to our price
 	for (auto& [order_id, order] : this->bid_quotes) {
+		// Skip orders that are already cancelled (pending removal)
+		if (order.state == OrderState::CANCELLED || order.state == OrderState::CANCELLED_ACK) {
+			continue;
+		}
+		
 		// Taker: fill immediately at best ask
 		// Maker: fill when best_ask <= our_bid (someone willing to sell at our price)
 		if (order.is_taker || best_ask <= order.price) {
@@ -268,6 +282,11 @@ void SimExchange::execute() {
 
 	// SELL orders fill when bid crosses up to our price
 	for (auto& [order_id, order] : this->ask_quotes) {
+		// Skip orders that are already cancelled (pending removal)
+		if (order.state == OrderState::CANCELLED || order.state == OrderState::CANCELLED_ACK) {
+			continue;
+		}
+		
 		// Taker: fill immediately at best bid
 		// Maker: fill when best_bid >= our_ask (someone willing to buy at our price)
 		if (order.is_taker || best_bid >= order.price) {

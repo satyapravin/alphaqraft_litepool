@@ -28,7 +28,7 @@ namespace RLTrader {
         double averagePrice = 0.0;
         double netAmount = 0.0;
         double totalFee = 0.0;
-        int numOfTrades = 0;
+        long numOfTrades = 0;
         double initialBalance = 0.0;
         double balance = 0.0;
         TradeInfo trade_info;

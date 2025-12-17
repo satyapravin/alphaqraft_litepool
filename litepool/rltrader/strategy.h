@@ -17,20 +17,23 @@ namespace RLTrader {
         double base_spread_bps = 5.0;         // Base spread in basis points (5 bps = 0.05%)
     };
 
-    // RL action outputs - simplified 4-action space
-    // Reduces redundancy and improves learning efficiency
+    // RL action outputs - 5-action space
     struct RLAction {
-        // Spread control: [-1, 1] → multiplier [0.5, 1.5] on base spread
-        double spread = 0.0;                  // Tighten (<0) or widen (>0) symmetric spread
+        // Bid spread control: [-1, 1] → multiplier on base spread for bid side
+        double bid_spread = 0.0;             // Tighten (<0) or widen (>0) bid spread
         
-        // Size control: [-1, 1] → [min_size_pct, max_size_pct] of balance
-        double size = 0.0;                    // Small (<0) or large (>0) order size
+        // Ask spread control: [-1, 1] → multiplier on base spread for ask side
+        double ask_spread = 0.0;             // Tighten (<0) or widen (>0) ask spread
         
         // Skew control: [-1, 1] → asymmetry based on inventory
-        // Handles both spread skew AND size skew for inventory management
-        // Positive skew = favor selling (widen bid, tighten ask, larger ask size)
-        // Negative skew = favor buying (tighten bid, widen ask, larger bid size)
+        // Positive skew = favor selling (widen bid, tighten ask)
+        // Negative skew = favor buying (tighten bid, widen ask)
         double skew = 0.0;
+        
+        // Target inventory: [-1, 1] → target leverage/position (clamped to [-0.1, 0.1] = ±10% of balance)
+        // Positive = target long position, Negative = target short position
+        // Smoothed with EMA to prevent flickering, then clamped to ±10% of balance
+        double target_inventory = 0.0;
         
         // Requote decision: >0 means requote, <=0 means keep existing orders
         double should_requote = 0.0;
@@ -51,21 +54,33 @@ namespace RLTrader {
         Position& getPosition() { return position; }
         StrategyConfig& getConfig() { return config; }
         
+        // Get last placed quote prices for diagnostics
+        double getLastBidPrice() const { return last_bid_price; }
+        double getLastAskPrice() const { return last_ask_price; }
+        double getLastMidPrice() const { return last_mid_price; }
+        double getVolatility() const { return realized_vol; }
+        
+        // Update smoothed target inventory (EMA smoothing to prevent flickering)
+        void updateTargetInventory(double target_inventory_action);
+        
         // Process fills from exchange
         void next();
 
     protected:
-        // Override this for different quoting strategies (e.g., GLFT)
+        // Avellaneda-Stoikov inspired quoting model
         virtual std::pair<double, double> computeQuotePrices(
             const RLAction& action,
             double mid_price,
             double leverage,
             double tick_size);
         
-        // Override this for different sizing strategies
+        // Compute order sizes
         virtual std::pair<double, double> computeQuoteSizes(
             const RLAction& action,
             double init_balance);
+        
+        // Update volatility estimate from mid-price changes
+        void updateVolatility(double mid_price);
 
     protected:
         BaseInstrument& instrument;
@@ -76,9 +91,24 @@ namespace RLTrader {
         int max_ticks;
         
         // State variables
-        double target_inventory_ema = 0.0;    // Smoothed target inventory
+        double target_inventory_ema = 0.0;    // Smoothed target inventory (clamped to [-0.1, 0.1])
         
-        // EMA smoothing for target inventory
-        static constexpr double TARGET_EMA_ALPHA = 0.05;
+        // Track last placed quote prices for diagnostics
+        double last_bid_price = 0.0;
+        double last_ask_price = 0.0;
+        double last_mid_price = 0.0;
+        
+        // Volatility tracking (EMA of squared returns)
+        double prev_mid_price = 0.0;
+        double realized_vol = 0.0;            // EMA volatility estimate
+        
+        // Model parameters
+        static constexpr double TARGET_EMA_ALPHA = 0.05;     // Target inventory smoothing
+        static constexpr double VOL_EMA_ALPHA = 0.1;         // Volatility EMA (~10 sample half-life)
+        static constexpr double VOL_SPREAD_MULT = 50.0;      // How much volatility widens spread
+        static constexpr double INVENTORY_SKEW_MULT = 2.0;   // How much inventory shifts mid-point
+        static constexpr double ACTION_SKEW_MULT = 0.5;      // How much action.skew shifts mid-point
+        static constexpr double MAX_SPREAD_MULT = 3.0;       // Maximum spread multiplier from action
+        static constexpr double MIN_SPREAD_MULT = 0.2;       // Minimum spread multiplier from action
     };
 }
