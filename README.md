@@ -29,21 +29,22 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 | Component | Description |
 |-----------|-------------|
 | `tianshou_ppo.py` | Main training script with PPO implementation |
-| `simple_actor_critic.py` | Neural network with shared features, separate actor/critic heads |
+| `simple_actor_critic.py` | LSTM Actor-Critic with temporal pattern recognition |
 | `simple_collector.py` | Experience collection from vectorized environments |
 | `simple_ppo_policy.py` | PPO policy with clipped surrogate objective |
 
-## Action Space (5 dimensions)
+## Action Space (4 dimensions)
 
 | Action | Range | Description |
 |--------|-------|-------------|
-| `bid_spread` | [-1, 1] | Controls bid quote width (mapped to spread multiplier) |
-| `ask_spread` | [-1, 1] | Controls ask quote width (mapped to spread multiplier) |
-| `skew` | [-1, 1] | Asymmetric quote adjustment for inventory control |
-| `target_inventory` | [-1, 1] | Desired inventory level (EMA smoothed) |
+| `bid_spread` | [-1, 1] | Controls bid quote width (mapped to [0.2x, 3.0x] spread multiplier) |
+| `ask_spread` | [-1, 1] | Controls ask quote width (mapped to [0.2x, 3.0x] spread multiplier) |
+| `target_inventory` | [-1, 1] | Desired inventory level (skew computed automatically from error) |
 | `requote` | {0, 1} | Binary decision to cancel and requote |
 
-## Observation Space (16 signals)
+**Note**: The `skew` action was removed to avoid conflicts with `target_inventory`. Quote asymmetry (skew) is now computed automatically based on the difference between current position and target inventory.
+
+## Observation Space (18 signals)
 
 **Market Signals (13):**
 - Spread metrics: `market_spread`, `bid_depth`, `ask_depth`, `depth_imbalance`
@@ -51,20 +52,45 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 - Volatility: `vol_regime`, `price_trend`
 - Microstructure: `spread_change`, `depth_change`
 
-**AMM Flow Signals (3):**
-- `buy_pressure`: Recent buy volume from simulated AMM arbitrage
-- `sell_pressure`: Recent sell volume from simulated AMM arbitrage  
-- `net_flow`: Directional flow momentum indicator
+**AMM Flow Signals (4):**
+- `net_flow`: EMA-based flow momentum indicator
+- `flow_imbalance`: Recent buy/sell volume ratio
+- `inventory_delta`: LP inventory change in simulated AMM
+- `cumulative_flow/balance`: Raw cumulative flow normalized by trading balance (trend indicator)
+
+**Agent State (1):**
+- `current_leverage`: Agent's current position leverage (critical for inventory management)
 
 ## Reward Function
 
 ```
-reward = realized_pnl_delta + unrealized_pnl_delta + fee_rebate_delta
+reward = realized_pnl_delta + unrealized_pnl_delta + fee_rebate_delta - inventory_deviation_penalty
 ```
 
 - **Realized P&L Delta**: Profit/loss from completed trades
 - **Unrealized P&L Delta**: Mark-to-market changes (anchored to slow-moving price MA)
 - **Fee Rebates**: Maker fee rebates earned (incentivizes market participation)
+- **Inventory Deviation Penalty**: Penalizes deviation from agent's chosen `target_inventory` (aligns incentives - agent can hold positions it explicitly chooses)
+
+## Model Architecture
+
+**LSTM Actor-Critic** with temporal pattern recognition:
+
+```
+Observations [18] → MLP Feature Extractor [128] → LSTM [64] → Combined [192]
+                                                              ↓
+                                                     ┌───────┴───────┐
+                                                     ↓               ↓
+                                                  Actor           Critic
+                                            (quote params,       (value)
+                                              requote)
+```
+
+Key features:
+- **MLP Feature Extractor**: 2-layer with LayerNorm for stable training
+- **LSTM**: Captures temporal patterns in market dynamics
+- **Exponential spread mapping**: More control at tighter spreads where profitability matters most
+- **Separate actor/critic heads**: Reduces interference in learning
 
 ## Build Instructions
 
@@ -109,9 +135,10 @@ python tianshou_ppo.py
 |-----------|-------|-------------|
 | `N_ENVS` | 3 | Parallel environments |
 | `N_STEPS` | 2048 | Steps per rollout |
-| `GAMMA` | 0.995 | Discount factor (~200 step horizon) |
-| `BASE_SPREAD_BPS` | 1.0 | Base spread in basis points |
-| `MIN_SIZE_PCT` | 1.0% | Order size as % of balance |
+| `GAMMA` | 0.99 | Discount factor (~100 step horizon) |
+| `BASE_SPREAD_BPS` | 3.0 | Base spread in basis points |
+| `MIN_SIZE_PCT` | 5.0% | Order size as % of balance |
+| `Model Params` | ~82k | LSTM Actor-Critic parameters |
 
 ## Data Format
 
@@ -128,9 +155,8 @@ Place data files in `data/training/` directory.
 Key strategy parameters in `tianshou_ppo.py`:
 
 ```python
-BASE_SPREAD_BPS = 1.0    # Base spread (bps)
-MIN_SIZE_PCT = 1.0       # Min order size (%)
-MAX_SIZE_PCT = 5.0       # Max order size (%)
+BASE_SPREAD_BPS = 3.0    # Base spread (bps) - room for spread capture
+MIN_SIZE_PCT = 5.0       # Order size (%) - strong P&L signal
 MAKER_FEE = -0.000025    # Maker rebate (-0.25 bps)
 TAKER_FEE = 0.0005       # Taker fee (5 bps)
 ```

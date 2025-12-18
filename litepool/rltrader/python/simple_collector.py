@@ -96,7 +96,8 @@ class SimpleCollector:
         # Get bootstrap value
         with torch.no_grad():
             obs_tensor = torch.as_tensor(self.obs, dtype=torch.float32)
-            _, _, bootstrap_values = self.policy.model(obs_tensor)  # quote_dist, requote_dist, value
+            # LSTM model returns (quote_dist, requote_dist, value, hidden_state)
+            _, _, bootstrap_values, _ = self.policy.model(obs_tensor)
             bootstrap_values = bootstrap_values.numpy()
         
         # Convert to tensors

@@ -7,8 +7,8 @@
 
 namespace RLTrader {
 
-// Observation space dimension: 13 market signals + 3 AMM flow signals
-constexpr int OBS_DIM = 16;
+// Observation space dimension: 13 market signals + 4 AMM flow signals + 1 agent state
+constexpr int OBS_DIM = 18;
 
 class EnvAdaptor { 
 public:

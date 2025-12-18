@@ -60,7 +60,7 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) StateSpec(const Config& conf) {
-    return MakeDict("obs"_.Bind(Spec<double>({16})),  // 13 market signals + 3 AMM flow signals
+    return MakeDict("obs"_.Bind(Spec<double>({18})),  // 13 market + 4 AMM flow + 1 agent state (leverage)
                     "info:mid_price"_.Bind(Spec<double>({-1})),
                     "info:balance"_.Bind(Spec<double>({-1})),
                     "info:unrealized_pnl"_.Bind(Spec<double>({-1})),
@@ -90,9 +90,10 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) ActionSpec(const Config& conf) {
-    // 5-action space: spread, size, skew, target_inventory, should_requote
-    return MakeDict("action"_.Bind(Spec<float>({5}, {{ -1., -1., -1., -1., -1. },
-                                                     {  1.,  1.,  1.,  1.,  1. }})));
+    // 4-action space: bid_spread, ask_spread, target_inventory, should_requote
+    // Note: skew removed - automatically computed from inventory error toward target
+    return MakeDict("action"_.Bind(Spec<float>({4}, {{ -1., -1., -1., -1. },
+                                                     {  1.,  1.,  1.,  1. }})));
   }
 };
 
@@ -216,12 +217,12 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
 
   void Step(const Action& action_dict) override { 
       RLTrader::RLAction action;
-      // 5-action space: bid_spread, ask_spread, skew, target_inventory, should_requote
+      // 4-action space: bid_spread, ask_spread, target_inventory, should_requote
+      // Note: skew removed - automatically computed from inventory error
       action.bid_spread       = static_cast<double>(action_dict["action"_][0]);
       action.ask_spread       = static_cast<double>(action_dict["action"_][1]);
-      action.skew             = static_cast<double>(action_dict["action"_][2]);
-      action.target_inventory = static_cast<double>(action_dict["action"_][3]);
-      action.should_requote   = static_cast<double>(action_dict["action"_][4]);
+      action.target_inventory = static_cast<double>(action_dict["action"_][2]);
+      action.should_requote   = static_cast<double>(action_dict["action"_][3]);
       
       // Update smoothed target inventory (EMA smoothing to prevent flickering)
       strategy_ptr->updateTargetInventory(action.target_inventory);
@@ -353,9 +354,18 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     double fee_delta = -(current_fees - prev_fees);  // Positive when rebates earned
     prev_fees = current_fees;
     
-    // Total reward: realized PnL delta + unrealized PnL delta + fee rebates
-    // Agent now gets rewarded for trading (via maker rebates)
-    double reward = realized_delta + unrealized_delta + fee_delta;
+    // Inventory deviation penalty: only penalize excess inventory beyond target
+    // Agent sets target_inventory, so we respect that and only penalize deviation
+    // This aligns incentives: agent can hold inventory if it chooses to
+    constexpr double INVENTORY_DEV_COST = 0.1;  // Penalty per unit deviation from target
+    double target_inventory = info["target_inventory"];  // Agent's desired inventory level [-1, 1] scaled to leverage
+    double target_leverage = target_inventory * 0.5;     // Scale [-1,1] to ±50% max target leverage
+    double inventory_deviation = std::abs(leverage - target_leverage);
+    double inventory_penalty = INVENTORY_DEV_COST * inventory_deviation;
+    
+    // Total reward: realized PnL delta + unrealized PnL delta + fee rebates - inventory cost
+    // Agent now gets rewarded for trading (via maker rebates) but penalized for holding inventory
+    double reward = realized_delta + unrealized_delta + fee_delta - inventory_penalty;
     state["reward"_] = reward;
     
     state["obs"_].Assign(data.begin(), data.size());

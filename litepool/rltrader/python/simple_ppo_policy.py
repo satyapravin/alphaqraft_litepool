@@ -38,14 +38,16 @@ class SimplePPOPolicy:
             obs: [batch_size, obs_dim] numpy array
             deterministic: if True, return mean actions and threshold requote
         Returns:
-            actions: [batch_size, 5] numpy array - [4 quote params (bid_spread, ask_spread, skew, target_inv), 1 requote]
+            actions: [batch_size, 4] numpy array - [3 quote params (bid_spread, ask_spread, target_inv), 1 requote]
             log_probs: [batch_size] numpy array
             values: [batch_size] numpy array
         """
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32)
         
         with torch.no_grad():
-            quote_dist, requote_dist, values = self.model(obs_tensor)
+            # LSTM model returns (quote_dist, requote_dist, values, hidden_state)
+            # We ignore hidden_state for now (stateless inference per step)
+            quote_dist, requote_dist, values, _ = self.model(obs_tensor)
             
             if deterministic:
                 # Use mean for quote params, threshold 0.5 for requote

@@ -85,8 +85,8 @@ def load_model_and_env():
 
     # Model
     model = SimpleActorCritic(
-        obs_dim=16,
-        action_dim=5,  # 4 continuous (spread, size, skew, target_inventory) + 1 binary (requote)
+        obs_dim=18,
+        action_dim=4,  # 3 continuous (bid_spread, ask_spread, target_inventory) + 1 binary (requote)
         hidden_dim=64,
     )
     model.eval()

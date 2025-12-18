@@ -17,7 +17,7 @@ namespace RLTrader {
         double base_spread_bps = 5.0;         // Base spread in basis points (5 bps = 0.05%)
     };
 
-    // RL action outputs - 5-action space
+    // RL action outputs - 4-action space (skew removed - determined automatically from inventory error)
     struct RLAction {
         // Bid spread control: [-1, 1] → multiplier on base spread for bid side
         double bid_spread = 0.0;             // Tighten (<0) or widen (>0) bid spread
@@ -25,14 +25,9 @@ namespace RLTrader {
         // Ask spread control: [-1, 1] → multiplier on base spread for ask side
         double ask_spread = 0.0;             // Tighten (<0) or widen (>0) ask spread
         
-        // Skew control: [-1, 1] → asymmetry based on inventory
-        // Positive skew = favor selling (widen bid, tighten ask)
-        // Negative skew = favor buying (tighten bid, widen ask)
-        double skew = 0.0;
-        
-        // Target inventory: [-1, 1] → target leverage/position (clamped to [-0.1, 0.1] = ±10% of balance)
+        // Target inventory: [-1, 1] → target leverage/position
         // Positive = target long position, Negative = target short position
-        // Smoothed with EMA to prevent flickering, then clamped to ±10% of balance
+        // Skew is automatically computed from (current_leverage - target) to push toward target
         double target_inventory = 0.0;
         
         // Requote decision: >0 means requote, <=0 means keep existing orders
@@ -59,6 +54,7 @@ namespace RLTrader {
         double getLastAskPrice() const { return last_ask_price; }
         double getLastMidPrice() const { return last_mid_price; }
         double getVolatility() const { return realized_vol; }
+        double getTargetInventory() const { return target_inventory_ema; }
         
         // Update smoothed target inventory (EMA smoothing to prevent flickering)
         void updateTargetInventory(double target_inventory_action);
@@ -107,7 +103,8 @@ namespace RLTrader {
         static constexpr double VOL_EMA_ALPHA = 0.1;         // Volatility EMA (~10 sample half-life)
         static constexpr double VOL_SPREAD_MULT = 50.0;      // How much volatility widens spread
         static constexpr double INVENTORY_SKEW_MULT = 2.0;   // How much inventory shifts mid-point
-        static constexpr double ACTION_SKEW_MULT = 0.5;      // How much action.skew shifts mid-point
+        // REMOVED: ACTION_SKEW_MULT - skew is now fully determined by inventory error
+        // Agent controls inventory via target_inventory action only (no conflicting skew action)
         static constexpr double MAX_SPREAD_MULT = 3.0;       // Maximum spread multiplier from action
         static constexpr double MIN_SPREAD_MULT = 0.2;       // Minimum spread multiplier from action
     };

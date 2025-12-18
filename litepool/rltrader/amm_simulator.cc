@@ -38,6 +38,7 @@ void AmmV3Simulator::reset(double initial_price) {
     // Reset EMA-based net flow tracking
     net_flow_ema_ = 0.0;
     net_flow_magnitude_ema_ = initial_price * 0.001;  // Start with small magnitude estimate
+    cumulative_flow_ = 0.0;  // Reset raw cumulative flow
 }
 
 void AmmV3Simulator::updateRollingRange(double market_price) {
@@ -174,7 +175,7 @@ void AmmV3Simulator::updateFlowTracking(double trade_size) {
 }
 
 AmmFlowSignals AmmV3Simulator::step(double market_price) {
-    AmmFlowSignals signals{0.0, 0.0, 0.0};
+    AmmFlowSignals signals{0.0, 0.0, 0.0, 0.0};
     
     if (!initialized_) {
         reset(market_price);
@@ -184,6 +185,10 @@ AmmFlowSignals AmmV3Simulator::step(double market_price) {
     // === IMPORTANT: Simulate arbitrage BEFORE updating range ===
     // This ensures trade size reflects actual price movement with consistent liquidity
     double trade_size = simulateArbitrage(market_price);
+    
+    // === Track raw cumulative flow ===
+    // Positive = net buying, Negative = net selling (in USD)
+    cumulative_flow_ += trade_size;
     
     // === Now update the rolling range for next step ===
     // The new liquidity will be used for the next step's reserve calculations
@@ -214,6 +219,9 @@ AmmFlowSignals AmmV3Simulator::step(double market_price) {
     //    +1 = price at upper bound (LP holds all quote asset)
     //     0 = price at center (balanced 50/50)
     signals.inventory_delta = computeRangePosition(market_price);
+    
+    // 4. Raw cumulative flow (to be normalized by balance in env_adaptor)
+    signals.cumulative_flow = cumulative_flow_;
     
     return signals;
 }

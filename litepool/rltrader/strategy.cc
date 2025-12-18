@@ -33,17 +33,18 @@ void Strategy::reset() {
 }
 
 void Strategy::updateTargetInventory(double target_inventory_action) {
-    // Scale action from [-1, 1] to [-0.1, 0.1] (representing -10% to +10% of balance)
-    // This gives the RL agent full control over the target inventory range
-    double scaled_target = target_inventory_action * 0.1;
+    // RL action is already in [-1, 1], representing target leverage from -100% to +100%
+    // No scaling - let agent express full range of inventory preferences
+    // The actual position is still hard-limited to ±10%, but agent can "desire" more
+    // This gives clearer signal about directional preference
     
     // EMA smoothing: target_inventory_ema = alpha * new_target + (1 - alpha) * old_target
     // TARGET_EMA_ALPHA = 0.05 means ~20 step half-life (smooth updates)
-    target_inventory_ema = TARGET_EMA_ALPHA * scaled_target + 
+    target_inventory_ema = TARGET_EMA_ALPHA * target_inventory_action + 
                           (1.0 - TARGET_EMA_ALPHA) * target_inventory_ema;
     
-    // Clamp the smoothed result to ensure it stays within bounds
-    target_inventory_ema = std::clamp(target_inventory_ema, -0.1, 0.1);
+    // Clamp to [-1, 1] - full range allowed
+    target_inventory_ema = std::clamp(target_inventory_ema, -1.0, 1.0);
 }
 
 void Strategy::updateVolatility(double mid_price) {
@@ -92,13 +93,18 @@ std::pair<double, double> Strategy::computeQuotePrices(
     
     // === Step 3: Agent spread control ===
     // bid_spread/ask_spread actions: [-1, 1] → [MIN_SPREAD_MULT, MAX_SPREAD_MULT]
-    // Linear mapping: mult = (MAX+MIN)/2 + action * (MAX-MIN)/2
-    // This gives symmetric, interpretable control
-    double mid_mult = (MAX_SPREAD_MULT + MIN_SPREAD_MULT) / 2.0;
-    double range_mult = (MAX_SPREAD_MULT - MIN_SPREAD_MULT) / 2.0;
+    // EXPONENTIAL mapping: more control at tighter spreads (where it matters most)
+    // action=-1 → MIN_SPREAD_MULT (0.2x), action=0 → 1.0x, action=+1 → MAX_SPREAD_MULT (3.0x)
+    // Formula: mult = exp(action * log_ratio) where log_ratio = ln(MAX/MIN)/2
+    double log_ratio = std::log(MAX_SPREAD_MULT / MIN_SPREAD_MULT) / 2.0;  // ~1.35
+    double center_mult = std::sqrt(MAX_SPREAD_MULT * MIN_SPREAD_MULT);     // Geometric mean ~0.77
     
-    double bid_spread_mult = mid_mult + action.bid_spread * range_mult;
-    double ask_spread_mult = mid_mult + action.ask_spread * range_mult;
+    double bid_spread_mult = center_mult * std::exp(action.bid_spread * log_ratio);
+    double ask_spread_mult = center_mult * std::exp(action.ask_spread * log_ratio);
+    
+    // Clamp to ensure within bounds (handles numerical edge cases)
+    bid_spread_mult = std::clamp(bid_spread_mult, MIN_SPREAD_MULT, MAX_SPREAD_MULT);
+    ask_spread_mult = std::clamp(ask_spread_mult, MIN_SPREAD_MULT, MAX_SPREAD_MULT);
     
     // === Step 4: Compute final half-spreads ===
     double bid_half_spread = base_half_spread * vol_mult * bid_spread_mult;
@@ -117,55 +123,36 @@ std::pair<double, double> Strategy::computeQuotePrices(
     //   → more likely to buy, reduce short position
     
     // Inventory error: how far we are from target
-    double inventory_error = leverage - target_inventory_ema;
+    // target_inventory_ema is in [-1, 1], scale to leverage units [-0.1, 0.1]
+    double target_leverage = target_inventory_ema * 0.1;  // Scale to match leverage range
+    double inventory_error = leverage - target_leverage;
     
-    // Inventory-based skew: shift mid-point to reduce inventory
+    // Inventory-based skew: shift mid-point to reduce inventory error
     // Negative sign: positive error (too long) → negative shift (quote lower)
-    double inventory_skew = -inventory_error * INVENTORY_SKEW_MULT;
-    
-    // Hard position limit enforcement
-    constexpr double MAX_POSITION_LEVERAGE = 0.1;  // ±10% of balance
-    if (leverage > MAX_POSITION_LEVERAGE) {
-        // Force stronger downward shift when over long limit
-        inventory_skew = std::min(inventory_skew, -1.5);
-    } else if (leverage < -MAX_POSITION_LEVERAGE) {
-        // Force stronger upward shift when over short limit
-        inventory_skew = std::max(inventory_skew, 1.5);
-    }
-    
-    // Agent's additional skew control
-    double action_skew = action.skew * ACTION_SKEW_MULT;
-    
-    // Total skew (in units of base_half_spread)
-    // Reduced from ±3.0 to ±1.5 to prevent extreme asymmetric spreads
-    // With max skew of 1.5, one side can be 1.5x wider while other is 1.5x tighter
-    // This prevents the tight side from going below ~0.5 bps (still profitable)
-    double total_skew = inventory_skew + action_skew;
+    // SIMPLIFIED: Removed action.skew - target_inventory is the only inventory control
+    // This avoids conflicts where agent could set opposing target_inventory and skew
+    double total_skew = -inventory_error * INVENTORY_SKEW_MULT;
     total_skew = std::clamp(total_skew, -1.5, 1.5);
     
-    // Compute reservation price
-    double reservation_price = mid_price + total_skew * base_half_spread;
+    // Compute reservation price shift (in price units)
+    double skew_shift = total_skew * base_half_spread;
+    double reservation_price = mid_price + skew_shift;
     
     // === Step 6: Compute final quote prices ===
-    double bid_price = reservation_price - bid_half_spread;
-    double ask_price = reservation_price + ask_half_spread;
+    // IMPORTANT: Ensure spreads are wide enough to keep quotes on correct side of mid
+    // If skew shifts reservation UP, bid needs extra spread to stay below mid
+    // If skew shifts reservation DOWN, ask needs extra spread to stay above mid
+    double min_bid_half_spread = std::max(bid_half_spread, skew_shift + base_half_spread * 0.5);
+    double min_ask_half_spread = std::max(ask_half_spread, -skew_shift + base_half_spread * 0.5);
+    
+    double bid_price = reservation_price - min_bid_half_spread;
+    double ask_price = reservation_price + min_ask_half_spread;
     
     // === Step 7: Safety checks ===
-    // Minimum spread from mid-price: 1.0 bps (prevents adverse selection on too-tight quotes)
-    // On $100k BTC, 1 bps = $10, which is a reasonable minimum edge
-    double min_half_spread_from_mid = mid_price * 1.0 / 10000.0;  // 1.0 bps
+    // REMOVED: 1 bps minimum floor - let agent learn consequences of tight spreads
+    // Agent will experience adverse selection if quoting too tight, which is the learning signal
     
-    // Ensure bid is at least min_half_spread below mid
-    if (mid_price - bid_price < min_half_spread_from_mid) {
-        bid_price = mid_price - min_half_spread_from_mid;
-    }
-    
-    // Ensure ask is at least min_half_spread above mid
-    if (ask_price - mid_price < min_half_spread_from_mid) {
-        ask_price = mid_price + min_half_spread_from_mid;
-    }
-    
-    // Ensure minimum spread of 1 tick between bid and ask
+    // Only ensure minimum spread of 1 tick between bid and ask (hard floor)
     if (ask_price - bid_price < tick_size) {
         double center = (bid_price + ask_price) / 2.0;
         bid_price = center - tick_size / 2.0;
@@ -197,7 +184,7 @@ void Strategy::quote(const RLAction& action,
     // Validate RL outputs are in expected range [-1, 1]
     assert(action.bid_spread >= -1.0001 && action.bid_spread <= 1.0001);
     assert(action.ask_spread >= -1.0001 && action.ask_spread <= 1.0001);
-    assert(action.skew       >= -1.0001 && action.skew       <= 1.0001);
+    // Note: skew action removed - now computed automatically from inventory error
     
     // Early exit if prices invalid
     if (bid_prices[0] < 0.0001 || ask_prices[0] < 0.0001) return;
@@ -235,14 +222,13 @@ void Strategy::quote(const RLAction& action,
     }
     
     // CRITICAL: After crossing prevention, ensure quotes are still on correct side of mid
-    // Prevents the bug where bid ends up above mid in wide-spread markets
-    double min_spread_from_mid = mid_price * 1.0 / 10000.0;  // 1 bps minimum
-    if (bid_price > mid_price - min_spread_from_mid) {
-        bid_price = mid_price - min_spread_from_mid;
+    // Use tick_size as minimum (not 1 bps) - let agent learn from tight spreads
+    if (bid_price > mid_price - tick_size) {
+        bid_price = mid_price - tick_size;
         bid_price = std::floor(bid_price / tick_size) * tick_size;
     }
-    if (ask_price < mid_price + min_spread_from_mid) {
-        ask_price = mid_price + min_spread_from_mid;
+    if (ask_price < mid_price + tick_size) {
+        ask_price = mid_price + tick_size;
         ask_price = std::ceil(ask_price / tick_size) * tick_size;
     }
     
@@ -261,47 +247,14 @@ void Strategy::quote(const RLAction& action,
     bid_size_0 = instrument.getTradeAmount(bid_size_0, bid_price);
     ask_size_0 = instrument.getTradeAmount(ask_size_0, ask_price);
     
-    // Hard position limit: ±10% of balance (leverage ±0.1)
-    constexpr double MAX_POSITION_LEVERAGE = 0.1;
+    // No hard position cap - let agent manage inventory risk through target_inventory
+    // Only use config.max_leverage as an absolute safety limit (typically very high, e.g. 5x)
     
-    // Calculate actual position value using net amount (not leverage * initBalance which is incorrect)
-    // leverage = position_value / equity, but we need position_value directly
-    double net_amount = position.getNetAmount();
-    double current_position_value = net_amount * mid_price;
-    double bid_order_value = bid_size_0 * bid_price;
-    double ask_order_value = ask_size_0 * ask_price;
-    double estimated_new_leverage_bid = (current_position_value + bid_order_value) / initBalance;
-    double estimated_new_leverage_ask = (current_position_value - ask_order_value) / initBalance;
-    
-    // Check if placing bid is allowed:
-    // - Must meet minimum size and leverage limits
-    // - If already over +10% limit, disallow bids (they increase long position)
-    // - Otherwise, only allow if bid won't exceed +10% limit
+    // Check if placing bid is allowed: meet minimum size and absolute leverage limit
     bool can_place_bid = (bid_size_0 >= minAmount) && (leverage < config.max_leverage);
-    if (can_place_bid) {
-        if (leverage > MAX_POSITION_LEVERAGE) {
-            // Already over +10% limit - disallow bids (they increase long position)
-            can_place_bid = false;
-        } else {
-            // Within limit - check if bid would exceed it
-            can_place_bid = (estimated_new_leverage_bid <= MAX_POSITION_LEVERAGE);
-        }
-    }
     
-    // Check if placing ask is allowed:
-    // - Must meet minimum size and leverage limits
-    // - If already over -10% limit, disallow asks (they increase short position)
-    // - Otherwise, only allow if ask won't exceed -10% limit
+    // Check if placing ask is allowed: meet minimum size and absolute leverage limit
     bool can_place_ask = (ask_size_0 >= minAmount) && (leverage > -config.max_leverage);
-    if (can_place_ask) {
-        if (leverage < -MAX_POSITION_LEVERAGE) {
-            // Already over -10% limit - disallow asks (they increase short position)
-            can_place_ask = false;
-        } else {
-            // Within limit - check if ask would exceed it
-            can_place_ask = (estimated_new_leverage_ask >= -MAX_POSITION_LEVERAGE);
-        }
-    }
     
     // Store last placed prices for diagnostics (0 indicates order not placed)
     last_mid_price = mid_price;

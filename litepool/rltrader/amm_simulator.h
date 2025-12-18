@@ -18,9 +18,10 @@ namespace RLTrader {
  * - inventory_delta: Normalized change in LP holdings relative to centered position
  */
 struct AmmFlowSignals {
-    double net_flow;           // Cumulative (buys - sells), normalized
+    double net_flow;           // EMA-based net flow signal (momentum indicator)
     double flow_imbalance;     // buy_vol / total_vol over window [-1, 1] centered
     double inventory_delta;    // Position in range: -1 (all base) to +1 (all quote)
+    double cumulative_flow;    // Raw cumulative (buys - sells) in USD - to be normalized by balance
 };
 
 class AmmV3Simulator {
@@ -92,6 +93,7 @@ private:
     // EMA-based net flow tracking (avoids range normalization issues)
     double net_flow_ema_;                 // EMA of trade direction signal
     double net_flow_magnitude_ema_;       // EMA of trade magnitude for normalization
+    double cumulative_flow_;              // Raw cumulative (buys - sells) in USD
     
     /**
      * Update rolling range center using EMA of market price.

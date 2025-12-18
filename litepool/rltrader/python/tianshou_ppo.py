@@ -1,8 +1,8 @@
 """
 Simple PPO training for GLFT market making.
-- 16-signal observations (13 market signals + 3 AMM flow signals)
+- 18-signal observations (13 market + 4 AMM flow + 1 agent state)
 - 5-action outputs: 4 continuous quote parameters + 1 binary requote decision
-  * Actions 0-3: bid_spread, ask_spread, skew, target_inventory (continuous)
+  * Actions 0-2: bid_spread, ask_spread, target_inventory (continuous)
   * Action 4: should_requote (binary decision: >0 = requote, <=0 = continue)
 - Order size uses min_size_pct by default (no RL control)
 - Separate policy heads: Normal distribution for quotes, Bernoulli for requote
@@ -17,7 +17,7 @@ import litepool
 from simple_actor_critic import SimpleActorCritic
 from simple_ppo_policy import SimplePPOPolicy
 from simple_collector import SimpleCollector
-from goal_manager import NetPnlGoalManager
+# Removed: HER-style goal manager not needed with dense rewards
 from metric_logger import MetricLogger
 
 # === Device setup (CPU for your machine) ===
@@ -32,11 +32,11 @@ UPDATE_EPOCHS = 5      # PPO epochs per update
 MINIBATCH_SIZE = 256   # Minibatch size for updates
 TOTAL_EPOCHS = 10000   # Total training epochs
 LEARNING_RATE = 1e-4
-GAMMA = 0.997  # ~333 step effective horizon (~3 minutes at 500ms/step) - balances immediate vs long-term rewards
+GAMMA = 0.99  # ~100 step effective horizon (~50 seconds) - easier for value function to learn
 GAE_LAMBDA = 0.95
-BASE_SPREAD_BPS = 1.0  # Base spread in basis points (2 bps = $20 on $100k BTC - reasonable for crypto)
-MIN_SIZE_PCT = 1.0      # Minimum order size as % of balance (must match env config)
-MAX_SIZE_PCT = 5.0     # Maximum order size as % of balance (must match env config)
+BASE_SPREAD_BPS = 3.0  # Base spread in basis points (3 bps = $30 on $100k BTC - room for spread capture)
+MIN_SIZE_PCT = 5.0      # Order size as % of balance (fixed, no RL control)
+MAX_SIZE_PCT = 5.0     # Same as MIN - fixed size, no RL control
 
 # === Environment setup ===
 print("Creating environment...")
@@ -78,13 +78,14 @@ torch.manual_seed(42)
 np.random.seed(42)
 
 # Model with separate heads:
-# - Continuous head (Normal): 4 quote parameters (bid_spread, ask_spread, skew, target_inventory)
+# - Continuous head (Normal): 3 quote parameters (bid_spread, ask_spread, target_inventory)
 # - Binary head (Bernoulli): 1 requote decision
 # - 3 hidden layers with LayerNorm for stable training
 model = SimpleActorCritic(
-    obs_dim=16,  # 13 market signals + 3 AMM flow signals
-    action_dim=5,  # 4 quote params (bid_spread, ask_spread, skew, target_inventory) + 1 requote decision
-    hidden_dim=128,  # Increased from 64 for better representation of market dynamics
+    obs_dim=18,  # 13 market + 4 AMM flow + 1 agent state (leverage)
+    action_dim=4,  # 3 quote params (bid_spread, ask_spread, target_inventory) + 1 requote decision
+    hidden_dim=128,  # MLP hidden dimension
+    lstm_hidden=64,  # LSTM hidden dimension for temporal patterns
 )
 print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -95,14 +96,13 @@ policy = SimplePPOPolicy(
     gamma=GAMMA,
     gae_lambda=GAE_LAMBDA,
     clip_eps=0.2,
-    vf_coef=0.1,  # Reduced from 0.5 - value loss was dominating (2748+), this should help balance
-    ent_coef=0.05,  # Reduced - log_std is clamped now to prevent entropy explosion
-    max_grad_norm=1.0,  # Increased for stability
+    vf_coef=0.25,  # Increased to improve value function learning
+    ent_coef=0.01,  # Reduced to allow policy to become more deterministic
+    max_grad_norm=0.5,  # Standard value for PPO
 )
 
-REWARD_SCALE = 100.0  # Reduced from 1000.0 - value loss was too high (64k-138k)
-                      # With GAMMA=0.997 over 4096 steps, returns accumulate quickly
-                      # Lower scale makes value function easier to learn while preserving gradients
+REWARD_SCALE = 50.0  # Reduced to make value function easier to learn
+                      # With GAMMA=0.99 over 2048 steps, returns are more manageable
 
 collector = SimpleCollector(
     env=env,
@@ -113,7 +113,7 @@ collector = SimpleCollector(
     reward_scale=REWARD_SCALE,
 )
 
-goal_mgr = NetPnlGoalManager(device)
+# Removed: goal_mgr (HER-style reward shaping not needed with dense rewards)
 
 # === Metrics logger ===
 metric_logger = MetricLogger(print_interval=N_STEPS * NUM_ENVS)  # Log every rollout
@@ -166,9 +166,6 @@ def train():
         # === Collect rollout ===
         batch = collector.collect()
         
-        # === HER-style reward shaping ===
-        goal_mgr.relabel_rewards(batch)
-        
         # === PPO Update ===
         batch_size = batch['obs'].shape[0]
         indices = np.arange(batch_size)
@@ -210,21 +207,19 @@ def train():
         
         # Diagnostic: Check requote decisions and PnL
         actions_np = batch['actions'].detach().cpu().numpy()
-        requote_actions = actions_np[:, 4]  # Last action (index 4) is requote decision
+        requote_actions = actions_np[:, 3]  # Last action (index 3) is requote decision
         requote_rate = (requote_actions > 0).mean()  # Fraction of steps that requoted
         
         # Check quote parameter statistics (only when requoting)
-        requote_mask = actions_np[:, 4] > 0
+        requote_mask = actions_np[:, 3] > 0
         if requote_mask.sum() > 0:
-            quote_actions = actions_np[requote_mask, :4]  # First 4 actions: bid_spread, ask_spread, skew, target_inventory
+            quote_actions = actions_np[requote_mask, :3]  # First 3 actions: bid_spread, ask_spread, target_inventory
             avg_bid_spread = quote_actions[:, 0].mean()
             avg_ask_spread = quote_actions[:, 1].mean()
-            avg_skew = quote_actions[:, 2].mean()
-            avg_target_inv = quote_actions[:, 3].mean()
+            avg_target_inv = quote_actions[:, 2].mean()
         else:
             avg_bid_spread = 0.0
             avg_ask_spread = 0.0
-            avg_skew = 0.0
             avg_target_inv = 0.0
         
         # Extract info for diagnostics - average across all environments from last step
@@ -372,33 +367,33 @@ def train():
             torch.save(model.state_dict(), results_dir / "best_model.pth")
         
         # Calculate actual quote parameters (for diagnostics)
-        # bid_spread/ask_spread: [-1, 1] -> linear mapping to [MIN_SPREAD_MULT, MAX_SPREAD_MULT]
-        # Must match strategy.cc: mid_mult + action * range_mult
+        # bid_spread/ask_spread: [-1, 1] -> EXPONENTIAL mapping to [MIN_SPREAD_MULT, MAX_SPREAD_MULT]
+        # Must match strategy.cc: center_mult * exp(action * log_ratio)
         # size: fixed at MIN_SIZE_PCT (no RL control)
         MIN_SPREAD_MULT = 0.2  # Must match strategy.h
         MAX_SPREAD_MULT = 3.0  # Must match strategy.h
-        MID_MULT = (MAX_SPREAD_MULT + MIN_SPREAD_MULT) / 2.0  # 1.6
-        RANGE_MULT = (MAX_SPREAD_MULT - MIN_SPREAD_MULT) / 2.0  # 1.4
+        LOG_RATIO = np.log(MAX_SPREAD_MULT / MIN_SPREAD_MULT) / 2.0  # ~1.35
+        CENTER_MULT = np.sqrt(MAX_SPREAD_MULT * MIN_SPREAD_MULT)     # ~0.77
         
         if requote_mask.sum() > 0:
-            quote_actions = actions_np[requote_mask, :4]  # bid_spread, ask_spread, skew, target_inventory
-            # Bid spread: linear mapping to match C++ calculation
+            quote_actions = actions_np[requote_mask, :3]  # bid_spread, ask_spread, target_inventory
+            # Bid spread: exponential mapping to match C++ calculation
             bid_spread_actions = quote_actions[:, 0]
-            bid_spread_mult = MID_MULT + bid_spread_actions * RANGE_MULT  # action [-1,1] → mult [0.2, 3.0]
+            bid_spread_mult = CENTER_MULT * np.exp(bid_spread_actions * LOG_RATIO)
             actual_bid_spread_bps = BASE_SPREAD_BPS * bid_spread_mult.mean()
             
-            # Ask spread: linear mapping
+            # Ask spread: exponential mapping
             ask_spread_actions = quote_actions[:, 1]
-            ask_spread_mult = MID_MULT + ask_spread_actions * RANGE_MULT  # action [-1,1] → mult [0.2, 3.0]
+            ask_spread_mult = CENTER_MULT * np.exp(ask_spread_actions * LOG_RATIO)
             actual_ask_spread_bps = BASE_SPREAD_BPS * ask_spread_mult.mean()
             
             # Average spread for logging (show bid/ask separately to diagnose)
             actual_spread_bps = (actual_bid_spread_bps + actual_ask_spread_bps) / 2.0
             size_pct = MIN_SIZE_PCT  # Fixed at minimum size
         else:
-            actual_bid_spread_bps = BASE_SPREAD_BPS * MID_MULT
-            actual_ask_spread_bps = BASE_SPREAD_BPS * MID_MULT
-            actual_spread_bps = BASE_SPREAD_BPS * MID_MULT
+            actual_bid_spread_bps = BASE_SPREAD_BPS * CENTER_MULT
+            actual_ask_spread_bps = BASE_SPREAD_BPS * CENTER_MULT
+            actual_spread_bps = BASE_SPREAD_BPS * CENTER_MULT
             size_pct = MIN_SIZE_PCT
         
         # Calculate ACTUAL effective spreads from placed prices (accounts for skew and clamping)
@@ -514,9 +509,9 @@ if __name__ == "__main__":
     print(f"Environments: {NUM_ENVS}")
     print(f"Threads: {NUM_THREADS}")
     print(f"Steps per rollout: {N_STEPS}")
-    print(f"Observations: 16 signals (13 market + 3 AMM flow signals)")
-    print(f"Actions: 5 (4 continuous quote params + 1 binary requote decision)")
-    print(f"  Quote params: bid_spread, ask_spread, skew, target_inventory (continuous)")
+    print(f"Observations: 18 signals (13 market + 4 AMM flow + 1 agent state)")
+    print(f"Actions: 4 (3 continuous quote params + 1 binary requote decision)")
+    print(f"  Quote params: bid_spread, ask_spread, target_inventory (continuous)")
     print(f"  Order size: fixed at min_size_pct ({MIN_SIZE_PCT}%) - no RL control")
     print(f"  Requote: binary decision (>0 = requote, <=0 = continue)")
     print(f"  Note: target_inventory is smoothed with EMA (alpha=0.05) to prevent flickering")

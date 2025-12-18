@@ -82,6 +82,7 @@ void EnvAdaptor::computeInfo(OrderBook &book) {
     info["unrealized_pnl"] = posInfo.inventoryPnL;
     info["realized_pnl"] = posInfo.realizedPnL;
     info["leverage"] = posInfo.leverage;
+    info["target_inventory"] = strategy.getTargetInventory();  // Agent's desired inventory level
     info["trade_count"] = static_cast<double>(tradeInfo.buy_trades + tradeInfo.sell_trades);
     info["buy_trades"] = static_cast<double>(tradeInfo.buy_trades);
     info["sell_trades"] = static_cast<double>(tradeInfo.sell_trades);
@@ -106,14 +107,30 @@ void EnvAdaptor::computeState(OrderBook& book)
     // Copy market signals [0..12] (13 signals)
     std::copy_n(market_signals.begin(), market_signals.size(), state.begin());
     
-    // Compute AMM flow signals [13..15] (3 signals)
+    // Compute AMM flow signals [13..16] (4 signals)
     double mid_price = (book.bid_prices[0] + book.ask_prices[0]) * 0.5;
     if (mid_price > 0) {
         AmmFlowSignals amm_signals = amm_simulator.step(mid_price);
-        state[13] = amm_signals.net_flow;        // Cumulative flow direction
+        state[13] = amm_signals.net_flow;        // EMA-based flow momentum
         state[14] = amm_signals.flow_imbalance;  // Recent buy/sell imbalance
         state[15] = amm_signals.inventory_delta; // LP inventory change
+        
+        // [16] Cumulative flow / balance: trend indicator for target inventory
+        // Normalized by initial balance to give [-1, 1] scale for typical flow ranges
+        double init_balance = strategy.getPosition().getInitialBalance();
+        if (init_balance > 0) {
+            // Scale: cumulative_flow of ±balance maps to ±1
+            double flow_per_balance = amm_signals.cumulative_flow / init_balance;
+            state[16] = std::tanh(flow_per_balance);  // Smooth bounding to [-1, 1]
+        } else {
+            state[16] = 0.0;
+        }
     }
+    
+    // [17] Agent state: current leverage (position / balance)
+    // Critical for agent to know its own position for inventory management
+    auto posInfo = strategy.getPosition().getPositionInfo(book.bid_prices[0], book.ask_prices[0]);
+    state[17] = std::tanh(posInfo.leverage * 5.0);  // Scale: ±20% leverage maps to ±tanh(1) ≈ ±0.76
     
     computeInfo(book);
 }
