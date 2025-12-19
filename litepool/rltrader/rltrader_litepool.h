@@ -126,14 +126,10 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   
   // Reward tracking
   double prev_realized_pnl = 0.0;
-  double prev_unrealized_from_anchor = 0.0;
+  double prev_unrealized_pnl = 0.0;  // Actual unrealized PnL (mark-to-market)
   double prev_fees = 0.0;  // Track fees for fee rebate reward
-  double price_anchor_ma = 0.0;  // Rolling MA of price (slow-moving "fair value")
-  bool price_anchor_initialized = false;
+  double prev_spread_capture = 0.0;  // LIFO spread capture tracking
   double initial_balance_ = 0.0; // Store initial balance for consistent reward scaling
-  
-  // Reward hyperparameters
-  static constexpr double PRICE_MA_ALPHA = 0.002;     // Slow MA: ~500 step half-life for unrealized PnL anchor
   
   // Terminal info cache (stores metrics before reset for episode logging)
   std::unordered_map<std::string, double> terminal_info_;
@@ -202,10 +198,9 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
 
   void Reset() override {
     prev_realized_pnl = 0.0;
-    prev_unrealized_from_anchor = 0.0;
+    prev_unrealized_pnl = 0.0;
     prev_fees = 0.0;
-    price_anchor_ma = 0.0;
-    price_anchor_initialized = false;
+    prev_spread_capture = 0.0;
     initial_balance_ = balance;  // Store initial balance for consistent reward scaling
     steps = 0;
     had_fills_prev_step_ = false;  // Reset fill tracking
@@ -245,7 +240,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
       
       // Only requote if should_requote > 0, otherwise continue with existing quotes
       if (action.should_requote > 0.0) {
-          adaptor_ptr->quote(action);
+      adaptor_ptr->quote(action);
       }
       
       // Get trade count before advancing time to detect new fills
@@ -318,54 +313,42 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
         state["info:final_net_amount_btc"_] = 0.0;
     }
     
-    // === Reward Calculation with Rolling MA Anchor ===
+    // === Reward Calculation ===
     double mid_price = info["mid_price"];
     double leverage = info["leverage"];
     
-    // 1. Initialize or update price anchor (slow-moving MA = "fair value")
-    if (!price_anchor_initialized && mid_price > 0) {
-        price_anchor_ma = mid_price;
-        price_anchor_initialized = true;
-    } else if (mid_price > 0) {
-        price_anchor_ma = PRICE_MA_ALPHA * mid_price + (1.0 - PRICE_MA_ALPHA) * price_anchor_ma;
-    }
+    // 1. LIFO Spread Capture delta (profit from closed round-trips)
+    // This is the profit from completing round-trips (buy low, sell high)
+    // Represents realized PnL from closed trades (excluding fees)
+    double spread_capture_delta = info["spread_capture"] - prev_spread_capture;
+    prev_spread_capture = info["spread_capture"];
     
-    // 2. Realized PnL delta (clean, from closed trades)
-    double realized_delta = info["realized_pnl"] - prev_realized_pnl;
-    prev_realized_pnl = info["realized_pnl"];
+    // 2. Unrealized PnL delta (actual mark-to-market, reduced weight)
+    // Use actual unrealized PnL from position tracking (not approximation)
+    // This represents mark-to-market PnL from open positions
+    double current_unrealized_pnl = info["unrealized_pnl"];
+    double unrealized_delta = current_unrealized_pnl - prev_unrealized_pnl;
+    prev_unrealized_pnl = current_unrealized_pnl;
     
-    // 3. Unrealized PnL relative to rolling anchor (using INITIAL balance for consistent scaling)
-    //    U = leverage * initial_balance * (price - anchor) / anchor
-    //    Since leverage ≈ position_value / initial_balance, this gives:
-    //    U ≈ position_value * price_deviation (consistent units)
-    //    - Long (leverage > 0) when price > anchor → positive reward
-    //    - Short (leverage < 0) when price < anchor → positive reward
-    double unrealized_from_anchor = 0.0;
-    if (price_anchor_ma > 0 && initial_balance_ > 0) {
-        double price_deviation = (mid_price - price_anchor_ma) / price_anchor_ma;
-        unrealized_from_anchor = leverage * initial_balance_ * price_deviation;
-    }
-    double unrealized_delta = unrealized_from_anchor - prev_unrealized_from_anchor;
-    prev_unrealized_from_anchor = unrealized_from_anchor;
-    
-    // Fee rebate reward: with maker_fee < 0, fees becomes more negative when trading
+    // 3. Fee rebate reward: with maker_fee < 0, fees becomes more negative when trading
     // We reward the agent for earning rebates (flip sign so rebates = positive reward)
     double current_fees = info["fees"];
     double fee_delta = -(current_fees - prev_fees);  // Positive when rebates earned
     prev_fees = current_fees;
     
-    // Inventory deviation penalty: only penalize excess inventory beyond target
-    // Agent sets target_inventory, so we respect that and only penalize deviation
-    // This aligns incentives: agent can hold inventory if it chooses to
-    constexpr double INVENTORY_DEV_COST = 0.1;  // Penalty per unit deviation from target
-    double target_inventory = info["target_inventory"];  // Agent's desired inventory level [-1, 1] scaled to leverage
-    double target_leverage = target_inventory * 0.5;     // Scale [-1,1] to ±50% max target leverage
+    // 4. Inventory deviation penalty: only penalize excess inventory beyond target
+    // Reduced cost: inventory management is important but shouldn't dominate reward
+    // The penalty is applied every step, so it needs to be small relative to spread capture
+    constexpr double INVENTORY_DEV_COST = 0.01;  // Reduced from 0.05 to 0.01 (5x reduction)
+    double target_inventory = info["target_inventory"];
+    double target_leverage = target_inventory * 0.5;
     double inventory_deviation = std::abs(leverage - target_leverage);
     double inventory_penalty = INVENTORY_DEV_COST * inventory_deviation;
     
-    // Total reward: realized PnL delta + unrealized PnL delta + fee rebates - inventory cost
-    // Agent now gets rewarded for trading (via maker rebates) but penalized for holding inventory
-    double reward = realized_delta + unrealized_delta + fee_delta - inventory_penalty;
+    // Total reward: spread capture (closed trades) + unrealized (open positions) + fees - inventory cost
+    // Both realized and unrealized PnL are at full weight to directly represent actual profits
+    constexpr double UNREALIZED_WEIGHT = 1.0;
+    double reward = spread_capture_delta + UNREALIZED_WEIGHT * unrealized_delta + fee_delta - inventory_penalty;
     state["reward"_] = reward;
     
     state["obs"_].Assign(data.begin(), data.size());

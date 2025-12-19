@@ -81,6 +81,7 @@ void EnvAdaptor::computeInfo(OrderBook &book) {
     info["balance"] = posInfo.balance;
     info["unrealized_pnl"] = posInfo.inventoryPnL;
     info["realized_pnl"] = posInfo.realizedPnL;
+    info["spread_capture"] = posInfo.spreadCapture;  // LIFO spread capture from closed round-trips
     info["leverage"] = posInfo.leverage;
     info["target_inventory"] = strategy.getTargetInventory();  // Agent's desired inventory level
     info["trade_count"] = static_cast<double>(tradeInfo.buy_trades + tradeInfo.sell_trades);

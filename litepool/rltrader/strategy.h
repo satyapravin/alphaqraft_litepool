@@ -102,10 +102,10 @@ namespace RLTrader {
         static constexpr double TARGET_EMA_ALPHA = 0.05;     // Target inventory smoothing
         static constexpr double VOL_EMA_ALPHA = 0.1;         // Volatility EMA (~10 sample half-life)
         static constexpr double VOL_SPREAD_MULT = 50.0;      // How much volatility widens spread
-        static constexpr double INVENTORY_SKEW_MULT = 2.0;   // How much inventory shifts mid-point
+        static constexpr double INVENTORY_SKEW_MULT = 1.0;   // Reduced: smoother quote shifts, agent spreads respected more
         // REMOVED: ACTION_SKEW_MULT - skew is now fully determined by inventory error
         // Agent controls inventory via target_inventory action only (no conflicting skew action)
         static constexpr double MAX_SPREAD_MULT = 3.0;       // Maximum spread multiplier from action
-        static constexpr double MIN_SPREAD_MULT = 0.2;       // Minimum spread multiplier from action
+        static constexpr double MIN_SPREAD_MULT = 0.5;       // Minimum spread multiplier (0.5x base = 1.5bps floor)
     };
 }

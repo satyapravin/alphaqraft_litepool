@@ -1,6 +1,7 @@
 #pragma once
 #include "base_instrument.h"
 #include "order.h"
+#include <deque>
 
 namespace RLTrader {
 	struct PositionInfo {
@@ -11,6 +12,7 @@ namespace RLTrader {
         double inventoryPnL = 0;
         double leverage = 0;
 	double fees = 0;
+        double spreadCapture = 0;  // Cumulative spread captured from closed round-trips
     };
 
     struct TradeInfo {
@@ -20,6 +22,13 @@ namespace RLTrader {
         double sell_amount = 0;
         double average_buy_price = 0;
         double average_sell_price = 0;
+    };
+
+    // Individual open position entry for LIFO tracking
+    struct OpenEntry {
+        OrderSide side;
+        double price;
+        double amount;
     };
 
     class Position {
@@ -33,6 +42,10 @@ namespace RLTrader {
         double balance = 0.0;
         TradeInfo trade_info;
 
+        // LIFO stacks for spread capture tracking
+        std::deque<OpenEntry> long_stack;   // BUY entries waiting to close
+        std::deque<OpenEntry> short_stack;  // SELL entries waiting to close
+        double spreadCapture = 0.0;         // Cumulative spread captured
 
     public:
         Position(BaseInstrument& instr, const double& aBalance, const double& initialQty, const double& initialAvgprice);
@@ -43,6 +56,7 @@ namespace RLTrader {
         [[nodiscard]] double getNetAmount() const { return netAmount; }
         [[nodiscard]] double getInitialBalance() const { return initialBalance; }
         [[nodiscard]] long getNumberOfTrades() const { return numOfTrades; }
+        [[nodiscard]] double getSpreadCapture() const { return spreadCapture; }
         TradeInfo& getTradeInfo() { return trade_info; }
     };
 }

@@ -69,20 +69,15 @@ std::pair<double, double> Strategy::computeQuotePrices(
     double tick_size) {
     
     // ============================================================================
-    // Avellaneda-Stoikov Inspired Market Making Model
+    // Direct Spread Control Model
     // ============================================================================
-    // Key insight: A market maker controls two things:
-    //   1. WHERE to quote (reservation price = adjusted fair value)
-    //   2. HOW WIDE to quote (spread = risk/reward tradeoff)
-    //
-    // The model separates these concerns cleanly:
-    //   - Reservation price is shifted based on inventory (reduces adverse selection)
-    //   - Spread is widened based on volatility (compensates for risk)
-    //   - RL agent fine-tunes both through actions
+    // Agent directly controls bid_spread and ask_spread (full spreads in bps).
+    // No reservation price - quotes are placed symmetrically around mid-price,
+    // with inventory skew applied by adjusting spreads directly.
     // ============================================================================
     
-    // === Step 1: Compute base half-spread ===
-    double base_half_spread = mid_price * config.base_spread_bps / 10000.0 / 2.0;
+    // === Step 1: Compute base spread (in bps) ===
+    double base_spread_bps = config.base_spread_bps;
     
     // === Step 2: Volatility adjustment ===
     // In volatile markets, widen spreads to compensate for adverse selection risk
@@ -91,11 +86,10 @@ std::pair<double, double> Strategy::computeQuotePrices(
     double vol_mult = 1.0 + realized_vol * VOL_SPREAD_MULT;
     vol_mult = std::clamp(vol_mult, 1.0, 5.0);  // Cap at 5x widening
     
-    // === Step 3: Agent spread control ===
+    // === Step 3: Agent spread control (full spreads in bps) ===
     // bid_spread/ask_spread actions: [-1, 1] → [MIN_SPREAD_MULT, MAX_SPREAD_MULT]
     // EXPONENTIAL mapping: more control at tighter spreads (where it matters most)
-    // action=-1 → MIN_SPREAD_MULT (0.2x), action=0 → 1.0x, action=+1 → MAX_SPREAD_MULT (3.0x)
-    // Formula: mult = exp(action * log_ratio) where log_ratio = ln(MAX/MIN)/2
+    // action=-1 → MIN_SPREAD_MULT (0.5x), action=0 → 1.0x, action=+1 → MAX_SPREAD_MULT (3.0x)
     double log_ratio = std::log(MAX_SPREAD_MULT / MIN_SPREAD_MULT) / 2.0;  // ~1.35
     double center_mult = std::sqrt(MAX_SPREAD_MULT * MIN_SPREAD_MULT);     // Geometric mean ~0.77
     
@@ -106,47 +100,40 @@ std::pair<double, double> Strategy::computeQuotePrices(
     bid_spread_mult = std::clamp(bid_spread_mult, MIN_SPREAD_MULT, MAX_SPREAD_MULT);
     ask_spread_mult = std::clamp(ask_spread_mult, MIN_SPREAD_MULT, MAX_SPREAD_MULT);
     
-    // === Step 4: Compute final half-spreads ===
-    double bid_half_spread = base_half_spread * vol_mult * bid_spread_mult;
-    double ask_half_spread = base_half_spread * vol_mult * ask_spread_mult;
+    // === Step 4: Compute base spreads (full spreads in bps) ===
+    double bid_spread_bps = base_spread_bps * vol_mult * bid_spread_mult;
+    double ask_spread_bps = base_spread_bps * vol_mult * ask_spread_mult;
     
-    // === Step 5: Compute reservation price (adjusted fair value) ===
-    // The key insight from Avellaneda-Stoikov: when holding inventory,
-    // shift your quotes to incentivize trades that reduce inventory.
-    //
-    // If long (leverage > 0): shift quotes DOWN (lower reservation price)
-    //   → bid becomes less attractive (lower), ask becomes more attractive (lower)
-    //   → more likely to sell, reduce long position
-    //
-    // If short (leverage < 0): shift quotes UP (higher reservation price)
-    //   → bid becomes more attractive (higher), ask becomes less attractive (higher)
-    //   → more likely to buy, reduce short position
-    
-    // Inventory error: how far we are from target
+    // === Step 5: Apply inventory skew by adjusting spreads directly ===
+    // If long (leverage > 0): widen bid spread, tighten ask spread → more likely to sell
+    // If short (leverage < 0): tighten bid spread, widen ask spread → more likely to buy
     // target_inventory_ema is in [-1, 1], scale to leverage units [-0.1, 0.1]
     double target_leverage = target_inventory_ema * 0.1;  // Scale to match leverage range
     double inventory_error = leverage - target_leverage;
     
-    // Inventory-based skew: shift mid-point to reduce inventory error
-    // Negative sign: positive error (too long) → negative shift (quote lower)
-    // SIMPLIFIED: Removed action.skew - target_inventory is the only inventory control
-    // This avoids conflicts where agent could set opposing target_inventory and skew
-    double total_skew = -inventory_error * INVENTORY_SKEW_MULT;
-    total_skew = std::clamp(total_skew, -1.5, 1.5);
+    // Skew factor: positive when long (widen bid, tighten ask), negative when short
+    double skew_factor = -inventory_error * INVENTORY_SKEW_MULT;
+    skew_factor = std::clamp(skew_factor, -1.5, 1.5);
     
-    // Compute reservation price shift (in price units)
-    double skew_shift = total_skew * base_half_spread;
-    double reservation_price = mid_price + skew_shift;
+    // Apply skew: widen one side, tighten the other
+    // Positive skew_factor (long) → widen bid, tighten ask
+    // Negative skew_factor (short) → tighten bid, widen ask
+    double skew_adjustment_bps = skew_factor * base_spread_bps * 0.3;  // Max 30% adjustment
+    bid_spread_bps += skew_adjustment_bps;   // Widen bid when long (positive skew)
+    ask_spread_bps -= skew_adjustment_bps;  // Tighten ask when long (positive skew)
     
-    // === Step 6: Compute final quote prices ===
-    // IMPORTANT: Ensure spreads are wide enough to keep quotes on correct side of mid
-    // If skew shifts reservation UP, bid needs extra spread to stay below mid
-    // If skew shifts reservation DOWN, ask needs extra spread to stay above mid
-    double min_bid_half_spread = std::max(bid_half_spread, skew_shift + base_half_spread * 0.5);
-    double min_ask_half_spread = std::max(ask_half_spread, -skew_shift + base_half_spread * 0.5);
+    // Ensure minimum spreads (safety floor)
+    bid_spread_bps = std::max(bid_spread_bps, base_spread_bps * MIN_SPREAD_MULT);
+    ask_spread_bps = std::max(ask_spread_bps, base_spread_bps * MIN_SPREAD_MULT);
     
-    double bid_price = reservation_price - min_bid_half_spread;
-    double ask_price = reservation_price + min_ask_half_spread;
+    // === Step 6: Convert spreads to price units and place quotes ===
+    // Agent controls FULL spreads (distance from mid to quote)
+    // No division by 2 - bid_spread_bps is already the full distance from mid
+    double bid_spread_price = mid_price * bid_spread_bps / 10000.0;
+    double ask_spread_price = mid_price * ask_spread_bps / 10000.0;
+    
+    double bid_price = mid_price - bid_spread_price;
+    double ask_price = mid_price + ask_spread_price;
     
     // === Step 7: Safety checks ===
     // REMOVED: 1 bps minimum floor - let agent learn consequences of tight spreads
@@ -170,10 +157,10 @@ std::pair<double, double> Strategy::computeQuoteSizes(
     const RLAction& action,
     double init_balance) {
     
-    // Use fixed size (min_size_pct) - no RL control over size
-    // This simplifies the action space and focuses learning on spread/skew
-    double size_pct = config.min_size_pct;
-    double size_usd = size_pct / 100.0 * init_balance;
+    // Use 1% size per level for ladder quoting
+    // With 5 levels, total exposure is 5% per side
+    constexpr double SIZE_PER_LEVEL_PCT = 1.0;
+    double size_usd = SIZE_PER_LEVEL_PCT / 100.0 * init_balance;
     
     return {size_usd, size_usd};
 }
@@ -181,10 +168,27 @@ std::pair<double, double> Strategy::computeQuoteSizes(
 void Strategy::quote(const RLAction& action,
                      FixedVector<double, 20>& bid_prices,
                      FixedVector<double, 20>& ask_prices) {
+    // ============================================================================
+    // LADDER QUOTING: Place 5 levels of orders per side
+    // ============================================================================
+    // Level 1: 1x base spread (closest to mid, fills first)
+    // Level 2: 2x base spread
+    // Level 3: 3x base spread
+    // Level 4: 4x base spread
+    // Level 5: 5x base spread (furthest from mid, fills last)
+    //
+    // Benefits:
+    // - Reduced adverse selection (only closest level fills on small moves)
+    // - Natural dollar-cost averaging on big moves
+    // - More rebates (5 fills = 5x rebates)
+    // - More realistic market making
+    // ============================================================================
+    
+    constexpr int NUM_LEVELS = 5;
+    
     // Validate RL outputs are in expected range [-1, 1]
     assert(action.bid_spread >= -1.0001 && action.bid_spread <= 1.0001);
     assert(action.ask_spread >= -1.0001 && action.ask_spread <= 1.0001);
-    // Note: skew action removed - now computed automatically from inventory error
     
     // Early exit if prices invalid
     if (bid_prices[0] < 0.0001 || ask_prices[0] < 0.0001) return;
@@ -195,79 +199,69 @@ void Strategy::quote(const RLAction& action,
     auto leverage = posInfo.leverage;
     auto initBalance = position.getInitialBalance();
     auto mid_price = (bid_prices[0] + ask_prices[0]) * 0.5;
+    double best_bid = bid_prices[0];
+    double best_ask = ask_prices[0];
     
     // Update volatility estimate for spread adjustment
     updateVolatility(mid_price);
     
-    // Compute quote prices and sizes using Avellaneda-Stoikov inspired model
-    auto [bid_price, ask_price] = computeQuotePrices(action, mid_price, leverage, tick_size);
-    auto [bid_size_0, ask_size_0] = computeQuoteSizes(action, initBalance);
+    // Compute base quote prices (for level 1)
+    auto [base_bid_price, base_ask_price] = computeQuotePrices(action, mid_price, leverage, tick_size);
+    auto [level_size, _] = computeQuoteSizes(action, initBalance);
     
-    // Ensure quotes don't cross the book
-    // IMPORTANT: Don't clamp quotes to market edges - respect the computed spread
-    // If computed spread is wide, quotes should be far from market (won't fill easily)
-    // If computed spread is tight, quotes will be competitive (will fill more easily)
-    double best_bid = bid_prices[0];
-    double best_ask = ask_prices[0];
+    // Calculate spreads from mid for ladder spacing
+    double bid_spread_from_mid = mid_price - base_bid_price;  // Positive value
+    double ask_spread_from_mid = base_ask_price - mid_price;  // Positive value
     
-    // Only prevent crossing - don't clamp to market edges
-    // This allows the agent to control how competitive its quotes are
-    if (bid_price >= best_ask) {
-        // Computed bid would cross - adjust to just below best ask
-        bid_price = best_ask - tick_size;
-    }
-    if (ask_price <= best_bid) {
-        // Computed ask would cross - adjust to just above best bid
-        ask_price = best_bid + tick_size;
-    }
-    
-    // CRITICAL: After crossing prevention, ensure quotes are still on correct side of mid
-    // Use tick_size as minimum (not 1 bps) - let agent learn from tight spreads
-    if (bid_price > mid_price - tick_size) {
-        bid_price = mid_price - tick_size;
-        bid_price = std::floor(bid_price / tick_size) * tick_size;
-    }
-    if (ask_price < mid_price + tick_size) {
-        ask_price = mid_price + tick_size;
-        ask_price = std::ceil(ask_price / tick_size) * tick_size;
-    }
-    
-    // Ensure valid spread (bid < ask)
-    if (bid_price >= ask_price) {
-        // Invalid spread - use minimum 1-tick spread centered at mid
-        double center = (best_bid + best_ask) * 0.5;
-        bid_price = center - tick_size / 2.0;
-        ask_price = center + tick_size / 2.0;
-    }
+    // Ensure minimum spread of 1 tick
+    bid_spread_from_mid = std::max(bid_spread_from_mid, tick_size);
+    ask_spread_from_mid = std::max(ask_spread_from_mid, tick_size);
     
     // Cancel existing orders before placing new ones
     exchange.cancelOrders();
     
-    // Convert to trade amounts (rounded to minAmount)
-    bid_size_0 = instrument.getTradeAmount(bid_size_0, bid_price);
-    ask_size_0 = instrument.getTradeAmount(ask_size_0, ask_price);
+    // Convert size to trade amount
+    level_size = instrument.getTradeAmount(level_size, mid_price);
     
-    // No hard position cap - let agent manage inventory risk through target_inventory
-    // Only use config.max_leverage as an absolute safety limit (typically very high, e.g. 5x)
+    // Check position limits
+    bool can_place_bids = (level_size >= minAmount) && (leverage < config.max_leverage);
+    bool can_place_asks = (level_size >= minAmount) && (leverage > -config.max_leverage);
     
-    // Check if placing bid is allowed: meet minimum size and absolute leverage limit
-    bool can_place_bid = (bid_size_0 >= minAmount) && (leverage < config.max_leverage);
-    
-    // Check if placing ask is allowed: meet minimum size and absolute leverage limit
-    bool can_place_ask = (ask_size_0 >= minAmount) && (leverage > -config.max_leverage);
-    
-    // Store last placed prices for diagnostics (0 indicates order not placed)
+    // Store first level prices for diagnostics
     last_mid_price = mid_price;
-    last_bid_price = can_place_bid ? bid_price : 0.0;
-    last_ask_price = can_place_ask ? ask_price : 0.0;
+    last_bid_price = can_place_bids ? (mid_price - bid_spread_from_mid) : 0.0;
+    last_ask_price = can_place_asks ? (mid_price + ask_spread_from_mid) : 0.0;
     
-    // Place orders with hard position limits
-    if (can_place_bid) {
-        this->exchange.quote(std::to_string(++order_id), OrderSide::BUY, bid_price, bid_size_0);
+    // Place ladder of orders
+    for (int level = 1; level <= NUM_LEVELS; ++level) {
+        // Spread increases with level: 1x, 2x, 3x, 4x, 5x base spread
+        double level_bid_spread = bid_spread_from_mid * level;
+        double level_ask_spread = ask_spread_from_mid * level;
+        
+        double bid_price = mid_price - level_bid_spread;
+        double ask_price = mid_price + level_ask_spread;
+        
+        // Round to tick size
+        bid_price = std::floor(bid_price / tick_size) * tick_size;
+        ask_price = std::ceil(ask_price / tick_size) * tick_size;
+        
+        // Prevent crossing
+        if (bid_price >= best_ask) {
+            bid_price = best_ask - tick_size * level;
+        }
+        if (ask_price <= best_bid) {
+            ask_price = best_bid + tick_size * level;
+        }
+        
+        // Place bid at this level
+        if (can_place_bids && bid_price > 0) {
+            this->exchange.quote(std::to_string(++order_id), OrderSide::BUY, bid_price, level_size);
     }
         
-    if (can_place_ask) {
-        this->exchange.quote(std::to_string(++order_id), OrderSide::SELL, ask_price, ask_size_0);
+        // Place ask at this level
+        if (can_place_asks && ask_price > 0) {
+            this->exchange.quote(std::to_string(++order_id), OrderSide::SELL, ask_price, level_size);
+        }
     }
 }
 

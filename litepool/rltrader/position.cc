@@ -28,6 +28,11 @@ void Position::reset(const double& initialQty, const double& initialPrice) {
     trade_info.sell_amount = 0;
     trade_info.average_buy_price = 0;
     trade_info.average_sell_price = 0;
+    
+    // Clear LIFO stacks
+    long_stack.clear();
+    short_stack.clear();
+    spreadCapture = 0.0;
 }
 
 PositionInfo Position::getPositionInfo(const double& bidPrice, const double& askPrice) const {
@@ -40,6 +45,7 @@ PositionInfo Position::getPositionInfo(const double& bidPrice, const double& ask
     info.netPosition = this->instrument.getPositionFromAmount(netAmount, mid);
     info.leverage = 0;
     info.fees = totalFee;
+    info.spreadCapture = this->spreadCapture;  // LIFO spread capture
     
     if (this->averagePrice > instrument.getTickSize()) {
         // Equity = balance + unrealized_pnl - fees
@@ -64,7 +70,7 @@ void Position::onFill(const Order& order)
         throw std::runtime_error("Invalid order amount");
     }
 
-
+    // Track trade info
     if (order.side == OrderSide::BUY) {
         trade_info.average_buy_price *= trade_info.buy_amount;
         trade_info.buy_trades++;
@@ -79,10 +85,67 @@ void Position::onFill(const Order& order)
         trade_info.average_sell_price /= trade_info.sell_amount;
     }
 
+    // =========================================================================
+    // LIFO Spread Capture: Track open positions and calculate spread on close
+    // =========================================================================
+    // BUY fills: close shorts (LIFO) or open new longs
+    // SELL fills: close longs (LIFO) or open new shorts
+    // =========================================================================
+    
+    double remaining_amount = order.amount;
+    
+    if (order.side == OrderSide::BUY) {
+        // BUY: First try to close short positions (LIFO - from back)
+        while (remaining_amount > 0 && !short_stack.empty()) {
+            auto& entry = short_stack.back();
+            double close_amount = std::min(remaining_amount, entry.amount);
+            
+            // Spread capture: we sold at entry.price, now buying back at order.price
+            // Profit = (sell_price - buy_price) * amount
+            double spread = (entry.price - order.price) * close_amount;
+            spreadCapture += spread;
+            
+            remaining_amount -= close_amount;
+            entry.amount -= close_amount;
+            
+            if (entry.amount <= 0) {
+                short_stack.pop_back();
+            }
+        }
+        
+        // Remaining amount opens new long position
+        if (remaining_amount > 0) {
+            long_stack.push_back({OrderSide::BUY, order.price, remaining_amount});
+        }
+    } else {
+        // SELL: First try to close long positions (LIFO - from back)
+        while (remaining_amount > 0 && !long_stack.empty()) {
+            auto& entry = long_stack.back();
+            double close_amount = std::min(remaining_amount, entry.amount);
+            
+            // Spread capture: we bought at entry.price, now selling at order.price
+            // Profit = (sell_price - buy_price) * amount
+            double spread = (order.price - entry.price) * close_amount;
+            spreadCapture += spread;
+            
+            remaining_amount -= close_amount;
+            entry.amount -= close_amount;
+            
+            if (entry.amount <= 0) {
+                long_stack.pop_back();
+            }
+        }
+        
+        // Remaining amount opens new short position
+        if (remaining_amount > 0) {
+            short_stack.push_back({OrderSide::SELL, order.price, remaining_amount});
+        }
+    }
+
+    // Original position tracking (for legacy compatibility)
     double pnl = 0;
     double sideSign = order.side == OrderSide::BUY ? 1.0 : -1.0;
 
-    // Use 1% of minAmount as threshold for "no position"
     const double positionThreshold = instrument.getMinAmount() * 0.01;
     if (std::abs(netAmount) < positionThreshold) {
         averagePrice = order.price;
@@ -103,7 +166,6 @@ void Position::onFill(const Order& order)
             netAmount += order.amount * sideSign;
         }
     }
-
 
     totalFee += instrument.fees(order.amount, order.price, !order.is_taker);
     numOfTrades++;

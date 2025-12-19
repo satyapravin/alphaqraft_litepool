@@ -32,10 +32,10 @@ UPDATE_EPOCHS = 5      # PPO epochs per update
 MINIBATCH_SIZE = 256   # Minibatch size for updates
 TOTAL_EPOCHS = 10000   # Total training epochs
 LEARNING_RATE = 1e-4
-GAMMA = 0.99  # ~100 step effective horizon (~50 seconds) - easier for value function to learn
+GAMMA = 0.995    
 GAE_LAMBDA = 0.95
-BASE_SPREAD_BPS = 3.0  # Base spread in basis points (3 bps = $30 on $100k BTC - room for spread capture)
-MIN_SIZE_PCT = 5.0      # Order size as % of balance (fixed, no RL control)
+BASE_SPREAD_BPS = 1.0  # Base spread in basis points (1 bps = $10 on $100k BTC - room for spread capture)
+MIN_SIZE_PCT = 1.0      # 1% per level × 5 levels = 5% total per side (ladder quoting)
 MAX_SIZE_PCT = 5.0     # Same as MIN - fixed size, no RL control
 
 # === Environment setup ===
@@ -59,8 +59,8 @@ env = litepool.make(
     foldername="/home/pravin/dev/alphaqraft_litepool/data/training/",
     balance=100000.0,  # Starting capital: $100,000 USD
                        # With BTC ~$100k, 2% of $100k = $2,000 = ~0.02 BTC per order
-    start=1,
-    max=36000,  # 1-hour episodes: 36000 ticks / 5 = 7200 RL steps (episodes span ~3.5 rollouts)
+    start=50000,
+    max=2048*5,         
     base_spread_bps=BASE_SPREAD_BPS,  # Base spread in basis points
     min_size_pct=MIN_SIZE_PCT,        # Minimum order size as % of balance
     max_size_pct=MAX_SIZE_PCT,        # Maximum order size as % of balance
@@ -97,7 +97,7 @@ policy = SimplePPOPolicy(
     gae_lambda=GAE_LAMBDA,
     clip_eps=0.2,
     vf_coef=0.25,  # Increased to improve value function learning
-    ent_coef=0.01,  # Reduced to allow policy to become more deterministic
+    ent_coef=0.05,  # Higher entropy for more exploration (prevent policy collapse)
     max_grad_norm=0.5,  # Standard value for PPO
 )
 
@@ -370,7 +370,7 @@ def train():
         # bid_spread/ask_spread: [-1, 1] -> EXPONENTIAL mapping to [MIN_SPREAD_MULT, MAX_SPREAD_MULT]
         # Must match strategy.cc: center_mult * exp(action * log_ratio)
         # size: fixed at MIN_SIZE_PCT (no RL control)
-        MIN_SPREAD_MULT = 0.2  # Must match strategy.h
+        MIN_SPREAD_MULT = 0.5  # Must match strategy.h (0.5x base = 1.5bps floor)
         MAX_SPREAD_MULT = 3.0  # Must match strategy.h
         LOG_RATIO = np.log(MAX_SPREAD_MULT / MIN_SPREAD_MULT) / 2.0  # ~1.35
         CENTER_MULT = np.sqrt(MAX_SPREAD_MULT * MIN_SPREAD_MULT)     # ~0.77
@@ -428,15 +428,18 @@ def train():
             bid_prices = extract_prices(last_info, 'last_bid_price')
             ask_prices = extract_prices(last_info, 'last_ask_price')
             
-            # Calculate effective spreads from actual placed prices
+            # Calculate effective FULL spreads from actual placed prices
+            # bid_spread = distance from mid to bid (full spread, not half)
+            # ask_spread = distance from mid to ask (full spread, not half)
             valid_spreads = []
             for i in range(min(len(mid_prices), len(bid_prices), len(ask_prices))):
                 mid = mid_prices[i]
                 bid = bid_prices[i]
                 ask = ask_prices[i]
                 if mid > 0 and bid > 0 and ask > 0:
-                    bid_spread_bps = ((mid - bid) / mid) * 10000.0
-                    ask_spread_bps = ((ask - mid) / mid) * 10000.0
+                    # Full spread: distance from mid to quote (in bps)
+                    bid_spread_bps = ((mid - bid) / mid) * 10000.0  # Full spread from mid to bid
+                    ask_spread_bps = ((ask - mid) / mid) * 10000.0  # Full spread from mid to ask
                     valid_spreads.append((bid_spread_bps, ask_spread_bps))
             
             if valid_spreads:
