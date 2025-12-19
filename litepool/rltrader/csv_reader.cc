@@ -63,6 +63,9 @@ void CsvReader::reset() {
         this->filestream.close();
     }
     this->filestream.open(filename, std::ios::in);
+    if (!this->filestream.is_open()) {
+        throw std::runtime_error("Could not open file: " + filename);
+    }
     this->readCSV(start_line);
     this->iterator.populate(&rows);
 }

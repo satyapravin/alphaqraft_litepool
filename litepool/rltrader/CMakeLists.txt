@@ -13,18 +13,21 @@ set(OPENSSL_ROOT_DIR "/usr/openssl")
 set(OPENSSL_LIBRARIES "/lib64/libssl.so;/lib64/libcrypto.so")
 find_package(OpenSSL REQUIRED)
 
-#add_executable(test_sim base_instrument.h
-#        csv_reader.h csv_reader.cc
-#        sim_exchange.h sim_exchange.cc
-#        inverse_instrument.h inverse_instrument.cc
-#        normal_instrument.h normal_instrument.cc
-#        order.h position.h position.cc
-#        strategy.cc doctest.h strategy.h
-#        orderbook.h orderbook_buffer.h
-#        market_signal_builder.h market_signal_builder.cc
-#        position_signal_builder.h position_signal_builder.cc
-#        trade_signal_builder.h trade_signal_builder.cc
-#        env_adaptor.h env_adaptor.cc testcases.cc)
+add_executable(testcases testcases.cc
+        csv_reader.h csv_reader.cc
+        sim_exchange.h sim_exchange.cc
+        inverse_instrument.h inverse_instrument.cc
+        normal_instrument.h normal_instrument.cc
+        order.h position.h position.cc
+        strategy.cc doctest.h strategy.h
+        orderbook.h orderbook_buffer.h
+        market_signal_builder.h market_signal_builder.cc
+        trade_reader.h trade_reader.cc
+        trade_signal_builder.h trade_signal_builder.cc
+        env_adaptor.h env_adaptor.cc
+        amm_simulator.h amm_simulator.cc
+        circ_buffer.h circ_table.h
+        fixed_vector.h)
 
 set(GFLAG_LIBRARY_NAME /usr/local/lib/libgflags.a)
 pybind11_add_module(rltrader_litepool rltrader_litepool.h rltrader_litepool.cc
@@ -45,6 +48,8 @@ pybind11_add_module(rltrader_litepool rltrader_litepool.h rltrader_litepool.cc
                                       strategy.cc doctest.h strategy.h
                                       orderbook.h orderbook_buffer.h
                                       market_signal_builder.h market_signal_builder.cc
+                                      trade_reader.h trade_reader.cc
+                                      trade_signal_builder.h trade_signal_builder.cc
                                       env_adaptor.h env_adaptor.cc
                                       amm_simulator.h amm_simulator.cc
                                       norm_macro.h rl_macros.h
@@ -72,6 +77,8 @@ add_executable(rltradertest rltrader_litepool_test.cc
                                       strategy.cc doctest.h strategy.h
                                       orderbook.h orderbook_buffer.h
                                       market_signal_builder.h market_signal_builder.cc
+                                      trade_reader.h trade_reader.cc
+                                      trade_signal_builder.h trade_signal_builder.cc
                                       env_adaptor.h env_adaptor.cc
                                       amm_simulator.h amm_simulator.cc
                                       norm_macro.h rl_macros.h
@@ -88,7 +95,26 @@ target_link_libraries(rltrader_litepool PUBLIC OpenSSL::SSL OpenSSL::Crypto Boos
                                         PRIVATE glog -lstdc++fs nlohmann_json::nlohmann_json)
 target_link_libraries(rltradertest PUBLIC OpenSSL::SSL OpenSSL::Crypto Boost::system Threads::Threads
                                    PRIVATE GTest::GTest GTest::Main gflags gmock glog -lstdc++fs nlohmann_json::nlohmann_json)
-			   #target_link_libraries(test_sim PUBLIC OpenSSL::SSL OpenSSL::Crypto Boost::system Threads::Threads
-			   #        PRIVATE GTest::GTest GTest::Main gflags gmock glog -lstdc++fs nlohmann_json::nlohmann_json)
+target_link_libraries(testcases PUBLIC OpenSSL::SSL OpenSSL::Crypto Boost::system Threads::Threads
+                                   PRIVATE glog -lstdc++fs nlohmann_json::nlohmann_json)
+
+# Register doctest testcases executable with CTest
+add_test(NAME doctest_testcases COMMAND testcases)
+
+# Configure test properties
+# Set working directory to project root so test_data/ paths resolve correctly
+set_tests_properties(doctest_testcases PROPERTIES
+    TIMEOUT 300
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+
+# Add custom target to run tests (can be invoked with: make test)
+add_custom_target(run_tests
+    COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+    DEPENDS testcases rltradertest
+    COMMENT "Running all tests..."
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+)
+
 include(GoogleTest)
 gtest_discover_tests(rltradertest)
