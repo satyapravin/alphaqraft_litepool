@@ -21,6 +21,8 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 | `strategy` | Avellaneda-Stoikov inspired quoting model with RL-controlled parameters |
 | `env_adaptor` | Bridges market data, strategy, and exchange into RL observations |
 | `market_signal_builder` | Generates 13 normalized market microstructure signals |
+| `trade_reader` | Reads and synchronizes trade feed data from CSV files |
+| `trade_signal_builder` | Generates 8 normalized trade flow signals (volume, pressure, intensity) |
 | `amm_simulator` | Simulates AMM V3 concentrated liquidity for flow signals |
 | `rltrader_litepool` | Main environment exposing Gymnasium interface to Python |
 
@@ -44,7 +46,7 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 
 **Note**: The `skew` action was removed to avoid conflicts with `target_inventory`. Quote asymmetry (skew) is now computed automatically based on the difference between current position and target inventory.
 
-## Observation Space (18 signals)
+## Observation Space (26 signals)
 
 **Market Signals (13):**
 - Spread metrics: `market_spread`, `bid_depth`, `ask_depth`, `depth_imbalance`
@@ -57,6 +59,16 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 - `flow_imbalance`: Recent buy/sell volume ratio
 - `inventory_delta`: LP inventory change in simulated AMM
 - `cumulative_flow/balance`: Raw cumulative flow normalized by trading balance (trend indicator)
+
+**Trade Feed Signals (8):**
+- `buy_volume`: Normalized buy volume from recent trades
+- `sell_volume`: Normalized sell volume from recent trades
+- `volume_imbalance`: (buy - sell) / (buy + sell) from trade flow
+- `trade_intensity`: Volume per 100ms period (activity rate)
+- `price_impact`: Price change per unit volume
+- `buy_pressure`: EMA-based buy pressure indicator
+- `sell_pressure`: EMA-based sell pressure indicator
+- `time_since_last_trade`: Normalized temporal signal for trade recency
 
 **Agent State (1):**
 - `current_leverage`: Agent's current position leverage (critical for inventory management)
@@ -77,7 +89,7 @@ reward = realized_pnl_delta + unrealized_pnl_delta + fee_rebate_delta - inventor
 **LSTM Actor-Critic** with temporal pattern recognition:
 
 ```
-Observations [18] → MLP Feature Extractor [128] → LSTM [64] → Combined [192]
+Observations [26] → MLP Feature Extractor [128] → LSTM [64] → Combined [192]
                                                               ↓
                                                      ┌───────┴───────┐
                                                      ↓               ↓
@@ -139,16 +151,23 @@ python tianshou_ppo.py
 | `BASE_SPREAD_BPS` | 3.0 | Base spread in basis points |
 | `MIN_SIZE_PCT` | 5.0% | Order size as % of balance |
 | `Model Params` | ~82k | LSTM Actor-Critic parameters |
+| `OBS_DIM` | 26 | Observation space (13 market + 4 AMM + 8 trade + 1 agent state) |
 
 ## Data Format
 
-Training data should be CSV files with order book snapshots:
+Training data requires two types of CSV files:
 
+**Order Book Data:**
 ```
 timestamp,bid_price_1,bid_size_1,...,ask_price_1,ask_size_1,...
 ```
+Place book data files in `data/training/` directory.
 
-Place data files in `data/training/` directory.
+**Trade Feed Data (optional but recommended):**
+```
+exchange,symbol,timestamp,local_timestamp,id,side,price,amount
+```
+Place trade data files in `data/training/trades/` directory. The trade feed provides additional signals for better market flow understanding. If not provided, trade signals will be zeroed out.
 
 ## Configuration
 
