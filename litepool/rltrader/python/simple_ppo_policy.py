@@ -3,6 +3,7 @@ Simple PPO Policy - no recurrence, no OT, just standard PPO.
 """
 import torch
 import torch.nn as nn
+import time
 
 
 class SimplePPOPolicy:
@@ -73,7 +74,13 @@ class SimplePPOPolicy:
         
         with torch.no_grad():
             # LSTM model returns (quote_dist, requote_dist, values, hidden_state)
+            # Time the actual model forward pass
+            forward_start = time.perf_counter()
             quote_dist, requote_dist, values, new_hidden_states = self.model(obs_tensor, hidden=batch_hidden)
+            forward_time = time.perf_counter() - forward_start
+            # Log if it's taking too long (>10ms)
+            #if forward_time > 0.01:
+            #    print(f"[Model Forward] batch_size={batch_size}, forward_time={forward_time*1000:.2f}ms")
             
             if deterministic:
                 # Use mean for quote params, threshold 0.5 for requote
@@ -311,15 +318,11 @@ class SimplePPOPolicy:
         
         # Check for NaN/Inf gradients before clipping (fast check)
         has_bad_grad = False
-        max_grad_norm_actual = 0.0
         for param in self.model.parameters():
             if param.grad is not None:
                 if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
                     has_bad_grad = True
                     break
-                # Also check if gradient norm is too large (could cause slow clipping)
-                param_norm = param.grad.data.norm(2)
-                max_grad_norm_actual = max(max_grad_norm_actual, param_norm.item())
         
         if has_bad_grad:
             print("WARNING: NaN/Inf gradients detected, skipping update")
@@ -333,11 +336,21 @@ class SimplePPOPolicy:
                 'action_std': 0.0,
             }
         
-        # If gradient norm is extremely large, skip clipping to prevent hanging
-        # Increased threshold from 1000 to 5000 to allow larger gradients during training
-        # With reward_scale=1.0, returns are small, so gradients should be manageable
-        if max_grad_norm_actual > 5000.0:
-            print(f"WARNING: Gradient norm too large ({max_grad_norm_actual:.1f}), skipping update to prevent hang")
+        # Compute global gradient norm (same as clip_grad_norm_ uses)
+        # This is the L2 norm across ALL parameters, not per-parameter
+        # Per-parameter norms can be large (5000+) while global norm is still reasonable (< 1000)
+        total_norm = 0.0
+        for param in self.model.parameters():
+            if param.grad is not None:
+                param_norm = param.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** (1. / 2)
+        
+        # If global gradient norm is extremely large, skip update to prevent hanging
+        # With max_grad_norm=0.5, normal gradients should be < 100
+        # If global norm > 10000, something is seriously wrong and clipping will be very slow
+        if total_norm > 10000.0:
+            print(f"WARNING: Global gradient norm too large ({total_norm:.1f}), skipping update to prevent hang")
             self.optimizer.zero_grad()
             return {
                 'loss': total_loss_value,
@@ -348,7 +361,8 @@ class SimplePPOPolicy:
                 'action_std': 0.0,
             }
         
-        # Gradient clipping (can be slow if gradients are large, but we've checked above)
+        # Gradient clipping (clips global norm to max_grad_norm=0.5)
+        # This is fast even if per-parameter norms are large, as long as global norm is reasonable
         nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
         self.optimizer.step()
         

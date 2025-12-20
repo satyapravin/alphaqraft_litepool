@@ -483,10 +483,6 @@ def train():
         if completed_episode_rewards:
             print(f"  Completed {len(completed_episode_rewards)} episode(s) in this epoch")
         
-        # Force garbage collection to help with memory management
-        # PyTorch's allocator caches memory, but Python GC can help free unreferenced objects
-        gc.collect()
-        
         # === Log detailed metrics ===
         if epoch % 10 == 0 or epoch == 0:
             # Prepare data for MetricLogger
@@ -498,7 +494,7 @@ def train():
             
             # Convert infos list to dict format expected by MetricLogger
             # MetricLogger expects infos['infos'] to be a dict with arrays per metric, indexed by env_id
-            if batch['infos'] and len(batch['infos']) > 0:
+            if batch.get('infos') and len(batch['infos']) > 0:
                 # Get last step's info from all environments
                 last_infos = batch['infos'][-1]  # Last step, should be list of dicts (one per env)
                 if isinstance(last_infos, list) and len(last_infos) > 0:
@@ -519,6 +515,15 @@ def train():
                         'leverage': np.array([safe_get(inf, 'leverage', 0.0) for inf in last_infos]),
                     }
                     metric_logger.log(global_step, {'infos': info_dict}, rewards_array, policy)
+        
+        # CRITICAL: Clear infos from batch IMMEDIATELY after logging to prevent memory accumulation
+        # infos_list contains 2048 dictionaries with numpy arrays - this is HUGE and causes hangs
+        if 'infos' in batch:
+            batch['infos'] = None
+        
+        # Force garbage collection to help with memory management
+        # PyTorch's allocator caches memory, but Python GC can help free unreferenced objects
+        gc.collect()
         
         # === Save checkpoint ===
         if epoch % 10 == 0:

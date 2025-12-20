@@ -112,12 +112,19 @@ class SimpleCollector:
                     break
             
             # Get actions from policy with current hidden states
+            # Time model inference to diagnose slowdown
+            model_start = time.perf_counter()
             actions, log_probs, values, new_hidden_states = self.policy.get_actions(
                 self.obs, hidden_states=self.hidden_states
             )
+            model_time = time.perf_counter() - model_start
+            if step_idx % 100 == 0:  # Log every 100 steps
+                print(f"[Model Timing] Step {step_idx}: model_inference={model_time*1000:.2f}ms")
             
             # Store current step
-            obs_list.append(self.obs.copy())
+            # CRITICAL: Don't copy obs - it's already a new array from env.step()
+            # Copying 2048 times (6 envs * 30 dims) is expensive
+            obs_list.append(self.obs)
             actions_list.append(actions)
             log_probs_list.append(log_probs)
             values_list.append(values)
@@ -139,6 +146,8 @@ class SimpleCollector:
             rewards_list.append(rewards)
             dones_list.append(dones)
             truncs_list.append(truncs)  # Track truncs for early exit check
+            # Store infos directly - only convert when needed for logging
+            # The conversion was too slow when done on every step
             infos_list.append(infos)
             
             # IMPORTANT: In gymnasium, dones is actually "terminated" (done & ~trunc)
@@ -164,10 +173,12 @@ class SimpleCollector:
                     if new_hidden_states is not None:
                         # Extract hidden state for this environment
                         # new_hidden_states is tuple of (h, c) where each is [1, batch_size, hidden_dim]
+                        # CRITICAL: Use detach() only, no clone() - clone() creates unnecessary copies
+                        # The slice operation already creates a new view, and detach() breaks gradients
                         h, c = new_hidden_states
                         self.hidden_states[env_id] = (
-                            h[:, env_id:env_id+1, :].detach().clone(),  # [1, 1, hidden_dim]
-                            c[:, env_id:env_id+1, :].detach().clone()
+                            h[:, env_id:env_id+1, :].detach(),  # [1, 1, hidden_dim] - detach breaks gradient, no clone needed
+                            c[:, env_id:env_id+1, :].detach()
                         )
             
             # Accumulate rewards per environment (before scaling)
@@ -238,12 +249,16 @@ class SimpleCollector:
             dones_list = dones_list[:min_length]
             actual_n_steps = min_length
         
-        obs = torch.as_tensor(np.array(obs_list), dtype=torch.float32)
-        actions = torch.as_tensor(np.array(actions_list), dtype=torch.float32)
-        log_probs = torch.as_tensor(np.array(log_probs_list), dtype=torch.float32)
-        values = torch.as_tensor(np.array(values_list), dtype=torch.float32)
-        rewards_raw = torch.as_tensor(np.array(rewards_list), dtype=torch.float32)
-        dones = torch.as_tensor(np.array(dones_list), dtype=torch.float32)
+        # Convert lists to tensors - use np.stack() for efficiency
+        # CRITICAL: np.array() on large lists (2000+ elements) is VERY slow due to memory allocation/copying
+        # np.stack() is optimized for stacking arrays of the same shape (much faster than np.array())
+        # Then convert to torch tensor in one step (avoids intermediate list of tensors)
+        obs = torch.as_tensor(np.stack(obs_list, axis=0), dtype=torch.float32)
+        actions = torch.as_tensor(np.stack(actions_list, axis=0), dtype=torch.float32)
+        log_probs = torch.as_tensor(np.stack(log_probs_list, axis=0), dtype=torch.float32)
+        values = torch.as_tensor(np.stack(values_list, axis=0), dtype=torch.float32)
+        rewards_raw = torch.as_tensor(np.stack(rewards_list, axis=0), dtype=torch.float32)
+        dones = torch.as_tensor(np.stack(dones_list, axis=0), dtype=torch.float32)
         
         # Verify all tensors have the same first dimension
         assert obs.shape[0] == actions.shape[0] == log_probs.shape[0] == values.shape[0] == rewards_raw.shape[0] == dones.shape[0], \
@@ -329,14 +344,18 @@ class SimpleCollector:
         returns = advantages + values
         return advantages, returns
     
-    def _log_episode_end(self, infos, dones):
+    def _log_episode_end(self, infos, episode_ended):
         """Log metrics for environments that just finished an episode.
         
         Uses final_* keys which contain the terminal episode metrics cached
         before auto-reset (since regular info keys are reset to 0 after auto-reset).
+        
+        Args:
+            infos: Info dict from env.step()
+            episode_ended: Boolean array indicating which environments ended (dones | truncs)
         """
         for env_id in range(self.n_envs):
-            if dones[env_id]:
+            if episode_ended[env_id]:
                 self.episode_count += 1
                 
                 # Use final_* keys which have terminal info cached before reset
