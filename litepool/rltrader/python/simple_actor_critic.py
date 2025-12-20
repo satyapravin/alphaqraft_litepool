@@ -212,7 +212,13 @@ class SimpleActorCritic(nn.Module):
         """
         # Use fresh hidden states for training (stateless)
         # This is standard practice - gradients don't flow through rollout sequences
+        import time
+        eval_start = time.perf_counter()
         quote_dist, requote_dist, values, _ = self.forward(obs, hidden=None)
+        eval_time = time.perf_counter() - eval_start
+        # Log if evaluation is slow (>50ms for minibatch)
+        if eval_time > 0.05:
+            print(f"[Model Evaluate] batch_size={obs.shape[0]}, eval_time={eval_time*1000:.2f}ms")
         
         # Split actions
         quote_actions = actions[:, :3]

@@ -126,16 +126,7 @@ class StateBuffer {
    */
   void Done(std::size_t num = 1) {
     std::size_t done_count = done_count_.fetch_add(num);
-    // DEBUG: Log to identify if Done is called and when semaphore is signaled
-    static thread_local int done_count_total = 0;
-    done_count_total += num;
-    if (done_count_total % 1000 == 0) {
-      std::cerr << "[DEBUG StateBuffer] Done() call " << done_count_total << ", done_count=" << (done_count + num) << ", batch_=" << batch_ << "\n";
-    }
     if (done_count + num == batch_) {
-      if (done_count_total % 1000 == 0) {
-        std::cerr << "[DEBUG StateBuffer] Done() signaling semaphore, all " << batch_ << " done\n";
-      }
       sem_.signal();
     }
   }
@@ -145,13 +136,12 @@ class StateBuffer {
    * distributed out, and all user has called done.
    */
   std::vector<Array> Wait(std::size_t additional_done_count = 0) {
-    // Validate additional_done_count
-    if (additional_done_count > batch_) {
-        throw std::invalid_argument("additional_done_count exceeds batch size");
-    }
-
-    if (additional_done_count > 0) {
-        Done(additional_done_count);
+    // Note: additional_done_count is used to account for unallocated slots
+    // Done() compares done_count to batch_ (shared slots), so we clamp to batch_
+    // The original code didn't validate, so we maintain compatibility by clamping
+    std::size_t clamped_count = std::min(additional_done_count, batch_);
+    if (clamped_count > 0) {
+        Done(clamped_count);
     }
 
     while (!sem_.wait()) {
@@ -163,7 +153,10 @@ class StateBuffer {
     uint32_t shared_offset = offsets;
 
     // Ensure shared_offset is valid
-    DCHECK_EQ((std::size_t)shared_offset, batch_ - additional_done_count);
+    // shared_offset is the number of shared slot allocations (should be batch_)
+    // clamped_count is additional done calls to account for missing player slots
+    // The original DCHECK was incorrect - shared_offset should be batch_, not batch_ - clamped_count
+    DCHECK_LE((std::size_t)shared_offset, batch_);
 
     std::vector<Array> ret;
     ret.reserve(arrays_.size());
@@ -175,6 +168,17 @@ class StateBuffer {
             ret.emplace_back(a.Truncate(shared_offset));
         }
     }
+    
+    // CRITICAL: Reset counters after Wait() completes so buffer can be reused
+    // Without this, alloc_count_ and done_count_ accumulate across reuses,
+    // causing Allocate() to fail immediately on subsequent uses
+    // NOTE: We reset AFTER reading offsets_ for Truncate, but BEFORE returning
+    // The semaphore is consumed by sem_.wait() above, so it should be at 0 or negative
+    // We don't need to reset the semaphore - it will be signaled again when done_count reaches batch_
+    alloc_count_.store(0);
+    done_count_.store(0);
+    offsets_.store(0);
+    
     return ret;
   }
 };

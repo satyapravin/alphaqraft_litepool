@@ -18,7 +18,12 @@ Strategy::Strategy(BaseInstrument& instr, BaseExchange& exch, const double& bala
 }
 
 void Strategy::reset() {
-    this->exchange.reset();
+    // CRITICAL BUG FIX: Do NOT reset exchange here!
+    // The exchange is already reset by RlTraderEnv::Reset() -> exchange_ptr->reset()
+    // Resetting it again would cause CsvReader to be reset twice with different random start lines,
+    // leading to expensive double sequential skips and state confusion.
+    // this->exchange.reset();  // REMOVED - causes double reset bug
+    
     double initQty = 0;
     double avgPrice = 0;
     this->target_inventory_ema = 0;
