@@ -156,12 +156,12 @@ python tianshou_ppo.py
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| `N_ENVS` | 3 | Parallel environments |
+| `NUM_ENVS` | 6 | Parallel environments |
 | `N_STEPS` | 2048 | Steps per rollout |
-| `GAMMA` | 0.99 | Discount factor (~100 step horizon) |
-| `BASE_SPREAD_BPS` | 3.0 | Base spread in basis points |
-| `MIN_SIZE_PCT` | 5.0% | Order size as % of balance |
-| `Model Params` | ~82k | LSTM Actor-Critic parameters |
+| `GAMMA` | 0.995 | Discount factor |
+| `BASE_SPREAD_BPS` | 1.0 | Base spread in basis points |
+| `MIN_SIZE_PCT` | 1.0% | Order size as % of balance (per level, 5 levels = 5% total per side) |
+| `Model Params` | ~84k | LSTM Actor-Critic parameters |
 | `OBS_DIM` | 30 | Observation space (13 market + 4 AMM + 8 trade + 5 agent state) |
 
 ## Data Format
@@ -185,8 +185,8 @@ Place trade data files in `data/training/trades/` directory. The trade feed prov
 Key strategy parameters in `tianshou_ppo.py`:
 
 ```python
-BASE_SPREAD_BPS = 3.0    # Base spread (bps) - room for spread capture
-MIN_SIZE_PCT = 5.0       # Order size (%) - strong P&L signal
+BASE_SPREAD_BPS = 1.0    # Base spread (bps) - room for spread capture
+MIN_SIZE_PCT = 1.0       # Order size (%) per level (5 levels = 5% total per side)
 MAKER_FEE = -0.000025    # Maker rebate (-0.25 bps)
 TAKER_FEE = 0.0005       # Taker fee (5 bps)
 ```

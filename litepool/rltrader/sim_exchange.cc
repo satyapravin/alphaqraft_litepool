@@ -2,6 +2,7 @@
 #include <vector>
 #include <cassert>
 #include <sstream>
+#include <iostream>
 #include "orderbook.h"
 
 namespace RLTrader {
@@ -54,7 +55,7 @@ void SimExchange::toBook(const std::unordered_map<std::string, double>& lob, Ord
 	}
 }
 
-SimExchange::SimExchange(const std::string& filename, long delay, int start_read, int max_read) :dataReader(filename, start_read, max_read), delay(delay), current_timestamp(0) {
+SimExchange::SimExchange(const std::string& filename, long delay, int start_read) :dataReader(filename, start_read), delay(delay), current_timestamp(0) {
 	bid_quotes.clear();
 	ask_quotes.clear();
 	executions.clear();

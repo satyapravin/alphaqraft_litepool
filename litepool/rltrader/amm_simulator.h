@@ -45,8 +45,17 @@ public:
     /**
      * Clear initialized state so next step() will auto-initialize.
      * Call this at episode boundaries.
+     * Also clears all containers and resets state to prevent accumulation.
      */
-    void clear() { initialized_ = false; }
+    void clear() {
+        initialized_ = false;
+        recent_flows_.clear();
+        window_buy_vol_ = 0.0;
+        window_sell_vol_ = 0.0;
+        net_flow_ema_ = 0.0;
+        net_flow_magnitude_ema_ = 0.0;
+        cumulative_flow_ = 0.0;
+    }
     
     /**
      * Step the simulator with new market price.

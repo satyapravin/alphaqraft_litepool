@@ -27,6 +27,7 @@ void Strategy::reset() {
     this->last_bid_price = 0;
     this->last_ask_price = 0;
     this->last_mid_price = 0;
+    this->hit_leverage_limit_ = false;  // Reset leverage limit flag
     this->exchange.fetchPosition(initQty, avgPrice, false);
     this->position.reset(initQty, avgPrice);
     this->order_id = 0;
@@ -83,15 +84,17 @@ std::pair<double, double> Strategy::computeQuotePrices(
     // In volatile markets, widen spreads to compensate for adverse selection risk
     // vol_mult = 1 + volatility * VOL_SPREAD_MULT
     // E.g., if vol=0.001 (0.1% per tick) and MULT=50, spread widens by 5%
+    // For liquidity crunches, allow much larger volatility adjustments
     double vol_mult = 1.0 + realized_vol * VOL_SPREAD_MULT;
-    vol_mult = std::clamp(vol_mult, 1.0, 5.0);  // Cap at 5x widening
+    vol_mult = std::clamp(vol_mult, 1.0, 20.0);  // Cap at 20x widening (was 5x) - allows huge spreads during crashes
     
     // === Step 3: Agent spread control (full spreads in bps) ===
     // bid_spread/ask_spread actions: [-1, 1] → [MIN_SPREAD_MULT, MAX_SPREAD_MULT]
     // EXPONENTIAL mapping: more control at tighter spreads (where it matters most)
-    // action=-1 → MIN_SPREAD_MULT (0.5x), action=0 → 1.0x, action=+1 → MAX_SPREAD_MULT (3.0x)
-    double log_ratio = std::log(MAX_SPREAD_MULT / MIN_SPREAD_MULT) / 2.0;  // ~1.35
-    double center_mult = std::sqrt(MAX_SPREAD_MULT * MIN_SPREAD_MULT);     // Geometric mean ~0.77
+    // action=-1 → MIN_SPREAD_MULT (0.5x), action=0 → 1.0x, action=+1 → MAX_SPREAD_MULT (50.0x)
+    // Allows agent to widen spreads dramatically during liquidity crunches
+    double log_ratio = std::log(MAX_SPREAD_MULT / MIN_SPREAD_MULT) / 2.0;  // ~2.3 for 50.0/0.5
+    double center_mult = std::sqrt(MAX_SPREAD_MULT * MIN_SPREAD_MULT);     // Geometric mean ~5.0 for sqrt(50.0*0.5)
     
     double bid_spread_mult = center_mult * std::exp(action.bid_spread * log_ratio);
     double ask_spread_mult = center_mult * std::exp(action.ask_spread * log_ratio);
@@ -118,7 +121,9 @@ std::pair<double, double> Strategy::computeQuotePrices(
     // Apply skew: widen one side, tighten the other
     // Positive skew_factor (long) → widen bid, tighten ask
     // Negative skew_factor (short) → tighten bid, widen ask
-    double skew_adjustment_bps = skew_factor * base_spread_bps * 0.3;  // Max 30% adjustment
+    // Use percentage of current spread (not base) so skew scales with wide spreads during volatility
+    double avg_spread_bps = (bid_spread_bps + ask_spread_bps) * 0.5;
+    double skew_adjustment_bps = skew_factor * avg_spread_bps * 0.3;  // Max 30% of average spread
     bid_spread_bps += skew_adjustment_bps;   // Widen bid when long (positive skew)
     ask_spread_bps -= skew_adjustment_bps;  // Tighten ask when long (positive skew)
     
@@ -197,6 +202,22 @@ void Strategy::quote(const RLAction& action,
     auto minAmount = instrument.getMinAmount();
     auto posInfo = position.getPositionInfo(bid_prices[0], ask_prices[0]);
     auto leverage = posInfo.leverage;
+    
+    // Stop quoting if leverage hits maximum (100% long or short)
+    // This prevents over-leveraging and allows agent to manage risk during extreme moves
+    if (leverage >= 1.0 || leverage <= -1.0) {
+        // Cancel any existing orders and exit
+        exchange.cancelOrders();
+        last_mid_price = (bid_prices[0] + ask_prices[0]) * 0.5;
+        last_bid_price = 0.0;
+        last_ask_price = 0.0;
+        hit_leverage_limit_ = true;  // Flag that leverage limit was hit
+        return;
+    }
+    
+    // Reset flag if leverage is back within limits
+    hit_leverage_limit_ = false;
+    
     auto initBalance = position.getInitialBalance();
     auto mid_price = (bid_prices[0] + ask_prices[0]) * 0.5;
     double best_bid = bid_prices[0];

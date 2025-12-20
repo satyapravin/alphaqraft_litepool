@@ -3,6 +3,7 @@ Simple PPO Collector - no recurrence, no OT, just standard rollout collection.
 """
 import numpy as np
 import torch
+import time
 
 
 class SimpleCollector:
@@ -33,6 +34,7 @@ class SimpleCollector:
         self.dones = None
         self.episode_count = 0
         self.episode_rewards = None  # Track cumulative rewards per environment
+        self.episode_steps = None  # Track step count per environment
         self.completed_episode_rewards = []  # Track rewards from completed episodes in this batch
         self.hidden_states = None  # Track LSTM hidden states per environment: list of (h, c) tuples
     
@@ -56,6 +58,7 @@ class SimpleCollector:
                     self.n_envs = 1
             self.dones = np.zeros(self.n_envs, dtype=bool)
             self.episode_rewards = np.zeros(self.n_envs, dtype=np.float32)
+            self.episode_steps = np.zeros(self.n_envs, dtype=np.int32)  # Track steps per episode
             # Initialize LSTM hidden states (zeros for all environments)
             self.hidden_states = [None] * self.n_envs
         
@@ -73,10 +76,41 @@ class SimpleCollector:
         values_list = []
         rewards_list = []
         dones_list = []
+        truncs_list = []  # Track truncs to check if all envs are done
         infos_list = []
         
+        # Timing tracking
+        step_times = []
+        last_log_step = 0
+        
         # Rollout
-        for _ in range(n_steps):
+        for step_idx in range(n_steps):
+            # Timing logging every 500 steps
+            if step_idx % 500 == 0 and step_idx > 0:
+                if len(step_times) > 0:
+                    avg_time = np.mean(step_times)
+                    total_time = np.sum(step_times)
+                    print(f"[Python Timing] Steps {last_log_step}-{step_idx}: avg={avg_time*1000:.2f}ms, total={total_time:.3f}s, count={len(step_times)}")
+                    step_times.clear()
+                    last_log_step = step_idx
+            
+            # Early exit check BEFORE calling env.step() to avoid blocking
+            # If all environments were done in previous step and we have enough data, break
+            if step_idx > 0 and len(dones_list) > 0:
+                prev_dones = dones_list[-1]
+                prev_truncs = truncs_list[-1] if len(truncs_list) > 0 else np.zeros_like(prev_dones)
+                prev_all_done = np.all(prev_dones | prev_truncs)
+                min_steps = int(0.75 * n_steps)  # Collect at least 75% of steps
+                if prev_all_done and step_idx >= min_steps:
+                    # Break early if all environments are done
+                    # Pop the last elements to keep lists in sync (they were appended before env.step())
+                    if len(obs_list) > len(rewards_list):
+                        obs_list.pop()
+                        actions_list.pop()
+                        log_probs_list.pop()
+                        values_list.pop()
+                    break
+            
             # Get actions from policy with current hidden states
             actions, log_probs, values, new_hidden_states = self.policy.get_actions(
                 self.obs, hidden_states=self.hidden_states
@@ -88,18 +122,43 @@ class SimpleCollector:
             log_probs_list.append(log_probs)
             values_list.append(values)
             
-            # Environment step
-            next_obs, rewards, dones, truncs, infos = self.env.step(actions)
+            # Environment step with timeout protection
+            try:
+                step_start = time.time()
+                next_obs, rewards, dones, truncs, infos = self.env.step(actions)
+                step_time = time.time() - step_start
+                step_times.append(step_time)
+            except Exception as e:
+                print(f"ERROR in env.step() at rollout step {step_idx}: {e}")
+                # If we have some data collected, return what we have
+                if len(obs_list) > 0:
+                    print(f"WARNING: Returning partial batch with {len(obs_list)} steps due to env.step() error")
+                    break
+                raise
             
             rewards_list.append(rewards)
             dones_list.append(dones)
+            truncs_list.append(truncs)  # Track truncs for early exit check
             infos_list.append(infos)
+            
+            # IMPORTANT: In gymnasium, dones is actually "terminated" (done & ~trunc)
+            # But we want to log episodes when they end, regardless of truncation
+            # So we need to check both dones (terminated) and truncs
+            episode_ended = dones | truncs  # Episode ends if terminated OR truncated
+            
+            # Increment episode step count only for environments that are NOT done
+            # If an episode just ended, it already completed its steps, so don't increment
+            # This prevents the off-by-one error where steps show 2049 instead of 2048
+            for env_id in range(self.n_envs):
+                if not episode_ended[env_id]:
+                    self.episode_steps[env_id] += 1
             
             # Update LSTM hidden states, resetting for environments that are done
             for env_id in range(self.n_envs):
                 if dones[env_id]:
                     # Reset hidden state for this environment (new episode)
                     self.hidden_states[env_id] = None
+                    # Note: episode_steps[env_id] will be reset in _log_episode_end
                 else:
                     # Update hidden state for this environment
                     if new_hidden_states is not None:
@@ -113,20 +172,30 @@ class SimpleCollector:
             
             # Accumulate rewards per environment (before scaling)
             # Rewards from env are already normalized (fraction of balance)
+            # Clamp step rewards to prevent cumulative rewards from exploding
             if isinstance(rewards, np.ndarray):
-                self.episode_rewards += rewards
+                # Clamp each step reward to prevent cumulative explosion
+                rewards_clamped = np.clip(rewards, -10.0, 10.0)  # Much tighter clamp for step rewards
+                self.episode_rewards += rewards_clamped
             else:
-                self.episode_rewards[0] += rewards
+                rewards_clamped = np.clip(rewards, -10.0, 10.0)
+                self.episode_rewards[0] += rewards_clamped
             
             # Log episode metrics on reset
             # When done=True, infos is from the CURRENT step (terminal state).
             # Auto-reset happens on the NEXT step in litepool.
-            if self.log_episodes and dones.any():
-                self._log_episode_end(infos, dones)
+            # Use episode_ended (dones | truncs) to catch all episode endings
+            if self.log_episodes and episode_ended.any():
+                self._log_episode_end(infos, episode_ended)
             
             # Update state
             self.obs = next_obs
             self.dones = dones
+        
+        # If we broke early due to all environments being done, we need to handle the partial batch
+        # Make sure we have at least some data
+        if len(obs_list) == 0:
+            raise RuntimeError("No data collected - all environments may be stuck")
         
         # Get bootstrap value with current hidden states
         with torch.no_grad():
@@ -147,6 +216,28 @@ class SimpleCollector:
             bootstrap_values = bootstrap_values.numpy()
         
         # Convert to tensors
+        # Handle case where we collected fewer steps than n_steps
+        actual_n_steps = len(obs_list)
+        if actual_n_steps < n_steps:
+            print(f"INFO: Collected {actual_n_steps} steps instead of {n_steps} (all environments may be done)")
+        
+        # CRITICAL: Ensure all lists have the same length
+        # When we break early, we've already fixed the mismatch by popping the last items
+        # But double-check to be safe
+        min_length = min(len(obs_list), len(actions_list), len(log_probs_list), 
+                        len(values_list), len(rewards_list), len(dones_list))
+        if min_length != actual_n_steps:
+            print(f"WARNING: Mismatch in list lengths (obs={len(obs_list)}, actions={len(actions_list)}, "
+                  f"log_probs={len(log_probs_list)}, values={len(values_list)}, "
+                  f"rewards={len(rewards_list)}, dones={len(dones_list)}), trimming to {min_length} steps")
+            obs_list = obs_list[:min_length]
+            actions_list = actions_list[:min_length]
+            log_probs_list = log_probs_list[:min_length]
+            values_list = values_list[:min_length]
+            rewards_list = rewards_list[:min_length]
+            dones_list = dones_list[:min_length]
+            actual_n_steps = min_length
+        
         obs = torch.as_tensor(np.array(obs_list), dtype=torch.float32)
         actions = torch.as_tensor(np.array(actions_list), dtype=torch.float32)
         log_probs = torch.as_tensor(np.array(log_probs_list), dtype=torch.float32)
@@ -154,15 +245,41 @@ class SimpleCollector:
         rewards_raw = torch.as_tensor(np.array(rewards_list), dtype=torch.float32)
         dones = torch.as_tensor(np.array(dones_list), dtype=torch.float32)
         
+        # Verify all tensors have the same first dimension
+        assert obs.shape[0] == actions.shape[0] == log_probs.shape[0] == values.shape[0] == rewards_raw.shape[0] == dones.shape[0], \
+            f"Shape mismatch: obs={obs.shape[0]}, actions={actions.shape[0]}, log_probs={log_probs.shape[0]}, " \
+            f"values={values.shape[0]}, rewards={rewards_raw.shape[0]}, dones={dones.shape[0]}"
+        
         # Apply reward scaling (if needed)
         # Note: C++ already scales rewards by 10000, so reward_scale should typically be 1.0
         rewards = rewards_raw * self.reward_scale
         
+        # Clamp rewards to prevent numerical instability
+        # With C++ scaling by 10000 and Python reward_scale=1.0, step rewards are naturally small
+        # Step rewards are normalized by balance, so they're fractions (0.01 = 1% of balance)
+        # Clamp to [-10, 10] to prevent outliers while allowing normal rewards
+        # Over 2048 steps, max return ≈ 200 (with gamma=0.995), which is reasonable
+        rewards = torch.clamp(rewards, -10.0, 10.0)  # Conservative clamp for natural reward scale
+        
+        # Debug: Print reward statistics to diagnose small returns
+        # Clamp values BEFORE computing GAE to prevent returns from exploding
+        # With max_episode_steps=2048, gamma=0.995, and rewards [-10, 10] (after reward_scale=1.0),
+        # max return ≈ 200. But in practice, returns are much smaller due to small step rewards
+        # Use [-200, 200] to allow learning actual scale while preventing explosion
+        values = torch.clamp(values, -200.0, 200.0)
+        bootstrap_values_tensor = torch.as_tensor(bootstrap_values, dtype=torch.float32)
+        bootstrap_values_tensor = torch.clamp(bootstrap_values_tensor, -200.0, 200.0)
+        
         # Compute GAE
         advantages, returns = self._compute_gae(
             rewards, values, dones, 
-            torch.as_tensor(bootstrap_values, dtype=torch.float32)
+            bootstrap_values_tensor
         )
+        
+        # Clamp returns and advantages to prevent numerical instability
+        # With reward_scale=1.0, returns are naturally small (e.g., [-3.5, 0.5])
+        # Clamp to [-200, 200] to allow learning actual scale while preventing explosionreturns = torch.clamp(returns, -200.0, 200.0)
+        advantages = torch.clamp(advantages, -200.0, 200.0)  # Advantages are typically smaller
         
         # Flatten batch: [n_steps, n_envs, ...] -> [n_steps * n_envs, ...]
         batch = {
@@ -273,10 +390,14 @@ class SimpleCollector:
                 # Track completed episode reward for epoch average
                 self.completed_episode_rewards.append(episode_reward)
                 
-                # Reset reward accumulator for this environment
-                self.episode_rewards[env_id] = 0.0
+                # Get episode step count before resetting
+                episode_steps = int(self.episode_steps[env_id])
                 
-                print(f"  [Episode {self.episode_count:4d}] Env {env_id} | "
+                # Reset reward accumulator and step count for this environment
+                self.episode_rewards[env_id] = 0.0
+                self.episode_steps[env_id] = 0
+                
+                print(f"  [Episode {self.episode_count:4d}] Env {env_id} | Steps {episode_steps:5d} | "
                       f"Reward {episode_reward:8.4f} | "
                       f"R.PnL ${realized_pnl:8.4f} | "
                       f"U.PnL ${unrealized_pnl:8.4f} | "

@@ -16,7 +16,7 @@ namespace RLTrader {
         static bool initialize();
 
         // Constructor
-        SimExchange(const std::string& filename, long delay, int start_read, int max_read); // 300 milliseconds delay
+        SimExchange(const std::string& filename, long delay, int start_read); // 300 milliseconds delay
 
         // Generates an OrderBook
         void toBook(const std::unordered_map<std::string, double>& lob, OrderBook& book) override;
@@ -50,6 +50,18 @@ namespace RLTrader {
          void quote(const std::string& order_id, OrderSide side, double price, double amount) override;
 
          void market(const std::string& order_id, OrderSide side, double price, double amount, bool hedge) override;
+
+        // Expose current timestamp for trade synchronization
+        long long getCurrentTimestamp() const { return current_timestamp; }
+        
+        // Peek at first row timestamp without consuming (for reset synchronization)
+        long long peekFirstTimestamp() const { 
+            return dataReader.peekFirstTimestamp(); 
+        }
+        
+        // Check if data is available (for reset synchronization)
+        // Note: hasNext() modifies state, so this can't be const
+        bool hasData() { return dataReader.hasNext(); }
 
     private:
         CsvReader dataReader; // reader

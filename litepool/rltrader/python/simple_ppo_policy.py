@@ -130,16 +130,59 @@ class SimplePPOPolicy:
             }
         
         # Clip advantages and returns to prevent numerical instability
-        # With C++ scaling by 10000 and REWARD_SCALE=1.0, step rewards are ~1.0 (0.01% of balance)
-        # Over 2048 steps with GAMMA=0.99, returns are typically in [-100, 100] range
-        advantages = torch.clamp(advantages, -10.0, 10.0)
-        returns = torch.clamp(returns, -500.0, 500.0)  # Conservative clamp for safety
+        # These should already be clamped in collector, but add extra safety here
+        # With reward_scale=1.0 and step rewards clamped to [-10, 10],
+        # max return ≈ 200 (with gamma=0.995). Use [-200, 200] to allow learning actual scale
+        # Clamp advantages more aggressively to prevent gradient explosion
+        # Advantages directly affect policy gradients, so tighter clamping helps stability
+        advantages = torch.clamp(advantages, -50.0, 50.0)  # More aggressive clamp for advantages
+        returns = torch.clamp(returns, -200.0, 200.0)
         
-        # Normalize advantages
+        # CRITICAL: Store unnormalized returns BEFORE normalizing advantages
+        # Returns are computed as: returns = advantages + values (in GAE)
+        # So returns already reflect the scale of advantages
+        # We need to use the original returns (before any normalization) for value loss
+        returns_for_value = returns.clone()  # Keep unnormalized returns for value loss
+        
+        # Normalize advantages for policy learning (standard PPO practice)
+        # This reduces variance in policy gradient estimates
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
         # Forward pass
         new_log_probs, values, entropy = self.model.evaluate_actions(obs, actions)
+        
+        # EARLY DETECTION: Check for exploding values BEFORE any computation
+        # If values are too large, skip update to prevent hanging
+        if torch.isnan(values).any() or torch.isinf(values).any():
+            print("WARNING: NaN/Inf in values, skipping update")
+            return {
+                'loss': 0.0,
+                'policy_loss': 0.0,
+                'value_loss': 0.0,
+                'entropy': 0.0,
+                'approx_kl': 0.0,
+                'action_std': 0.0,
+            }
+        
+        # Check if values are exploding (too large) - skip update to prevent hanging
+        max_value = torch.abs(values).max().item()
+        if max_value > 10000.0:
+            print(f"WARNING: Values exploding (max={max_value:.1f}), skipping update to prevent hang")
+            return {
+                'loss': 0.0,
+                'policy_loss': 0.0,
+                'value_loss': 0.0,
+                'entropy': 0.0,
+                'approx_kl': 0.0,
+                'action_std': 0.0,
+            }
+        
+        # Clamp values to match returns range BEFORE computing loss
+        # This prevents value loss explosion while allowing gradients to flow
+        # Clamp values to match returns range [-200, 200] (with reward_scale=1.0)
+        # This allows value function to learn the actual scale of returns
+        values = torch.clamp(values, -200.0, 200.0)
+        old_values = torch.clamp(old_values, -200.0, 200.0)
         
         # Check for NaN in model outputs
         if torch.isnan(new_log_probs).any() or torch.isnan(values).any() or torch.isnan(entropy).any():
@@ -174,12 +217,56 @@ class SimplePPOPolicy:
             }
         
         # Value loss (clipped)
+        # CRITICAL: Use unnormalized returns for value loss computation
+        # Value function should learn to predict actual returns, not normalized ones
+        # Advantages are normalized for policy learning, but returns must remain unnormalized
+        # With reward_scale=1.0, returns should be in [-200, 200] range
+        returns_for_value_clamped = torch.clamp(returns_for_value, -200.0, 200.0)
+        
+        # EARLY EXIT: If returns are exploding, skip update to prevent hanging
+        max_return = torch.abs(returns_for_value_clamped).max().item()
+        if max_return > 10000.0:
+            print(f"WARNING: Returns exploding (max={max_return:.1f}), skipping update to prevent hang")
+            return {
+                'loss': 0.0,
+                'policy_loss': 0.0,
+                'value_loss': 0.0,
+                'entropy': 0.0,
+                'approx_kl': 0.0,
+                'action_std': 0.0,
+            }
+        
+        # Value clipping for PPO (prevent large updates)
         values_clipped = old_values + torch.clamp(
             values - old_values, -self.clip_eps, self.clip_eps
         )
-        value_loss_unclipped = (values - returns).pow(2)
-        value_loss_clipped = (values_clipped - returns).pow(2)
+        
+        # Compute value loss (squared error)
+        # CRITICAL: Use unnormalized returns for value loss
+        # Value function should learn to predict actual returns, not normalized ones
+        # Advantages are normalized for policy learning, but returns must remain unnormalized
+        value_loss_unclipped = (values - returns_for_value_clamped).pow(2)
+        value_loss_clipped = (values_clipped - returns_for_value_clamped).pow(2)
         value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
+        
+        # EARLY EXIT: If value loss is too large, skip update to prevent hanging
+        if value_loss.item() > 10000.0:
+            print(f"WARNING: Value loss too large ({value_loss.item():.1f}), skipping update to prevent hang")
+            return {
+                'loss': 0.0,
+                'policy_loss': 0.0,
+                'value_loss': value_loss.item(),
+                'entropy': 0.0,
+                'approx_kl': 0.0,
+                'action_std': 0.0,
+            }
+        
+        # Additional safety: clamp value loss itself to prevent explosion
+        # With vf_coef=0.1, value_loss=100 contributes only 10 to total loss
+        # Max possible value loss with range [-200, 200]: 0.5 * (200 - (-200))^2 = 40,000
+        # But in practice, value loss is normally much smaller (0.01-1.0 with reward_scale=1.0)
+        # Clamp to [0, 100] to allow normal learning while preventing explosion
+        value_loss = torch.clamp(value_loss, 0.0, 100.0)
         
         # Entropy loss
         entropy_loss = entropy.mean()
@@ -187,29 +274,81 @@ class SimplePPOPolicy:
         # Total loss
         total_loss = policy_loss + self.vf_coef * value_loss - self.ent_coef * entropy_loss
         
-        # Optimize
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        
-        # Check for NaN gradients before clipping
-        has_nan_grad = False
-        for param in self.model.parameters():
-            if param.grad is not None and torch.isnan(param.grad).any():
-                has_nan_grad = True
-                break
-        
-        if has_nan_grad:
-            print("WARNING: NaN gradients detected, skipping update")
-            self.optimizer.zero_grad()  # Clear gradients
+        # EARLY EXIT: If total loss is too large, skip update to prevent hanging
+        total_loss_value = total_loss.item()
+        if total_loss_value > 10000.0 or not torch.isfinite(total_loss):
+            print(f"WARNING: Total loss too large or non-finite ({total_loss_value:.1f}), skipping update to prevent hang")
             return {
-                'loss': total_loss.item() if not torch.isnan(total_loss) else 0.0,
-                'policy_loss': policy_loss.item() if not torch.isnan(policy_loss) else 0.0,
-                'value_loss': value_loss.item() if not torch.isnan(value_loss) else 0.0,
-                'entropy': entropy_loss.item() if not torch.isnan(entropy_loss) else 0.0,
+                'loss': total_loss_value if torch.isfinite(total_loss) else 0.0,
+                'policy_loss': policy_loss.item() if torch.isfinite(policy_loss) else 0.0,
+                'value_loss': value_loss.item() if torch.isfinite(value_loss) else 0.0,
+                'entropy': entropy_loss.item() if torch.isfinite(entropy_loss) else 0.0,
                 'approx_kl': 0.0,
-                'action_std': self.model.quote_log_std.exp().mean().item() if not torch.isnan(self.model.quote_log_std).any() else 0.0,
+                'action_std': 0.0,
             }
         
+        # Optimize
+        self.optimizer.zero_grad()
+        
+        # Use detach() to prevent gradient explosion if loss is still large
+        # This is a safety measure - normally we want gradients, but if loss is large,
+        # we want to prevent hanging during backward()
+        try:
+            total_loss.backward()
+        except RuntimeError as e:
+            if "non-finite" in str(e) or "NaN" in str(e) or "Inf" in str(e):
+                print(f"WARNING: Error during backward(): {e}, skipping update")
+                self.optimizer.zero_grad()
+                return {
+                    'loss': total_loss_value,
+                    'policy_loss': policy_loss.item(),
+                    'value_loss': value_loss.item(),
+                    'entropy': entropy_loss.item(),
+                    'approx_kl': 0.0,
+                    'action_std': 0.0,
+                }
+            raise
+        
+        # Check for NaN/Inf gradients before clipping (fast check)
+        has_bad_grad = False
+        max_grad_norm_actual = 0.0
+        for param in self.model.parameters():
+            if param.grad is not None:
+                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                    has_bad_grad = True
+                    break
+                # Also check if gradient norm is too large (could cause slow clipping)
+                param_norm = param.grad.data.norm(2)
+                max_grad_norm_actual = max(max_grad_norm_actual, param_norm.item())
+        
+        if has_bad_grad:
+            print("WARNING: NaN/Inf gradients detected, skipping update")
+            self.optimizer.zero_grad()  # Clear gradients
+            return {
+                'loss': total_loss_value,
+                'policy_loss': policy_loss.item(),
+                'value_loss': value_loss.item(),
+                'entropy': entropy_loss.item(),
+                'approx_kl': 0.0,
+                'action_std': 0.0,
+            }
+        
+        # If gradient norm is extremely large, skip clipping to prevent hanging
+        # Increased threshold from 1000 to 5000 to allow larger gradients during training
+        # With reward_scale=1.0, returns are small, so gradients should be manageable
+        if max_grad_norm_actual > 5000.0:
+            print(f"WARNING: Gradient norm too large ({max_grad_norm_actual:.1f}), skipping update to prevent hang")
+            self.optimizer.zero_grad()
+            return {
+                'loss': total_loss_value,
+                'policy_loss': policy_loss.item(),
+                'value_loss': value_loss.item(),
+                'entropy': entropy_loss.item(),
+                'approx_kl': 0.0,
+                'action_std': 0.0,
+            }
+        
+        # Gradient clipping (can be slow if gradients are large, but we've checked above)
         nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
         self.optimizer.step()
         

@@ -100,9 +100,10 @@ void Position::onFill(const Order& order)
             auto& entry = short_stack.back();
             double close_amount = std::min(remaining_amount, entry.amount);
             
-            // Spread capture: we sold at entry.price, now buying back at order.price
-            // Profit = (sell_price - buy_price) * amount
-            double spread = (entry.price - order.price) * close_amount;
+            // Spread capture: we sold at entry.price (opened short), now buying back at order.price (closing short)
+            // Use instrument.pnl() to handle both normal and inverse instruments correctly
+            // For shorts: qty is negative, entryPrice is where we sold, exitPrice is where we buy back
+            double spread = instrument.pnl(-close_amount, entry.price, order.price);
             spreadCapture += spread;
             
             remaining_amount -= close_amount;
@@ -123,9 +124,10 @@ void Position::onFill(const Order& order)
             auto& entry = long_stack.back();
             double close_amount = std::min(remaining_amount, entry.amount);
             
-            // Spread capture: we bought at entry.price, now selling at order.price
-            // Profit = (sell_price - buy_price) * amount
-            double spread = (order.price - entry.price) * close_amount;
+            // Spread capture: we bought at entry.price (opened long), now selling at order.price (closing long)
+            // Use instrument.pnl() to handle both normal and inverse instruments correctly
+            // For longs: qty is positive, entryPrice is where we bought, exitPrice is where we sell
+            double spread = instrument.pnl(close_amount, entry.price, order.price);
             spreadCapture += spread;
             
             remaining_amount -= close_amount;

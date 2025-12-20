@@ -122,6 +122,12 @@ class AsyncLitePool : public LitePool<typename Env::Spec> {
           int env_id = raw_action.env_id;
           int order = raw_action.order;
           bool reset = raw_action.force_reset || envs_[env_id]->IsDone();
+          
+          // Guard: Verify environment ID is valid
+          if (env_id < 0 || env_id >= static_cast<int>(num_envs_)) {
+            throw std::runtime_error("Invalid environment ID: " + std::to_string(env_id));
+          }
+          
           envs_[env_id]->EnvStep(state_buffer_queue_.get(), order, reset);
         }
       });

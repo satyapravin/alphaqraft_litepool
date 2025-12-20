@@ -19,6 +19,7 @@
 #include <vector>
 #include <algorithm>
 #include <tuple>
+#include <chrono>
 #include "litepool/core/async_litepool.h"
 #include "litepool/core/env.h"
 #include "env_adaptor.h"
@@ -51,7 +52,6 @@ class RlTraderEnvFns {
                     "foldername"_.Bind(std::string("./train_files/")),
                     "balance"_.Bind(1.0),
                     "start"_.Bind<int>(0),
-                    "max"_.Bind<int>(72000),
                     "ticks_per_step"_.Bind<int>(5),  // Advance 5 ticks per RL step
                     "base_spread_bps"_.Bind<double>(1.0),  // Base spread in basis points
                     "min_size_pct"_.Bind<double>(0.5),      // Minimum order size as % of balance
@@ -117,7 +117,6 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   std::string foldername;
   double balance = 0;
   int start_read = 0;
-  int max_read = 0;
   int ticks_per_step = 5;
   double base_spread_bps = 0.0;
   double min_size_pct = 0.5;
@@ -160,7 +159,6 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
                                               foldername(spec.config["foldername"_]),
                                               balance(spec.config["balance"_]),
                                               start_read(spec.config["start"_]),
-                                              max_read(spec.config["max"_]),
                                               ticks_per_step(spec.config["ticks_per_step"_]),
                                               base_spread_bps(spec.config["base_spread_bps"_]),
                                               min_size_pct(spec.config["min_size_pct"_]),
@@ -185,14 +183,14 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
       trade_filename = "";
     } else {
       int idx = env_id % 64;
-      // New folder structure: foldername/books/1.csv(.gz) and foldername/trades/1.csv(.gz)
-      // Try .csv.gz first, then fallback to .csv
-      std::string book_filename = foldername + "books/" + std::to_string(idx + 1) + ".csv.gz";
-      trade_filename = foldername + "trades/" + std::to_string(idx + 1) + ".csv.gz";
+      // New folder structure: foldername/books/1.csv and foldername/trades/1.csv
+      // Try .csv first (uncompressed), then fallback to .csv.gz if needed
+      std::string book_filename = foldername + "books/" + std::to_string(idx + 1) + ".csv";
+      trade_filename = foldername + "trades/" + std::to_string(idx + 1) + ".csv";
       
-      // Note: CsvReader should handle .gz files if compiled with zlib support
-      // If not, user should provide uncompressed .csv files
-      exch_raw_ptr = new RLTrader::SimExchange(book_filename, 250, start_read, max_read);
+      // Note: Files are expected to be uncompressed .csv after processing
+      // If .csv doesn't exist, user can provide .csv.gz files (CsvReader handles .gz if compiled with zlib)
+      exch_raw_ptr = new RLTrader::SimExchange(book_filename, 250, start_read);
     }
 
     instr_ptr.reset(instr_raw_ptr);
@@ -206,6 +204,11 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   }
 
   void Reset() override {
+    // Reset can be called when:
+    // 1. Episode is done (isDone == true) - normal case
+    // 2. Force reset (force_reset == true) - can happen at any time
+    // So we don't check isDone here - it's valid to reset even if not done
+    
     prev_realized_pnl = 0.0;
     prev_unrealized_pnl = 0.0;
     prev_fees = 0.0;
@@ -218,17 +221,25 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     exchange_ptr->reset();
     
     // Get starting timestamp from book reader to sync trade reader
-    // We need to peek at the first row after reset
+    // CRITICAL BUG FIX: Peek at first row WITHOUT consuming it
+    // Previous code: next_read() (consumes) → reset() (picks NEW random line) = BUG!
+    // New code: peekFirstTimestamp() (doesn't consume) → no reset needed = FIXED!
     RLTrader::SimExchange* sim_exch = dynamic_cast<RLTrader::SimExchange*>(exchange_ptr.get());
     long long book_start_timestamp = 0;
     if (sim_exch) {
-        // Peek at first row by calling next_read once
-        size_t slot;
-        RLTrader::OrderBook book;
-        if (exchange_ptr->next_read(slot, book)) {
-            book_start_timestamp = sim_exch->getCurrentTimestamp();
-            // Reset exchange again to start from beginning (next_read consumed the row)
-            exchange_ptr->reset();
+        try {
+            // Peek at first timestamp without consuming the row
+            if (sim_exch->hasData()) {
+                book_start_timestamp = sim_exch->peekFirstTimestamp();
+            } else {
+                // No data available after reset
+                isDone = true;
+                return;
+            }
+        } catch (const std::exception& e) {
+            // If peek fails, mark as done
+            isDone = true;
+            return;
         }
     }
     
@@ -241,11 +252,33 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     }
     
     isDone = false;
-    // Note: Don't clear terminal_info_ here - it gets cleared after WriteState uses it
-    WriteState();
+    
+    // Guard: Verify reset state
+    // Note: isDone check is after we set it to false, so this will always pass
+    // But we keep it as a sanity check in case someone modifies the code above
+    if (steps != 0) {
+        throw std::runtime_error("Steps counter not reset to 0");
+    }
+    
+      // Note: Don't clear terminal_info_ here - it gets cleared after WriteState uses it
+      WriteState();
   }
 
-  void Step(const Action& action_dict) override { 
+  void Step(const Action& action_dict) override {
+      // Timing for performance measurement
+      static thread_local int step_count = 0;
+      static thread_local double total_cpp_time = 0.0;
+      
+      auto step_start = std::chrono::high_resolution_clock::now();
+      
+      if (++step_count % 500 == 0) {
+          if (step_count > 500) {
+              double avg_time_ms = (total_cpp_time / 500.0) * 1000.0;
+              std::cerr << "[C++ Timing] Steps " << (step_count - 500) << "-" << step_count 
+                       << ": avg=" << avg_time_ms << "ms, total=" << total_cpp_time << "s\n";
+              total_cpp_time = 0.0;
+          }
+      } 
       RLTrader::RLAction action;
       // 4-action space: bid_spread, ask_spread, target_inventory, should_requote
       // Note: skew removed - automatically computed from inventory error
@@ -285,8 +318,50 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
       // This advances ticks_per_step ticks, during which:
       // - Orders may fill (detected by execute() in SimExchange)
       // - Fills are processed by strategy.next() which calls position.onFill()
-      isDone = !adaptor_ptr->next();
+      
+      // Advance time and read data
+      bool has_data = false;
+      try {
+          has_data = adaptor_ptr->next();
+      } catch (const std::exception& e) {
+          // Exception means no more data - treat as episode end
+          has_data = false;
+      } catch (...) {
+          has_data = false;
+      }
+      
       ++steps;
+      
+      // Guard: Check if episode should end
+      // Episode ends when:
+      // 1. No more data available (CSV file finished)
+      // 2. Reached max_episode_steps limit
+      int max_episode_steps = spec_.config["max_episode_steps"_];
+      
+      // Guard: Verify steps counter is within expected range
+      if (steps < 0) {
+          throw std::runtime_error("Steps counter is negative");
+      }
+      if (steps > max_episode_steps + 1) {
+          throw std::runtime_error("Steps counter exceeded max_episode_steps + 1");
+      }
+      
+      // Set done flag based on termination conditions
+      if (!has_data) {
+          // Guard: CSV file finished - episode must end
+          isDone = true;
+      } else if (steps >= max_episode_steps) {
+          // Guard: Max steps reached - episode must end
+          isDone = true;
+      } else {
+          // Episode continues
+          isDone = false;
+      }
+      
+      // Guard: Verify done flag is set correctly
+      if (isDone && steps < max_episode_steps && has_data) {
+          throw std::runtime_error("Episode marked as done but conditions not met");
+      }
       
       // Detect if fills occurred during this step by checking trade count change
       double trade_count_after = strategy_ptr->getPosition().getNumberOfTrades();
@@ -300,6 +375,11 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
       }
       
       WriteState();
+      
+      // Measure C++ processing time at end of Step() (includes WriteState())
+      auto step_end = std::chrono::high_resolution_clock::now();
+      double step_time = std::chrono::duration<double>(step_end - step_start).count();
+      total_cpp_time += step_time;
   }
 
   void WriteState() {

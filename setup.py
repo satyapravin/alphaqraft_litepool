@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import os
+import sys
 from setuptools import setup
 from setuptools.command.install import install
 from setuptools.dist import Distribution
@@ -24,4 +26,9 @@ class BinaryDistribution(Distribution):
 
 
 if __name__ == '__main__':
+  # Set PYTHON_EXECUTABLE environment variable so CMake uses the correct Python
+  # This ensures the compiled module matches the Python version being used
+  if 'PYTHON_EXECUTABLE' not in os.environ:
+    os.environ['PYTHON_EXECUTABLE'] = sys.executable
+  
   setup(distclass=BinaryDistribution, cmdclass={'install': InstallPlatlib})

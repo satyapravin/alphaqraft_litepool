@@ -55,6 +55,7 @@ namespace RLTrader {
         double getLastMidPrice() const { return last_mid_price; }
         double getVolatility() const { return realized_vol; }
         double getTargetInventory() const { return target_inventory_ema; }
+        bool hitLeverageLimit() const { return hit_leverage_limit_; }
         
         // Update smoothed target inventory (EMA smoothing to prevent flickering)
         void updateTargetInventory(double target_inventory_action);
@@ -98,6 +99,9 @@ namespace RLTrader {
         double prev_mid_price = 0.0;
         double realized_vol = 0.0;            // EMA volatility estimate
         
+        // Leverage limit tracking
+        bool hit_leverage_limit_ = false;     // True if leverage hit ±1.0 and quoting stopped
+        
         // Model parameters
         static constexpr double TARGET_EMA_ALPHA = 0.05;     // Target inventory smoothing
         static constexpr double VOL_EMA_ALPHA = 0.1;         // Volatility EMA (~10 sample half-life)
@@ -105,7 +109,7 @@ namespace RLTrader {
         static constexpr double INVENTORY_SKEW_MULT = 1.0;   // Reduced: smoother quote shifts, agent spreads respected more
         // REMOVED: ACTION_SKEW_MULT - skew is now fully determined by inventory error
         // Agent controls inventory via target_inventory action only (no conflicting skew action)
-        static constexpr double MAX_SPREAD_MULT = 3.0;       // Maximum spread multiplier from action
+        static constexpr double MAX_SPREAD_MULT = 50.0;      // Maximum spread multiplier from action (allows huge spreads for liquidity crunches)
         static constexpr double MIN_SPREAD_MULT = 0.5;       // Minimum spread multiplier (0.5x base = 1.5bps floor)
     };
 }

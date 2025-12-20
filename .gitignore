@@ -151,3 +151,8 @@ _vizdoom*
 MUJOCO_LOG.TXT
 .vscode/
 build
+
+# Model checkpoints and results
+results/
+*.pth
+litepool/rltrader/python/results/

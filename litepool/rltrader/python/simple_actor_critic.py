@@ -150,7 +150,10 @@ class SimpleActorCritic(nn.Module):
         # Critic
         critic_features = torch.relu(self.critic_hidden(combined))
         value = self.critic(critic_features).squeeze(-1)
-        value = torch.clamp(value, -100.0, 100.0)
+        # Clamp values to match returns range [-200, 200] to allow learning actual scale
+        # With reward_scale=1.0, returns are naturally small ([-3.5, 0.5])
+        # Clamp to [-200, 200] to allow learning while preventing explosion
+        value = torch.clamp(value, -200.0, 200.0)
         value = torch.where(torch.isnan(value), torch.zeros_like(value), value)
         
         return quote_dist, requote_dist, value, new_hidden

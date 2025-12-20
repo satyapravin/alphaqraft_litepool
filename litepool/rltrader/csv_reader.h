@@ -104,11 +104,10 @@ namespace RLTrader {
         void readCSV(int start_line);
         bool more_data;
         int start_read;
-        int max_read;
         int num_reads;
 
     public:
-        CsvReader(const std::string& filename, int start_read, int max_read);
+        CsvReader(const std::string& filename, int start_read);
         ~CsvReader() {
             if (filestream.is_open()) {
                 filestream.close();
@@ -129,5 +128,9 @@ namespace RLTrader {
         long long getTimeStamp() const;
         double getDouble(const std::string& keyname) const;
         void reset();
+        // Peek at first row without consuming it (for reset synchronization)
+        long long peekFirstTimestamp() const;
+        // Rewind iterator to beginning (after peeking)
+        void rewindIterator();
     };
 }

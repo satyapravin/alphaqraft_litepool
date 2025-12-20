@@ -38,8 +38,8 @@ TEST_CASE("Testing TemporalTable") {
         table.addRow(dummy_row);
         CHECK(table.size() == 1);
         const auto& row = table.get(0);
-        CHECK(row.size() == cols);
-        CHECK(std::all_of(row.begin(), row.end(), [](double val) { return val == 0.0; }));
+            CHECK(row.size() == cols);
+            CHECK(std::all_of(row.begin(), row.end(), [](double val) { return val == 0.0; }));
     }
 
     SUBCASE("Adding and retrieving rows") {
@@ -151,7 +151,7 @@ TEST_CASE("Testing TemporalBuffer with custom class TestData") {
 }
 
 TEST_CASE("env adaptor test") {
-	SimExchange exch("test_data/data.csv", 5, 0, 100);
+	SimExchange exch("test_data/data.csv", 5, 0);
 	InverseInstrument instr("BTC", 0.5, 10.0, 0, 0.0005);
 	StrategyConfig config;
 	config.base_spread_bps = 5.0;
@@ -271,7 +271,7 @@ TEST_CASE("testing the normal_instrument") {
 }
 
 TEST_CASE("testing the csv reader") {
-	CsvReader reader("test_data/data.csv", 0, 1000);
+	CsvReader reader("test_data/data.csv", 0);
 	reader.reset();
 	int counter = 0;
 	while(reader.hasNext()) {
@@ -281,7 +281,7 @@ TEST_CASE("testing the csv reader") {
 		counter++;
 	}
 
-	SimExchange exch("test_data/data.csv", 300, 0, 100);
+	SimExchange exch("test_data/data.csv", 300, 0);
 	exch.reset();
 	counter = 0;
 	OrderBook book;
@@ -639,7 +639,7 @@ TEST_CASE("testing the inverse position") {
 }
 
 TEST_CASE("testing exchange") {
-	SimExchange exch("test_data/data.csv", 5, 0, 100); // 10 microsecond delay is not practical in reality
+	SimExchange exch("test_data/data.csv", 5, 0); // 10 microsecond delay is not practical in reality
 	exch.reset();
 	OrderBook row;
 	size_t read_slot;
@@ -675,7 +675,7 @@ TEST_CASE("testing exchange") {
 }
 
 TEST_CASE("test of inverse strategy") {
-	SimExchange exch("test_data/data.csv", 5, 0, 1000);
+	SimExchange exch("test_data/data.csv", 5, 0);
 	OrderBook book;
 	size_t slot;
 	exch.next_read(slot, book);
@@ -706,7 +706,7 @@ TEST_CASE("test of inverse strategy") {
 }
 
 TEST_CASE("test of normal strategy") {
-	SimExchange exch("test_data/data.csv", 5, 0, 1000);
+	SimExchange exch("test_data/data.csv", 5, 0);
 	OrderBook book;
 	size_t slot;
 	exch.next_read(slot, book);
@@ -1487,7 +1487,7 @@ TEST_CASE("test csv reader and trade reader integration with env adaptor") {
 	// Test Case 1: Verify CSVReader reads book data correctly
 	// ============================================================================
 	{
-		CsvReader book_reader("test_data/data.csv", 0, 100);
+                CsvReader book_reader("test_data/data.csv", 0);
 		book_reader.reset();
 		
 		int row_count = 0;
@@ -1524,7 +1524,7 @@ TEST_CASE("test csv reader and trade reader integration with env adaptor") {
 	// Test Case 2: Verify TradeReader reads trade data correctly
 	// ============================================================================
 	{
-		TradeReader trade_reader("test_data/trades/1.csv", 0, 0);
+		TradeReader trade_reader("test_data/trades/1.csv", 0);
 		trade_reader.reset(0);  // Reset to beginning
 		
 		// Get trades up to a specific timestamp
@@ -1556,10 +1556,10 @@ TEST_CASE("test csv reader and trade reader integration with env adaptor") {
 	// Test Case 3: Verify timestamp synchronization between book and trade readers
 	// ============================================================================
 	{
-		CsvReader book_reader("test_data/data.csv", 0, 100);
+                CsvReader book_reader("test_data/data.csv", 0);
 		book_reader.reset();
 		
-		TradeReader trade_reader("test_data/trades/1.csv", 0, 0);
+		TradeReader trade_reader("test_data/trades/1.csv", 0);
 		
 		// Get first book timestamp
 		if (book_reader.hasNext()) {
@@ -1591,7 +1591,7 @@ TEST_CASE("test csv reader and trade reader integration with env adaptor") {
 	// Test Case 4: Verify EnvAdaptor uses both readers correctly
 	// ============================================================================
 	{
-		SimExchange exch("test_data/data.csv", 5, 0, 100);
+		SimExchange exch("test_data/data.csv", 5, 0);
 		NormalInstrument instr("BTCUSDT", 0.1, 0.0001, -0.0001, 0.00075);
 		StrategyConfig config;
 		config.base_spread_bps = 5.0;
@@ -1644,7 +1644,7 @@ TEST_CASE("test csv reader and trade reader integration with env adaptor") {
 	// Test Case 5: Verify EnvAdaptor without trade reader (should zero out trade signals)
 	// ============================================================================
 	{
-		SimExchange exch("test_data/data.csv", 5, 0, 100);
+		SimExchange exch("test_data/data.csv", 5, 0);
 		NormalInstrument instr("BTCUSDT", 0.1, 0.0001, -0.0001, 0.00075);
 		StrategyConfig config;
 		config.base_spread_bps = 5.0;
@@ -1674,10 +1674,10 @@ TEST_CASE("test csv reader and trade reader integration with env adaptor") {
 	// Test Case 6: Verify sequential reading and timestamp progression
 	// ============================================================================
 	{
-		CsvReader book_reader("test_data/data.csv", 0, 50);
+                CsvReader book_reader("test_data/data.csv", 0);
 		book_reader.reset();
 		
-		TradeReader trade_reader("test_data/trades/1.csv", 0, 0);
+		TradeReader trade_reader("test_data/trades/1.csv", 0);
 		
 		// Get first book timestamp and sync
 		if (book_reader.hasNext()) {
@@ -1715,7 +1715,7 @@ TEST_CASE("test csv reader and trade reader integration with env adaptor") {
 	// Test Case 7: Verify trade reader handles empty time windows correctly
 	// ============================================================================
 	{
-		TradeReader trade_reader("test_data/trades/1.csv", 0, 0);
+		TradeReader trade_reader("test_data/trades/1.csv", 0);
 		trade_reader.reset(0);
 		
 		// Request trades for a timestamp before any trades exist
@@ -1732,7 +1732,7 @@ TEST_CASE("test csv reader and trade reader integration with env adaptor") {
 	// Test Case 8: Verify SimExchange getCurrentTimestamp() works correctly
 	// ============================================================================
 	{
-		SimExchange exch("test_data/data.csv", 5, 0, 100);
+		SimExchange exch("test_data/data.csv", 5, 0);
 		exch.reset();
 		
 		size_t slot;
@@ -1759,7 +1759,7 @@ TEST_CASE("test csv reader and trade reader integration with env adaptor") {
 	// Test Case 9: Verify EnvAdaptor integration - full workflow
 	// ============================================================================
 	{
-		SimExchange exch("test_data/data.csv", 5, 0, 100);
+		SimExchange exch("test_data/data.csv", 5, 0);
 		NormalInstrument instr("BTCUSDT", 0.1, 0.0001, -0.0001, 0.00075);
 		StrategyConfig config;
 		config.base_spread_bps = 5.0;

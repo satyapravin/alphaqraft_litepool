@@ -3,15 +3,16 @@ Simple PPO training for GLFT market making.
 - 30-signal observations (13 market + 4 AMM flow + 8 trade + 5 agent state)
 - 4-action outputs: 3 continuous quote parameters + 1 binary requote decision
   * Actions 0-2: bid_spread, ask_spread, target_inventory (continuous)
-  * Action 4: should_requote (binary decision: >0 = requote, <=0 = continue)
+  * Action 3: should_requote (binary decision: >0 = requote, <=0 = continue)
 - Order size uses min_size_pct by default (no RL control)
 - Separate policy heads: Normal distribution for quotes, Bernoulli for requote
 - Target inventory is smoothed with EMA to prevent flickering
-- CPU-friendly, no recurrence, no OT
+- LSTM for temporal pattern recognition
 """
 import numpy as np
 import torch
 from pathlib import Path
+import gc
 import litepool
 
 from simple_actor_critic import SimpleActorCritic
@@ -25,8 +26,8 @@ device = torch.device("cpu")
 print(f"Using device: {device}")
 
 # === Configuration ===s
-NUM_ENVS = 3           # Match number of training data files
-NUM_THREADS = 3        # Leave cores for main process (10 cores total)
+NUM_ENVS = 6           # Match number of training data files
+NUM_THREADS = 6        # Leave cores for main process (10 cores total)
 N_STEPS = 2048         # Steps per rollout
 UPDATE_EPOCHS = 5      # PPO epochs per update
 MINIBATCH_SIZE = 256   # Minibatch size for updates
@@ -59,8 +60,8 @@ env = litepool.make(
     foldername="/home/pravin/dev/alphaqraft_litepool/data/training/",
     balance=100000.0,  # Starting capital: $100,000 USD
                        # With BTC ~$100k, 2% of $100k = $2,000 = ~0.02 BTC per order
-    start=50000,
-    max=2048*5,         
+    start=360000,
+    max_episode_steps=2048,  # 
     base_spread_bps=BASE_SPREAD_BPS,  # Base spread in basis points
     min_size_pct=MIN_SIZE_PCT,        # Minimum order size as % of balance
     max_size_pct=MAX_SIZE_PCT,        # Maximum order size as % of balance
@@ -96,13 +97,17 @@ policy = SimplePPOPolicy(
     gamma=GAMMA,
     gae_lambda=GAE_LAMBDA,
     clip_eps=0.2,
-    vf_coef=0.25,  # Increased to improve value function learning
+    vf_coef=0.1,  # Reduced to prevent value function from exploding with large returns
     ent_coef=0.05,  # Higher entropy for more exploration (prevent policy collapse)
     max_grad_norm=0.5,  # Standard value for PPO
 )
 
-REWARD_SCALE = 1.0  # No additional scaling - C++ already scales rewards by 10000
-                    # Rewards from C++ are already in a good range (e.g., 1.0 = 0.01% of balance)
+REWARD_SCALE = 1.0  # NO SCALING - let returns be naturally small
+                    # C++ already scales by 10000, rewards are normalized by balance
+                    # Returns will be small ([-3.5, 0.5]) which is CORRECT for the problem scale
+                    # Value function can learn to predict small returns efficiently
+                    # Scaling rewards was the wrong approach - it caused returns to explode
+                    # and made training slow/unstable
 
 collector = SimpleCollector(
     env=env,
@@ -203,14 +208,19 @@ def train():
         global_step += N_STEPS * NUM_ENVS
         
         # === Logging ===
-        # Use average of completed episode rewards instead of temporal average of all steps
+        # Use average of completed episode rewards (cumulative episode totals)
         # This matches the episode-level rewards shown in logs
         completed_episode_rewards = batch.get('completed_episode_rewards', [])
         if completed_episode_rewards:
+            # Average of cumulative episode rewards (sum of all steps per episode)
             avg_reward = float(np.mean(completed_episode_rewards))
         else:
-            # Fallback to temporal average if no episodes completed in this batch
-            avg_reward = batch['rewards'].mean().item()
+            # Fallback: estimate from step rewards (sum per environment, then average)
+            # This approximates cumulative episode rewards when no episodes completed
+            step_rewards = batch['rewards']  # [n_steps, n_envs] - already scaled by 10000
+            # Sum rewards per environment to get approximate episode totals
+            env_totals = step_rewards.sum(dim=0)  # [n_envs] - cumulative per environment
+            avg_reward = float(env_totals.mean().item())
         
         # Diagnostic: Check requote decisions and PnL
         actions_np = batch['actions'].detach().cpu().numpy()
@@ -468,6 +478,14 @@ def train():
               f"VL {total_value_loss/n_updates:7.4f} | "
               f"Ent {total_entropy/n_updates:6.4f} | "
               f"Std {loss_info['action_std']:5.3f}")
+        
+        # Print episode statistics if any episodes completed in this epoch
+        if completed_episode_rewards:
+            print(f"  Completed {len(completed_episode_rewards)} episode(s) in this epoch")
+        
+        # Force garbage collection to help with memory management
+        # PyTorch's allocator caches memory, but Python GC can help free unreferenced objects
+        gc.collect()
         
         # === Log detailed metrics ===
         if epoch % 10 == 0 or epoch == 0:

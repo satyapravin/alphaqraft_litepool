@@ -25,6 +25,7 @@
 #include <cassert>
 #include <condition_variable>
 #include <functional>
+#include <iostream>
 #include <utility>
 #include <vector>
 
@@ -125,7 +126,16 @@ class StateBuffer {
    */
   void Done(std::size_t num = 1) {
     std::size_t done_count = done_count_.fetch_add(num);
+    // DEBUG: Log to identify if Done is called and when semaphore is signaled
+    static thread_local int done_count_total = 0;
+    done_count_total += num;
+    if (done_count_total % 1000 == 0) {
+      std::cerr << "[DEBUG StateBuffer] Done() call " << done_count_total << ", done_count=" << (done_count + num) << ", batch_=" << batch_ << "\n";
+    }
     if (done_count + num == batch_) {
+      if (done_count_total % 1000 == 0) {
+        std::cerr << "[DEBUG StateBuffer] Done() signaling semaphore, all " << batch_ << " done\n";
+      }
       sem_.signal();
     }
   }

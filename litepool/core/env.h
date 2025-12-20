@@ -20,6 +20,7 @@
 #include <memory>
 #include <random>
 #include <tuple>
+#include <iostream>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -161,12 +162,20 @@ class Env {
 
   void EnvStep(StateBufferQueue* sbq, int order, bool reset) {
     PreProcess(sbq, order, reset);
-    if (reset) {
-      Reset();
-    } else {
-      ParseAction();
-      Step(Action(std::move(raw_action_)));
-      raw_action_.clear();
+    try {
+      if (reset) {
+        Reset();
+      } else {
+        ParseAction();
+        Step(Action(std::move(raw_action_)));
+        raw_action_.clear();
+      }
+    } catch (...) {
+      // If Reset() or Step() throws, we still need to call PostProcess()
+      // to ensure done_write() is called and the state buffer semaphore is signaled
+      // Otherwise, Wait() will block forever waiting for all environments to call Done()
+      PostProcess();
+      throw;  // Re-throw the exception after ensuring PostProcess is called
     }
     PostProcess();
   }
@@ -189,7 +198,15 @@ class Env {
   }
 
   void PostProcess() {
+    // DEBUG: Log to identify if PostProcess is called
+    static thread_local int postprocess_count = 0;
+    if (++postprocess_count % 1000 == 0) {
+      std::cerr << "[DEBUG Env] PostProcess() call " << postprocess_count << ", calling done_write()\n";
+    }
     slice_.done_write();
+    if (postprocess_count % 1000 == 0) {
+      std::cerr << "[DEBUG Env] PostProcess() call " << postprocess_count << ", done_write() completed\n";
+    }
     // action_batch_.reset();
   }
 

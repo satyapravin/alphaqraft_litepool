@@ -1,5 +1,6 @@
 #include "env_adaptor.h"
 #include <algorithm>
+#include <iostream>
 
 using namespace RLTrader;
 
@@ -9,7 +10,7 @@ EnvAdaptor::EnvAdaptor(Strategy& strat, BaseExchange& exch, const std::string& t
             ticks_per_step_(ticks_per_step),
             market_builder(std::make_unique<MarketSignalBuilder>()),
             trade_reader(trade_filename.empty() ? nullptr : 
-                         std::make_unique<TradeReader>(trade_filename, 0, 0)),
+                         std::make_unique<TradeReader>(trade_filename, 0)),
             trade_signal_builder(std::make_unique<TradeSignalBuilder>()),
             bid_prices(), ask_prices(), bid_sizes(), ask_sizes() {
 }
@@ -19,27 +20,44 @@ bool EnvAdaptor::next() {
     OrderBook book;
     size_t read_slot;
     
-    // Sync trade reader on first call after reset
-    // Get the starting timestamp from book reader
-    if (trade_reader) {
-        SimExchange* sim_exch = dynamic_cast<SimExchange*>(&exchange);
-        if (sim_exch) {
-            // Peek at first row to get starting timestamp
-            // We need to call next_read first, then sync
-            // Actually, we'll sync in computeState when we have the timestamp
-        }
-    }
-    
     // Advance multiple ticks per RL step to let orders persist
     for (int tick = 0; tick < ticks_per_step_; ++tick) {
-        if (!this->exchange.next_read(read_slot, book)) {
-            return false;  // No more data
+        // Guard: Verify tick is within expected range
+        if (tick < 0 || tick >= ticks_per_step_) {
+            throw std::runtime_error("Tick index out of range");
         }
-        this->strategy.next();  // Process any fills from this tick
+        
+        bool read_success = false;
+        try {
+            read_success = this->exchange.next_read(read_slot, book);
+        } catch (const std::exception& e) {
+            // Exception means no more data - return false to end episode
+            return false;
+        } catch (...) {
+            return false;
+        }
+        
+        // Guard: If no data available, episode must end immediately
+        // Don't continue processing remaining ticks - return immediately
+        if (!read_success) {
+            return false;  // No more data - episode ends
+        }
+        
+        try {
+            this->strategy.next();  // Process any fills from this tick
+        } catch (const std::exception& e) {
+            this->exchange.done_read(read_slot);  // Still need to release the slot
+            return false;
+        } catch (...) {
+            this->exchange.done_read(read_slot);
+            return false;
+        }
+        
         this->exchange.done_read(read_slot);
     }
     
     // Compute state from the last tick
+    // Guard: Only compute state if we successfully read data for all ticks
     computeState(book);
     std::copy(book.bid_prices.begin(), book.bid_prices.end(), bid_prices.begin());
     std::copy(book.ask_prices.begin(), book.ask_prices.end(), ask_prices.begin());
