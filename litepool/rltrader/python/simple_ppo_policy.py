@@ -153,7 +153,22 @@ class SimplePPOPolicy:
         
         # Normalize advantages for policy learning (standard PPO practice)
         # This reduces variance in policy gradient estimates
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # CRITICAL: If std is too small, normalization can explode gradients
+        # Add safety check: if std < 0.01, don't normalize (use raw advantages)
+        adv_mean = advantages.mean()
+        adv_std = advantages.std()
+        if adv_std > 0.01:
+            advantages = (advantages - adv_mean) / adv_std
+            # CRITICAL: Clamp after normalization to prevent explosion
+            # Even with proper std, normalization can produce large values if advantages are spread out
+            # Clamp to [-10, 10] to ensure policy gradients stay reasonable
+            advantages = torch.clamp(advantages, -10.0, 10.0)
+        else:
+            # If std is too small, just center (subtract mean) without dividing
+            # This prevents explosion when all advantages are similar
+            advantages = advantages - adv_mean
+            # Clamp again after centering to prevent any remaining large values
+            advantages = torch.clamp(advantages, -10.0, 10.0)
         
         # Forward pass
         new_log_probs, values, entropy = self.model.evaluate_actions(obs, actions)
@@ -205,8 +220,12 @@ class SimplePPOPolicy:
         
         # Policy loss (clipped surrogate)
         # Clip log prob difference to prevent extreme ratios
-        log_ratio = torch.clamp(new_log_probs - old_log_probs, -10.0, 10.0)
+        # CRITICAL: With log_ratio clamped to [-10, 10], exp(10) ≈ 22026 which is huge
+        # Clamp more aggressively to prevent gradient explosion
+        log_ratio = torch.clamp(new_log_probs - old_log_probs, -2.0, 2.0)  # Max ratio ≈ 7.4
         ratio = torch.exp(log_ratio)
+        # Double-clamp ratio for safety (in case log_ratio clamping isn't enough)
+        ratio = torch.clamp(ratio, 0.01, 10.0)  # Prevent extreme ratios
         surr1 = ratio * advantages
         surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages
         policy_loss = -torch.min(surr1, surr2).mean()

@@ -439,14 +439,18 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     double current_realized_pnl = info["realized_pnl"];
     double realized_pnl_delta = current_realized_pnl - prev_realized_pnl;
     prev_realized_pnl = current_realized_pnl;
-    if (initial_balance_ > 0) {
+    if (initial_balance_ > 1e-9) {  // Guard against division by zero/near-zero
         realized_pnl_delta /= initial_balance_;
+    } else {
+        realized_pnl_delta = 0.0;
     }
     
     double spread_capture_delta = info["spread_capture"] - prev_spread_capture;
     prev_spread_capture = info["spread_capture"];
-    if (initial_balance_ > 0) {
+    if (initial_balance_ > 1e-9) {  // Guard against division by zero/near-zero
         spread_capture_delta /= initial_balance_;
+    } else {
+        spread_capture_delta = 0.0;
     }
     
     // Blend: 50% realized_pnl (matches accounting) + 50% spread_capture (cleaner signal)
@@ -461,8 +465,10 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     double current_unrealized_pnl = info["unrealized_pnl"];
     double unrealized_delta = current_unrealized_pnl - prev_unrealized_pnl;
     prev_unrealized_pnl = current_unrealized_pnl;
-    if (initial_balance_ > 0) {
+    if (initial_balance_ > 1e-9) {  // Guard against division by zero/near-zero
         unrealized_delta /= initial_balance_;
+    } else {
+        unrealized_delta = 0.0;
     }
     
     // 3. Fee rebate reward: with maker_fee < 0, fees becomes more negative when trading
@@ -471,8 +477,10 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     double current_fees = info["fees"];
     double fee_delta = -(current_fees - prev_fees);  // Positive when rebates earned
     prev_fees = current_fees;
-    if (initial_balance_ > 0) {
+    if (initial_balance_ > 1e-9) {  // Guard against division by zero/near-zero
         fee_delta /= initial_balance_;
+    } else {
+        fee_delta = 0.0;
     }
     
     // 4. Inventory management is handled by strategy's skew mechanism (not reward penalty)

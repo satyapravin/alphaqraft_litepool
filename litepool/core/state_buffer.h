@@ -110,6 +110,11 @@ class StateBuffer {
       return WritableSlice{.arr = std::move(state),
                            .done_write = [this]() { Done(); }};
     }
+    // CRITICAL: If allocation fails, alloc_count_ was already incremented
+    // but Done() will never be called by the caller. We must call Done() here
+    // to prevent Wait() from hanging forever waiting for the semaphore.
+    // This accounts for the failed allocation attempt.
+    Done(1);
     DLOG(INFO) << "Allocation failed, continue to the next block of memory";
     throw std::out_of_range("StateBuffer out of storage");
   }

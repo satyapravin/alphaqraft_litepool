@@ -22,11 +22,6 @@ bool EnvAdaptor::next() {
     
     // Advance multiple ticks per RL step to let orders persist
     for (int tick = 0; tick < ticks_per_step_; ++tick) {
-        // Guard: Verify tick is within expected range
-        if (tick < 0 || tick >= ticks_per_step_) {
-            throw std::runtime_error("Tick index out of range");
-        }
-        
         bool read_success = false;
         try {
             read_success = this->exchange.next_read(read_slot, book);
@@ -167,7 +162,7 @@ void EnvAdaptor::computeState(OrderBook& book)
         // [16] Cumulative flow / balance: trend indicator for target inventory
         // Normalized by initial balance to give [-1, 1] scale for typical flow ranges
         double init_balance = strategy.getPosition().getInitialBalance();
-        if (init_balance > 0) {
+        if (init_balance > 1e-9) {  // Guard against division by zero/near-zero
             // Scale: cumulative_flow of ±balance maps to ±1
             double flow_per_balance = amm_signals.cumulative_flow / init_balance;
             state[16] = std::tanh(flow_per_balance);  // Smooth bounding to [-1, 1]
@@ -214,21 +209,30 @@ void EnvAdaptor::computeState(OrderBook& book)
     // [25] Current leverage (position / balance)
     state[25] = std::tanh(posInfo.leverage * 5.0);  // Scale: ±20% leverage maps to ±tanh(1) ≈ ±0.76
     
-    // [26] Normalized position (netAmount normalized by initial balance)
-    // For normal instruments: netAmount is in BTC, normalize by initialBalance to get position ratio
-    double netAmount = strategy.getPosition().getNetAmount();
-    double mid = 0.5 * (book.bid_prices[0] + book.ask_prices[0]);
-    double positionValue = std::abs(netAmount * mid);
-    state[26] = std::tanh((positionValue / initialBalance) * 2.0);  // Scale: 50% of balance = tanh(1) ≈ 0.76
-    
-    // [27] Normalized unrealized PnL (inventoryPnL / initialBalance)
-    state[27] = std::tanh((posInfo.inventoryPnL / initialBalance) * 10.0);  // Scale: ±10% of balance = ±tanh(1)
-    
-    // [28] Normalized realized PnL (realizedPnL / initialBalance)
-    state[28] = std::tanh((posInfo.realizedPnL / initialBalance) * 10.0);  // Scale: ±10% of balance = ±tanh(1)
-    
-    // [29] Normalized spread capture (spreadCapture / initialBalance)
-    state[29] = std::tanh((posInfo.spreadCapture / initialBalance) * 10.0);  // Scale: ±10% of balance = ±tanh(1)
+    // [26-29] Agent state signals - guard against division by zero/near-zero
+    if (initialBalance > 1e-9) {
+        // [26] Normalized position (netAmount normalized by initial balance)
+        // For normal instruments: netAmount is in BTC, normalize by initialBalance to get position ratio
+        double netAmount = strategy.getPosition().getNetAmount();
+        double mid = 0.5 * (book.bid_prices[0] + book.ask_prices[0]);
+        double positionValue = std::abs(netAmount * mid);
+        state[26] = std::tanh((positionValue / initialBalance) * 2.0);  // Scale: 50% of balance = tanh(1) ≈ 0.76
+        
+        // [27] Normalized unrealized PnL (inventoryPnL / initialBalance)
+        state[27] = std::tanh((posInfo.inventoryPnL / initialBalance) * 10.0);  // Scale: ±10% of balance = ±tanh(1)
+        
+        // [28] Normalized realized PnL (realizedPnL / initialBalance)
+        state[28] = std::tanh((posInfo.realizedPnL / initialBalance) * 10.0);  // Scale: ±10% of balance = ±tanh(1)
+        
+        // [29] Normalized spread capture (spreadCapture / initialBalance)
+        state[29] = std::tanh((posInfo.spreadCapture / initialBalance) * 10.0);  // Scale: ±10% of balance = ±tanh(1)
+    } else {
+        // Zero out agent state signals if initial balance is invalid
+        state[26] = 0.0;
+        state[27] = 0.0;
+        state[28] = 0.0;
+        state[29] = 0.0;
+    }
     
     computeInfo(book);
 }

@@ -54,9 +54,6 @@ class SimpleActorCritic(nn.Module):
         self.critic_hidden = nn.Linear(combined_dim, hidden_dim // 2)
         self.critic = nn.Linear(hidden_dim // 2, 1)
         
-        # Hidden state storage (per environment)
-        self._hidden_states = {}
-        
         self._init_weights()
     
     def _init_weights(self):
@@ -77,15 +74,6 @@ class SimpleActorCritic(nn.Module):
         nn.init.orthogonal_(self.requote_logit.weight, gain=0.01)
         nn.init.constant_(self.requote_logit.bias, -3.0)
         nn.init.orthogonal_(self.critic.weight, gain=1.0)
-    
-    def reset_hidden(self, env_ids=None):
-        """Reset LSTM hidden states for specified environments (or all if None)."""
-        if env_ids is None:
-            self._hidden_states = {}
-        else:
-            for env_id in env_ids:
-                if env_id in self._hidden_states:
-                    del self._hidden_states[env_id]
     
     def _get_hidden(self, batch_size, device):
         """Get or create hidden states for batch."""

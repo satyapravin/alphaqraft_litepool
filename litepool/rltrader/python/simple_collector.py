@@ -36,6 +36,8 @@ class SimpleCollector:
         self.episode_rewards = None  # Track cumulative rewards per environment
         self.episode_steps = None  # Track step count per environment
         self.completed_episode_rewards = []  # Track rewards from completed episodes in this batch
+        self.completed_episode_realized_pnl = []  # Track realized PnL from completed episodes
+        self.completed_episode_unrealized_pnl = []  # Track unrealized PnL from completed episodes
         self.hidden_states = None  # Track LSTM hidden states per environment: list of (h, c) tuples
     
     def collect(self):
@@ -61,10 +63,14 @@ class SimpleCollector:
             self.episode_steps = np.zeros(self.n_envs, dtype=np.int32)  # Track steps per episode
             # Initialize LSTM hidden states (zeros for all environments)
             self.hidden_states = [None] * self.n_envs
+            # Initialize previous episode_ended tracking
+            self._prev_episode_ended = np.zeros(self.n_envs, dtype=bool)
         
-        # Reset completed episode rewards at start of each batch collection
+        # Reset completed episode statistics at start of each batch collection
         # This ensures we only track episodes completed in THIS batch
         self.completed_episode_rewards = []
+        self.completed_episode_realized_pnl = []
+        self.completed_episode_unrealized_pnl = []
         
         # Ensure n_envs is set (should be set by now)
         n_envs = self.n_envs
@@ -76,7 +82,7 @@ class SimpleCollector:
         values_list = []
         rewards_list = []
         dones_list = []
-        truncs_list = []  # Track truncs to check if all envs are done
+        # Note: truncs_list removed - was only used for early exit logic which has been removed
         infos_list = []
         
         # Timing tracking
@@ -90,26 +96,13 @@ class SimpleCollector:
                 if len(step_times) > 0:
                     avg_time = np.mean(step_times)
                     total_time = np.sum(step_times)
-                    print(f"[Python Timing] Steps {last_log_step}-{step_idx}: avg={avg_time*1000:.2f}ms, total={total_time:.3f}s, count={len(step_times)}")
+                    #print(f"[Python Timing] Steps {last_log_step}-{step_idx}: avg={avg_time*1000:.2f}ms, total={total_time:.3f}s, count={len(step_times)}")
                     step_times.clear()
                     last_log_step = step_idx
             
-            # Early exit check BEFORE calling env.step() to avoid blocking
-            # If all environments were done in previous step and we have enough data, break
-            if step_idx > 0 and len(dones_list) > 0:
-                prev_dones = dones_list[-1]
-                prev_truncs = truncs_list[-1] if len(truncs_list) > 0 else np.zeros_like(prev_dones)
-                prev_all_done = np.all(prev_dones | prev_truncs)
-                min_steps = int(0.75 * n_steps)  # Collect at least 75% of steps
-                if prev_all_done and step_idx >= min_steps:
-                    # Break early if all environments are done
-                    # Pop the last elements to keep lists in sync (they were appended before env.step())
-                    if len(obs_list) > len(rewards_list):
-                        obs_list.pop()
-                        actions_list.pop()
-                        log_probs_list.pop()
-                        values_list.pop()
-                    break
+            # Note: Early exit logic removed - it caused issues with partial batches
+            # and misaligned data. Let the collection run for full n_steps.
+            # The environment auto-resets on done/trunc, so this is safe.
             
             # Get actions from policy with current hidden states
             # Time model inference to diagnose slowdown
@@ -118,8 +111,8 @@ class SimpleCollector:
                 self.obs, hidden_states=self.hidden_states
             )
             model_time = time.perf_counter() - model_start
-            if step_idx % 100 == 0:  # Log every 100 steps
-                print(f"[Model Timing] Step {step_idx}: model_inference={model_time*1000:.2f}ms")
+            #if step_idx % 100 == 0:  # Log every 100 steps
+            #    print(f"[Model Timing] Step {step_idx}: model_inference={model_time*1000:.2f}ms")
             
             # Store current step
             # CRITICAL: Don't copy obs - it's already a new array from env.step()
@@ -145,7 +138,7 @@ class SimpleCollector:
             
             rewards_list.append(rewards)
             dones_list.append(dones)
-            truncs_list.append(truncs)  # Track truncs for early exit check
+            # Note: truncs not stored - was only used for early exit logic which has been removed
             # Store infos directly - only convert when needed for logging
             # The conversion was too slow when done on every step
             infos_list.append(infos)
@@ -155,16 +148,32 @@ class SimpleCollector:
             # So we need to check both dones (terminated) and truncs
             episode_ended = dones | truncs  # Episode ends if terminated OR truncated
             
-            # Increment episode step count only for environments that are NOT done
-            # If an episode just ended, it already completed its steps, so don't increment
-            # This prevents the off-by-one error where steps show 2049 instead of 2048
-            for env_id in range(self.n_envs):
-                if not episode_ended[env_id]:
-                    self.episode_steps[env_id] += 1
+            # Track which environments ended in the PREVIOUS step (before auto-reset)
+            # This is needed to detect when an environment has just auto-reset
+            prev_episode_ended = getattr(self, '_prev_episode_ended', np.zeros(self.n_envs, dtype=bool))
             
-            # Update LSTM hidden states, resetting for environments that are done
+            # Increment episode step count for environments that are continuing their episode
+            # When an episode ends, env.step() returns dones=True/truncs=True, meaning the episode
+            # ended AFTER completing that step. So we should count that step BEFORE it ends.
+            # However, after auto-reset, the environment is in a new episode (step 0), so we should
+            # NOT increment for environments that just auto-reset (prev_ended=True, now False).
             for env_id in range(self.n_envs):
-                if dones[env_id]:
+                if episode_ended[env_id]:
+                    # Episode just ended - count this step (it ended AFTER completing it)
+                    self.episode_steps[env_id] += 1
+                elif not prev_episode_ended[env_id]:
+                    # Episode is continuing (not ended in prev step, not ended now) - count this step
+                    self.episode_steps[env_id] += 1
+                # else: prev_ended=True and current=False means just auto-reset, don't increment (it's step 0 of new episode)
+            
+            # Store current episode_ended for next iteration
+            self._prev_episode_ended = episode_ended.copy() if isinstance(episode_ended, np.ndarray) else np.array([episode_ended])
+            
+            # Update LSTM hidden states, resetting for environments that ended (done OR truncated)
+            # CRITICAL: Must reset on truncation too! When max_episode_steps is reached,
+            # dones=False but truncs=True, and we still need to reset hidden state for new episode
+            for env_id in range(self.n_envs):
+                if episode_ended[env_id]:  # Use episode_ended (dones | truncs), not just dones
                     # Reset hidden state for this environment (new episode)
                     self.hidden_states[env_id] = None
                     # Note: episode_steps[env_id] will be reset in _log_episode_end
@@ -293,7 +302,8 @@ class SimpleCollector:
         
         # Clamp returns and advantages to prevent numerical instability
         # With reward_scale=1.0, returns are naturally small (e.g., [-3.5, 0.5])
-        # Clamp to [-200, 200] to allow learning actual scale while preventing explosionreturns = torch.clamp(returns, -200.0, 200.0)
+        # Clamp to [-200, 200] to allow learning actual scale while preventing explosion
+        returns = torch.clamp(returns, -200.0, 200.0)
         advantages = torch.clamp(advantages, -200.0, 200.0)  # Advantages are typically smaller
         
         # Flatten batch: [n_steps, n_envs, ...] -> [n_steps * n_envs, ...]
@@ -309,6 +319,8 @@ class SimpleCollector:
             'dones': dones,  # Done flags [n_steps, n_envs] for goal_manager
             'infos': infos_list,
             'completed_episode_rewards': self.completed_episode_rewards.copy(),  # Cumulative rewards from completed episodes
+            'completed_episode_realized_pnl': self.completed_episode_realized_pnl.copy(),  # Realized PnL from completed episodes
+            'completed_episode_unrealized_pnl': self.completed_episode_unrealized_pnl.copy(),  # Unrealized PnL from completed episodes
         }
         
         return batch
@@ -406,8 +418,10 @@ class SimpleCollector:
                 # Get cumulative reward for this episode (normalized, fraction of balance)
                 episode_reward = self.episode_rewards[env_id]
                 
-                # Track completed episode reward for epoch average
+                # Track completed episode statistics for epoch average
                 self.completed_episode_rewards.append(episode_reward)
+                self.completed_episode_realized_pnl.append(realized_pnl)
+                self.completed_episode_unrealized_pnl.append(unrealized_pnl)
                 
                 # Get episode step count before resetting
                 episode_steps = int(self.episode_steps[env_id])

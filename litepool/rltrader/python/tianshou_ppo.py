@@ -25,14 +25,14 @@ from metric_logger import MetricLogger
 device = torch.device("cpu")
 print(f"Using device: {device}")
 
-# === Configuration ===s
+# === Configuration ===
 NUM_ENVS = 6           # Match number of training data files
 NUM_THREADS = 6        # Leave cores for main process (10 cores total)
 N_STEPS = 2048         # Steps per rollout
-UPDATE_EPOCHS = 5      # PPO epochs per update
-MINIBATCH_SIZE = 256   # Minibatch size for updates
+UPDATE_EPOCHS = 3      # PPO epochs per update
+MINIBATCH_SIZE = 128   # Minibatch size for updates
 TOTAL_EPOCHS = 10000   # Total training epochs
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 5e-5  # Reduced from 1e-4 to prevent gradient explosion
 GAMMA = 0.995    
 GAE_LAMBDA = 0.95
 BASE_SPREAD_BPS = 1.0  # Base spread in basis points (1 bps = $10 on $100k BTC - room for spread capture)
@@ -239,41 +239,51 @@ def train():
             avg_ask_spread = 0.0
             avg_target_inv = 0.0
         
-        # Extract info for diagnostics - average across all environments from last step
-        avg_realized_pnl = 0.0
-        avg_unrealized_pnl = 0.0
+        # Extract info for diagnostics
+        # Use completed episode statistics for PnL (matches episode-level logs)
+        # Fall back to last step info for trade counts and other metrics
+        completed_realized_pnl = batch.get('completed_episode_realized_pnl', [])
+        completed_unrealized_pnl = batch.get('completed_episode_unrealized_pnl', [])
+        
+        if completed_realized_pnl and len(completed_realized_pnl) > 0:
+            # Use average from completed episodes (matches episode-level statistics)
+            avg_realized_pnl = float(np.mean(completed_realized_pnl))
+            avg_unrealized_pnl = float(np.mean(completed_unrealized_pnl))
+        else:
+            # Fallback: use last step info if no episodes completed
+            avg_realized_pnl = 0.0
+            avg_unrealized_pnl = 0.0
+            if batch['infos'] and len(batch['infos']) > 0:
+                last_info = batch['infos'][-1]
+                def safe_get_avg(info, key, default=0.0):
+                    values = []
+                    if isinstance(info, list):
+                        for env_info in info:
+                            if isinstance(env_info, dict):
+                                val = env_info.get(key, default)
+                                if isinstance(val, (list, np.ndarray)) and len(val) > 0:
+                                    values.extend([float(v) for v in val])
+                                elif val is not None:
+                                    values.append(float(val))
+                    elif isinstance(info, dict):
+                        val = info.get(key, default)
+                        if isinstance(val, (list, np.ndarray)) and len(val) > 0:
+                            values = [float(v) for v in val]
+                        elif val is not None:
+                            values = [float(val)]
+                    return np.mean(values) if values else default
+                avg_realized_pnl = safe_get_avg(last_info, 'realized_pnl', 0.0)
+                avg_unrealized_pnl = safe_get_avg(last_info, 'unrealized_pnl', 0.0)
+        
         avg_trade_count = 0.0
         buy_delta = 0.0
         sell_delta = 0.0
         actual_placed_bid_spread_bps = 0.0
         actual_placed_ask_spread_bps = 0.0
         if batch['infos'] and len(batch['infos']) > 0:
-            # Get first and last step's info to calculate deltas
+            # Get first and last step's info to calculate deltas for trade counts
             first_info = batch['infos'][0]
             last_info = batch['infos'][-1]
-            
-            # Helper to extract and average value across all environments
-            def safe_get_avg(info, key, default=0.0):
-                values = []
-                if isinstance(info, list):
-                    # List of environment info dicts
-                    for env_info in info:
-                        if isinstance(env_info, dict):
-                            val = env_info.get(key, default)
-                            if isinstance(val, (list, np.ndarray)) and len(val) > 0:
-                                # Array of values (one per env) - collect all
-                                values.extend([float(v) for v in val])
-                            elif val is not None:
-                                values.append(float(val))
-                elif isinstance(info, dict):
-                    # Single dict - check if values are arrays (one per env)
-                    val = info.get(key, default)
-                    if isinstance(val, (list, np.ndarray)) and len(val) > 0:
-                        values = [float(v) for v in val]
-                    elif val is not None:
-                        values = [float(val)]
-                
-                return np.mean(values) if values else default
             
             # Helper to extract values for delta calculation (sum across all envs)
             def safe_get_sum(info, key, default=0.0):
@@ -295,9 +305,6 @@ def train():
                         values = [float(val)]
                 
                 return np.sum(values) if values else default
-            
-            avg_realized_pnl = safe_get_avg(last_info, 'realized_pnl', 0.0)
-            avg_unrealized_pnl = safe_get_avg(last_info, 'unrealized_pnl', 0.0)
             
             # Get buy/sell counts to diagnose inventory accumulation
             def get_counts(info_list, key):
