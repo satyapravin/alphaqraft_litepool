@@ -80,20 +80,34 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 ## Reward Function
 
 ```
-reward = realized_component + unrealized_pnl_delta + fee_rebate_delta - leverage_limit_penalty
+reward = realized_component 
+       + unrealized_pnl_delta 
+       + 2.0 * fee_rebate_delta 
+       + requote_penalty 
+       + leverage_limit_penalty
 ```
 
 where `realized_component = 0.5 * realized_pnl_delta + 0.5 * spread_capture_delta`
 
-- **Realized Component (50/50 blend)**:
-  - **Realized P&L Delta**: Profit/loss from completed trades using average price accounting (matches balance tracking)
-  - **Spread Capture Delta**: Profit from completed round-trips using LIFO accounting (cleaner market-making signal)
-  - The 50/50 blend balances accounting accuracy with market-making signal quality
-- **Unrealized P&L Delta**: Mark-to-market changes on open positions (normalized by initial balance)
-- **Fee Rebate Delta**: Maker fee rebates earned, normalized by initial balance (incentivizes market participation)
-- **Leverage Limit Penalty**: Large negative reward (-10.0 normalized) when leverage hits ±1.0, terminates episode early
+All deltas are normalized by initial balance to make rewards scale-independent. Final reward is scaled by 10,000 for readability.
 
-**Note**: Spread capture uses LIFO (last-in-first-out) accounting to track round-trip profits, which provides a cleaner signal for market making than the average price method. The delta is computed as the change in cumulative spread capture between steps, normalized by initial balance.
+### Reward Components
+
+| Component | Weight | Description |
+|-----------|--------|-------------|
+| **Realized P&L Delta** | 0.5 | Profit/loss from completed trades (average price accounting) |
+| **Spread Capture Delta** | 0.5 | Profit from round-trips (LIFO accounting, cleaner MM signal) |
+| **Unrealized P&L Delta** | 1.0 | Mark-to-market changes on open positions |
+| **Fee Rebate Delta** | 2.0 | Maker rebates earned (boosted to encourage fills) |
+| **Requote Penalty** | -1.0 | Per voluntary requote (forces order persistence) |
+| **Leverage Limit Penalty** | -100,000 | When leverage hits ±1.0 (terminates episode) |
+
+### Design Notes
+
+- **Fee weight boosted (2x)**: Encourages tighter spreads and more trading activity
+- **Requote penalty**: Only penalizes *voluntary* requotes (agent choice), not forced requotes (first step, no orders, after fills)
+- **Spread capture (LIFO)**: Provides cleaner signal than average price method for market making
+- **Leverage limit**: Large penalty + early termination prevents excessive risk-taking
 
 ## Model Architecture
 
@@ -193,4 +207,4 @@ TAKER_FEE = 0.0005       # Taker fee (5 bps)
 
 ## License
 
-MIT License
+Apache License 2.0 - See [LICENSE](LICENSE) for details.

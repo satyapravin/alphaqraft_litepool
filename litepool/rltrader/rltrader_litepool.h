@@ -137,8 +137,9 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   // Track fills from previous step to force requote if orders were filled
   bool had_fills_prev_step_ = false;
   
-  // Track if RL chose to requote (not forced by auto-requote logic) for penalty
-  // Removed: rl_chose_requote_ - was used for requote penalty which had no effect
+  // Track if RL chose to requote voluntarily (not forced by auto-requote logic)
+  // Used to penalize excessive voluntary requoting
+  bool rl_chose_requote_ = false;
 
   std::unique_ptr<RLTrader::BaseInstrument> instr_ptr;
   std::unique_ptr<RLTrader::BaseExchange> exchange_ptr;
@@ -216,6 +217,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     initial_balance_ = balance;  // Store initial balance for consistent reward scaling
     steps = 0;
     had_fills_prev_step_ = false;  // Reset fill tracking
+    rl_chose_requote_ = false;    // Reset requote tracking
     
     // Reset exchange first (picks random starting row)
     exchange_ptr->reset();
@@ -306,9 +308,13 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
           action.should_requote = 1.0;  // Force requote
       }
       
+      // Track if RL voluntarily chose to requote (for penalty)
+      // Voluntary = agent chose requote AND it wasn't forced
+      rl_chose_requote_ = (action.should_requote > 0.0) && !forced_requote;
+      
       // Only requote if should_requote > 0, otherwise continue with existing quotes
       if (action.should_requote > 0.0) {
-      adaptor_ptr->quote(action);
+          adaptor_ptr->quote(action);
       }
       
       // Get trade count before advancing time to detect new fills
@@ -474,6 +480,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     // 3. Fee rebate reward: with maker_fee < 0, fees becomes more negative when trading
     // We reward the agent for earning rebates (flip sign so rebates = positive reward)
     // Normalized by initial balance to make it scale-independent
+    // Weight increased to encourage more fills (agent was quoting too wide and not trading)
     double current_fees = info["fees"];
     double fee_delta = -(current_fees - prev_fees);  // Positive when rebates earned
     prev_fees = current_fees;
@@ -483,12 +490,14 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
         fee_delta = 0.0;
     }
     
-    // 4. Inventory management is handled by strategy's skew mechanism (not reward penalty)
-    // The strategy automatically adjusts spreads based on inventory_error to encourage
-    // trades that reduce inventory deviation. Unrealized PnL provides natural feedback.
-    // No artificial penalty needed - let the agent learn from actual P/L.
+    // 4. Requote penalty: discourage excessive voluntary requoting
+    // Only penalize when RL chose to requote without being forced
+    // Forced requotes (first step, no orders, after fills) are not penalized
+    // Small penalty to encourage letting orders sit and get filled
+    constexpr double REQUOTE_PENALTY = -0.0001;  // Small penalty per voluntary requote (pre-scaling)
+    double requote_penalty = rl_chose_requote_ ? REQUOTE_PENALTY : 0.0;
     
-    // 4. Leverage limit penalty: high negative reward if leverage hits ±1.0
+    // 5. Leverage limit penalty: high negative reward if leverage hits ±1.0
     // This strongly discourages the agent from reaching maximum leverage
     // The penalty should be large enough to dominate other rewards
     constexpr double LEVERAGE_LIMIT_PENALTY = -10.0;  // Large negative penalty (normalized)
@@ -499,12 +508,15 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
         isDone = true;
     }
     
-    // Total reward: blended realized (50% realized_pnl + 50% spread_capture) + unrealized + fees - leverage_limit_penalty
-    // This balances accounting accuracy (realized_pnl) with market-making signal quality (spread_capture)
-    // Unrealized PnL is at full weight to directly represent actual profits
-    // Inventory management is handled by strategy's quoting model, not reward penalty
+    // Total reward: blended realized + unrealized + fees + penalties
+    // - Realized: 50% realized_pnl + 50% spread_capture (balances accounting with MM signal)
+    // - Unrealized: full weight to represent mark-to-market profits
+    // - Fees: boosted weight (2x) to encourage more fills (agent was quoting too wide)
+    // - Requote penalty: small cost for voluntary requotes to encourage order persistence
+    // - Leverage limit penalty: large cost when hitting max leverage
     constexpr double UNREALIZED_WEIGHT = 1.0;
-    double reward = realized_component + UNREALIZED_WEIGHT * unrealized_delta + fee_delta + leverage_limit_penalty;
+    constexpr double FEE_WEIGHT = 2.0;  // Boosted to encourage fills
+    double reward = realized_component + UNREALIZED_WEIGHT * unrealized_delta + FEE_WEIGHT * fee_delta + requote_penalty + leverage_limit_penalty;
     
     // Scale reward by 10000 to make it more readable (0.0001 → 1.0)
     // This is just a scaling factor, doesn't change the learning signal

@@ -1,3 +1,17 @@
+# Copyright 2024 Alphaqraft
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Simple PPO training for GLFT market making.
 - 30-signal observations (13 market + 4 AMM flow + 8 trade + 5 agent state)
@@ -32,7 +46,7 @@ N_STEPS = 2048         # Steps per rollout
 UPDATE_EPOCHS = 3      # PPO epochs per update
 MINIBATCH_SIZE = 128   # Minibatch size for updates
 TOTAL_EPOCHS = 10000   # Total training epochs
-LEARNING_RATE = 5e-5  # Reduced from 1e-4 to prevent gradient explosion
+LEARNING_RATE = 1e-4   # Reduced from 1e-4 to prevent gradient explosion
 GAMMA = 0.995    
 GAE_LAMBDA = 0.95
 BASE_SPREAD_BPS = 1.0  # Base spread in basis points (1 bps = $10 on $100k BTC - room for spread capture)
