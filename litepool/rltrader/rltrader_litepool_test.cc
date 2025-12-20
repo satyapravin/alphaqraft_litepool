@@ -44,10 +44,10 @@ TEST(RlTraderLitePoolTest, SplitZeroAction) {
   std::vector<Array> raw_action;
   raw_action.reserve(3);
 
-  // Create arrays with proper dimensions
+  // Create arrays with proper dimensions (4 actions: bid_spread, ask_spread, target_inventory, should_requote)
   raw_action.push_back(Array(Spec<int>({num_envs})));         // env_id
   raw_action.push_back(Array(Spec<int>({num_envs, 1})));      // players.env_id
-  raw_action.push_back(Array(Spec<double>({num_envs, 10})));   // action
+  raw_action.push_back(Array(Spec<double>({num_envs, 4})));   // action
 
   // Initialize players.env_id array
   for (int i = 0; i < num_envs; ++i) {
@@ -60,17 +60,11 @@ TEST(RlTraderLitePoolTest, SplitZeroAction) {
     // Set env_id
     action["env_id"_][i] = i;
     
-    // Set action values using operator()
-    action["action"_](i, 0) = 5.0f;
-    action["action"_](i, 1) = 5.0f;
-    action["action"_](i, 2) = 80.0f;
-    action["action"_](i, 3) = 80.0f;
-    action["action"_](i, 4) = 2.0f;
-    action["action"_](i, 5) = 3.0f;
-    action["action"_](i, 6) = 80.0f;
-    action["action"_](i, 7) = 80.0f;
-    action["action"_](i, 8) = 2.0f;
-    action["action"_](i, 9) = 3.0f;
+    // Set action values: bid_spread, ask_spread, target_inventory, should_requote
+    action["action"_](i, 0) = 0.0f;  // bid_spread
+    action["action"_](i, 1) = 0.0f;  // ask_spread
+    action["action"_](i, 2) = 0.0f;  // target_inventory
+    action["action"_](i, 3) = 1.0f;  // should_requote
   }
 
   litepool.Send(std::move(action));
@@ -79,7 +73,7 @@ TEST(RlTraderLitePoolTest, SplitZeroAction) {
   for (int i = 0; i < num_envs; ++i) {
     EXPECT_EQ(static_cast<int>(state["info:env_id"_][i]), i);
     auto obs = state["obs"_](i);
-    EXPECT_EQ(obs.size, 242*2);
+    EXPECT_EQ(obs.size, 30);  // OBS_DIM = 30 (13 market + 4 AMM + 8 trade + 5 agent state)
   }
 }
 
@@ -110,7 +104,7 @@ void Runner(int num_envs, int batch, int seed, int total_iter, int num_threads) 
     raw_action.clear();
     raw_action.push_back(Array(Spec<int>({num_envs})));         // env_id
     raw_action.push_back(Array(Spec<int>({num_envs, 1})));      // players.env_id
-    raw_action.push_back(Array(Spec<double>({num_envs, 10})));   // action
+    raw_action.push_back(Array(Spec<double>({num_envs, 4})));   // action (4 actions)
 
     // Initialize players.env_id array
     for (int i = 0; i < num_envs; ++i) {
@@ -122,16 +116,11 @@ void Runner(int num_envs, int batch, int seed, int total_iter, int num_threads) 
     for (int i = 0; i < num_envs; ++i) {
       action["env_id"_][i] = i;
       
-      action["action"_](i, 0) = 5.0f;
-      action["action"_](i, 1) = 5.0f;
-      action["action"_](i, 2) = 80.0f;
-      action["action"_](i, 3) = 80.0f;
-      action["action"_](i, 4) = 2.0f;
-      action["action"_](i, 5) = 3.0f;
-      action["action"_](i, 6) = 80.0f;
-      action["action"_](i, 7) = 80.0f;
-      action["action"_](i, 8) = 2.0f;
-      action["action"_](i, 9) = 3.0f;
+      // Set action values: bid_spread, ask_spread, target_inventory, should_requote
+      action["action"_](i, 0) = 0.0f;  // bid_spread
+      action["action"_](i, 1) = 0.0f;  // ask_spread
+      action["action"_](i, 2) = 0.0f;  // target_inventory
+      action["action"_](i, 3) = 1.0f;  // should_requote
     }
 
     litepool.Send(std::move(action));

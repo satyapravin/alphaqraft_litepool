@@ -3,11 +3,14 @@
 
 using namespace RLTrader;
 
-EnvAdaptor::EnvAdaptor(Strategy& strat, BaseExchange& exch, int ticks_per_step):
+EnvAdaptor::EnvAdaptor(Strategy& strat, BaseExchange& exch, const std::string& trade_filename, int ticks_per_step):
             strategy(strat),
             exchange(exch),
             ticks_per_step_(ticks_per_step),
             market_builder(std::make_unique<MarketSignalBuilder>()),
+            trade_reader(trade_filename.empty() ? nullptr : 
+                         std::make_unique<TradeReader>(trade_filename, 0, 0)),
+            trade_signal_builder(std::make_unique<TradeSignalBuilder>()),
             bid_prices(), ask_prices(), bid_sizes(), ask_sizes() {
 }
 
@@ -15,6 +18,17 @@ bool EnvAdaptor::next() {
     std::fill_n(state.begin(), state.size(), 0);
     OrderBook book;
     size_t read_slot;
+    
+    // Sync trade reader on first call after reset
+    // Get the starting timestamp from book reader
+    if (trade_reader) {
+        SimExchange* sim_exch = dynamic_cast<SimExchange*>(&exchange);
+        if (sim_exch) {
+            // Peek at first row to get starting timestamp
+            // We need to call next_read first, then sync
+            // Actually, we'll sync in computeState when we have the timestamp
+        }
+    }
     
     // Advance multiple ticks per RL step to let orders persist
     for (int tick = 0; tick < ticks_per_step_; ++tick) {
@@ -54,6 +68,19 @@ void EnvAdaptor::reset() {
     mid_price_deque.clear();
     // Reset AMM simulator so it auto-initializes on first step with valid price
     amm_simulator.clear();
+    
+    // Reset trade signal builder
+    if (trade_signal_builder) {
+        trade_signal_builder->reset();
+    }
+    
+    // Trade reader will be synced via syncTradeReader() call from Reset()
+}
+
+void EnvAdaptor::syncTradeReader(long long book_start_timestamp) {
+    if (trade_reader) {
+        trade_reader->reset(book_start_timestamp);
+    }
 }
 
 
@@ -99,6 +126,9 @@ void EnvAdaptor::computeInfo(OrderBook &book) {
     info["last_bid_price"] = strategy.getLastBidPrice();
     info["last_ask_price"] = strategy.getLastAskPrice();
     info["last_mid_price"] = strategy.getLastMidPrice();
+    
+    // Leverage limit flag (for reward penalty)
+    info["hit_leverage_limit"] = strategy.hitLeverageLimit() ? 1.0 : 0.0;
 }
 
 
@@ -128,10 +158,59 @@ void EnvAdaptor::computeState(OrderBook& book)
         }
     }
     
-    // [17] Agent state: current leverage (position / balance)
-    // Critical for agent to know its own position for inventory management
+    // Trade signals [17..24] (8 signals)
+    if (trade_reader && trade_signal_builder) {
+        // Cast exchange to SimExchange to access getCurrentTimestamp()
+        SimExchange* sim_exch = dynamic_cast<SimExchange*>(&exchange);
+        if (sim_exch) {
+            long long book_timestamp = sim_exch->getCurrentTimestamp();
+            
+            // Get trades up to current book timestamp (synchronized)
+            std::vector<Trade> recent_trades = trade_reader->getRecentTrades(book_timestamp);
+            
+            // Compute trade signals (pass book timestamp for time_since_last_trade calculation)
+            TradeSignals trade_signals = trade_signal_builder->add_trades(recent_trades, mid_price, book_timestamp);
+            
+            state[17] = trade_signals.buy_volume;
+            state[18] = trade_signals.sell_volume;
+            state[19] = trade_signals.volume_imbalance;
+            state[20] = trade_signals.trade_intensity;
+            state[21] = trade_signals.price_impact;
+            state[22] = trade_signals.buy_pressure;
+            state[23] = trade_signals.sell_pressure;
+            state[24] = trade_signals.time_since_last_trade;
+        } else {
+            // Exchange doesn't support timestamp - zero out trade signals
+            std::fill_n(state.begin() + 17, 8, 0.0);
+        }
+    } else {
+        // No trade reader - zero out trade signals
+        std::fill_n(state.begin() + 17, 8, 0.0);
+    }
+    
+    // [25-29] Agent state: position, PnL, and performance metrics
+    // Critical for agent to know its own state for inventory management and performance tracking
     auto posInfo = strategy.getPosition().getPositionInfo(book.bid_prices[0], book.ask_prices[0]);
-    state[17] = std::tanh(posInfo.leverage * 5.0);  // Scale: ±20% leverage maps to ±tanh(1) ≈ ±0.76
+    double initialBalance = strategy.getPosition().getInitialBalance();
+    
+    // [25] Current leverage (position / balance)
+    state[25] = std::tanh(posInfo.leverage * 5.0);  // Scale: ±20% leverage maps to ±tanh(1) ≈ ±0.76
+    
+    // [26] Normalized position (netAmount normalized by initial balance)
+    // For normal instruments: netAmount is in BTC, normalize by initialBalance to get position ratio
+    double netAmount = strategy.getPosition().getNetAmount();
+    double mid = 0.5 * (book.bid_prices[0] + book.ask_prices[0]);
+    double positionValue = std::abs(netAmount * mid);
+    state[26] = std::tanh((positionValue / initialBalance) * 2.0);  // Scale: 50% of balance = tanh(1) ≈ 0.76
+    
+    // [27] Normalized unrealized PnL (inventoryPnL / initialBalance)
+    state[27] = std::tanh((posInfo.inventoryPnL / initialBalance) * 10.0);  // Scale: ±10% of balance = ±tanh(1)
+    
+    // [28] Normalized realized PnL (realizedPnL / initialBalance)
+    state[28] = std::tanh((posInfo.realizedPnL / initialBalance) * 10.0);  // Scale: ±10% of balance = ±tanh(1)
+    
+    // [29] Normalized spread capture (spreadCapture / initialBalance)
+    state[29] = std::tanh((posInfo.spreadCapture / initialBalance) * 10.0);  // Scale: ±10% of balance = ±tanh(1)
     
     computeInfo(book);
 }

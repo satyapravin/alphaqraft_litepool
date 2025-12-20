@@ -32,6 +32,9 @@ class SimpleCollector:
         self.obs = None
         self.dones = None
         self.episode_count = 0
+        self.episode_rewards = None  # Track cumulative rewards per environment
+        self.completed_episode_rewards = []  # Track rewards from completed episodes in this batch
+        self.hidden_states = None  # Track LSTM hidden states per environment: list of (h, c) tuples
     
     def collect(self):
         """
@@ -52,6 +55,13 @@ class SimpleCollector:
                 else:
                     self.n_envs = 1
             self.dones = np.zeros(self.n_envs, dtype=bool)
+            self.episode_rewards = np.zeros(self.n_envs, dtype=np.float32)
+            # Initialize LSTM hidden states (zeros for all environments)
+            self.hidden_states = [None] * self.n_envs
+        
+        # Reset completed episode rewards at start of each batch collection
+        # This ensures we only track episodes completed in THIS batch
+        self.completed_episode_rewards = []
         
         # Ensure n_envs is set (should be set by now)
         n_envs = self.n_envs
@@ -67,8 +77,10 @@ class SimpleCollector:
         
         # Rollout
         for _ in range(n_steps):
-            # Get actions from policy
-            actions, log_probs, values = self.policy.get_actions(self.obs)
+            # Get actions from policy with current hidden states
+            actions, log_probs, values, new_hidden_states = self.policy.get_actions(
+                self.obs, hidden_states=self.hidden_states
+            )
             
             # Store current step
             obs_list.append(self.obs.copy())
@@ -83,6 +95,29 @@ class SimpleCollector:
             dones_list.append(dones)
             infos_list.append(infos)
             
+            # Update LSTM hidden states, resetting for environments that are done
+            for env_id in range(self.n_envs):
+                if dones[env_id]:
+                    # Reset hidden state for this environment (new episode)
+                    self.hidden_states[env_id] = None
+                else:
+                    # Update hidden state for this environment
+                    if new_hidden_states is not None:
+                        # Extract hidden state for this environment
+                        # new_hidden_states is tuple of (h, c) where each is [1, batch_size, hidden_dim]
+                        h, c = new_hidden_states
+                        self.hidden_states[env_id] = (
+                            h[:, env_id:env_id+1, :].detach().clone(),  # [1, 1, hidden_dim]
+                            c[:, env_id:env_id+1, :].detach().clone()
+                        )
+            
+            # Accumulate rewards per environment (before scaling)
+            # Rewards from env are already normalized (fraction of balance)
+            if isinstance(rewards, np.ndarray):
+                self.episode_rewards += rewards
+            else:
+                self.episode_rewards[0] += rewards
+            
             # Log episode metrics on reset
             # When done=True, infos is from the CURRENT step (terminal state).
             # Auto-reset happens on the NEXT step in litepool.
@@ -93,11 +128,22 @@ class SimpleCollector:
             self.obs = next_obs
             self.dones = dones
         
-        # Get bootstrap value
+        # Get bootstrap value with current hidden states
         with torch.no_grad():
             obs_tensor = torch.as_tensor(self.obs, dtype=torch.float32)
+            # Prepare hidden states for bootstrap (combine all env hidden states)
+            if self.hidden_states[0] is not None:
+                # Stack hidden states: [1, n_envs, hidden_dim]
+                h_list = [h for h, _ in self.hidden_states]
+                c_list = [c for _, c in self.hidden_states]
+                bootstrap_hidden = (
+                    torch.cat(h_list, dim=1),  # [1, n_envs, hidden_dim]
+                    torch.cat(c_list, dim=1)
+                )
+            else:
+                bootstrap_hidden = None
             # LSTM model returns (quote_dist, requote_dist, value, hidden_state)
-            _, _, bootstrap_values, _ = self.policy.model(obs_tensor)
+            _, _, bootstrap_values, _ = self.policy.model(obs_tensor, hidden=bootstrap_hidden)
             bootstrap_values = bootstrap_values.numpy()
         
         # Convert to tensors
@@ -108,7 +154,8 @@ class SimpleCollector:
         rewards_raw = torch.as_tensor(np.array(rewards_list), dtype=torch.float32)
         dones = torch.as_tensor(np.array(dones_list), dtype=torch.float32)
         
-        # Scale rewards to meaningful magnitude (raw rewards are ~0.0001)
+        # Apply reward scaling (if needed)
+        # Note: C++ already scales rewards by 10000, so reward_scale should typically be 1.0
         rewards = rewards_raw * self.reward_scale
         
         # Compute GAE
@@ -129,6 +176,7 @@ class SimpleCollector:
             'rewards_raw': rewards_raw,  # Raw rewards for diagnostics
             'dones': dones,  # Done flags [n_steps, n_envs] for goal_manager
             'infos': infos_list,
+            'completed_episode_rewards': self.completed_episode_rewards.copy(),  # Cumulative rewards from completed episodes
         }
         
         return batch
@@ -219,7 +267,17 @@ class SimpleCollector:
                 
                 net_pnl = realized_pnl + unrealized_pnl - fees
                 
+                # Get cumulative reward for this episode (normalized, fraction of balance)
+                episode_reward = self.episode_rewards[env_id]
+                
+                # Track completed episode reward for epoch average
+                self.completed_episode_rewards.append(episode_reward)
+                
+                # Reset reward accumulator for this environment
+                self.episode_rewards[env_id] = 0.0
+                
                 print(f"  [Episode {self.episode_count:4d}] Env {env_id} | "
+                      f"Reward {episode_reward:8.4f} | "
                       f"R.PnL ${realized_pnl:8.4f} | "
                       f"U.PnL ${unrealized_pnl:8.4f} | "
                       f"Fees ${fees:6.4f} | "

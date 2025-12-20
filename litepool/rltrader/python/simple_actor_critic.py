@@ -17,7 +17,7 @@ import torch.nn as nn
 
 
 class SimpleActorCritic(nn.Module):
-    def __init__(self, obs_dim=18, action_dim=4, hidden_dim=128, lstm_hidden=64):
+    def __init__(self, obs_dim=30, action_dim=4, hidden_dim=128, lstm_hidden=64):
         super().__init__()
         assert action_dim == 4, "Expected 4 actions: 3 continuous (bid_spread, ask_spread, target_inventory) + 1 binary (requote)"
         
@@ -200,11 +200,16 @@ class SimpleActorCritic(nn.Module):
         Args:
             obs: [batch_size, obs_dim]
             actions: [batch_size, 4]
-            hidden: Optional LSTM hidden state
+            hidden: Optional LSTM hidden state tuple (h, c)
         Returns:
             log_probs, values, entropy
+        Note: For training, we use stateless evaluation (hidden=None) to avoid
+        backpropagating through the entire episode sequence. The LSTM state
+        is only maintained during rollout collection.
         """
-        quote_dist, requote_dist, values, _ = self.forward(obs, hidden)
+        # Use fresh hidden states for training (stateless)
+        # This is standard practice - gradients don't flow through rollout sequences
+        quote_dist, requote_dist, values, _ = self.forward(obs, hidden=None)
         
         # Split actions
         quote_actions = actions[:, :3]

@@ -1,23 +1,28 @@
 #pragma once
 #include <deque>
+#include <memory>
 #include "strategy.h"
 #include "base_exchange.h"
 #include "market_signal_builder.h"
 #include "amm_simulator.h"
+#include "trade_reader.h"
+#include "trade_signal_builder.h"
+#include "sim_exchange.h"
 
 namespace RLTrader {
 
-// Observation space dimension: 13 market signals + 4 AMM flow signals + 1 agent state
-constexpr int OBS_DIM = 18;
+// Observation space dimension: 13 market signals + 4 AMM flow signals + 8 trade signals + 5 agent state
+constexpr int OBS_DIM = 30;
 
 class EnvAdaptor { 
 public:
-    EnvAdaptor(Strategy& strat, BaseExchange& exch, int ticks_per_step = 5);
+    EnvAdaptor(Strategy& strat, BaseExchange& exch, const std::string& trade_filename = "", int ticks_per_step = 5);
     ~EnvAdaptor()  = default;
     
     void quote(const RLAction& action);
 
     void reset() ;
+    void syncTradeReader(long long book_start_timestamp);  // Sync trade reader to book's starting timestamp
     bool next() ;  // Advances ticks_per_step ticks, processing fills each tick
     void getInfo(std::unordered_map<std::string, double>& info) ;
     void getState(std::array<double, OBS_DIM>& state) ;
@@ -33,7 +38,9 @@ private:
     std::deque<double> mid_price_deque;
     std::unique_ptr<MarketSignalBuilder> market_builder;
     AmmV3Simulator amm_simulator;  // AMM flow signal generator
-    std::array<double, OBS_DIM> state;  // 13 market + 3 AMM flow signals
+    std::unique_ptr<TradeReader> trade_reader;  // Optional trade reader
+    std::unique_ptr<TradeSignalBuilder> trade_signal_builder;  // Trade signal generator
+    std::array<double, OBS_DIM> state;  // 13 market + 4 AMM flow + 8 trade + 5 agent state
     std::unordered_map<std::string, double> info;
     FixedVector<double, 20> bid_prices;
     FixedVector<double, 20> ask_prices;

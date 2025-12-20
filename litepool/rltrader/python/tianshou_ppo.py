@@ -1,7 +1,7 @@
 """
 Simple PPO training for GLFT market making.
-- 18-signal observations (13 market + 4 AMM flow + 1 agent state)
-- 5-action outputs: 4 continuous quote parameters + 1 binary requote decision
+- 30-signal observations (13 market + 4 AMM flow + 8 trade + 5 agent state)
+- 4-action outputs: 3 continuous quote parameters + 1 binary requote decision
   * Actions 0-2: bid_spread, ask_spread, target_inventory (continuous)
   * Action 4: should_requote (binary decision: >0 = requote, <=0 = continue)
 - Order size uses min_size_pct by default (no RL control)
@@ -82,7 +82,7 @@ np.random.seed(42)
 # - Binary head (Bernoulli): 1 requote decision
 # - 3 hidden layers with LayerNorm for stable training
 model = SimpleActorCritic(
-    obs_dim=18,  # 13 market + 4 AMM flow + 1 agent state (leverage)
+    obs_dim=30,  # 13 market + 4 AMM flow + 8 trade + 5 agent state
     action_dim=4,  # 3 quote params (bid_spread, ask_spread, target_inventory) + 1 requote decision
     hidden_dim=128,  # MLP hidden dimension
     lstm_hidden=64,  # LSTM hidden dimension for temporal patterns
@@ -101,8 +101,8 @@ policy = SimplePPOPolicy(
     max_grad_norm=0.5,  # Standard value for PPO
 )
 
-REWARD_SCALE = 50.0  # Reduced to make value function easier to learn
-                      # With GAMMA=0.99 over 2048 steps, returns are more manageable
+REWARD_SCALE = 1.0  # No additional scaling - C++ already scales rewards by 10000
+                    # Rewards from C++ are already in a good range (e.g., 1.0 = 0.01% of balance)
 
 collector = SimpleCollector(
     env=env,
@@ -203,7 +203,14 @@ def train():
         global_step += N_STEPS * NUM_ENVS
         
         # === Logging ===
-        avg_reward = batch['rewards'].mean().item()
+        # Use average of completed episode rewards instead of temporal average of all steps
+        # This matches the episode-level rewards shown in logs
+        completed_episode_rewards = batch.get('completed_episode_rewards', [])
+        if completed_episode_rewards:
+            avg_reward = float(np.mean(completed_episode_rewards))
+        else:
+            # Fallback to temporal average if no episodes completed in this batch
+            avg_reward = batch['rewards'].mean().item()
         
         # Diagnostic: Check requote decisions and PnL
         actions_np = batch['actions'].detach().cpu().numpy()
@@ -512,7 +519,7 @@ if __name__ == "__main__":
     print(f"Environments: {NUM_ENVS}")
     print(f"Threads: {NUM_THREADS}")
     print(f"Steps per rollout: {N_STEPS}")
-    print(f"Observations: 18 signals (13 market + 4 AMM flow + 1 agent state)")
+    print(f"Observations: 30 signals (13 market + 4 AMM flow + 8 trade + 5 agent state)")
     print(f"Actions: 4 (3 continuous quote params + 1 binary requote decision)")
     print(f"  Quote params: bid_spread, ask_spread, target_inventory (continuous)")
     print(f"  Order size: fixed at min_size_pct ({MIN_SIZE_PCT}%) - no RL control")

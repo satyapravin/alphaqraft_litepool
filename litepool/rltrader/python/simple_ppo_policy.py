@@ -26,28 +26,54 @@ class SimplePPOPolicy:
         self.ent_coef = ent_coef
         self.max_grad_norm = max_grad_norm
     
-    def get_action(self, obs, deterministic=False):
+    def get_action(self, obs, deterministic=False, hidden=None):
         """Get action for a single observation."""
-        return self.model.get_action(obs, deterministic)
+        return self.model.get_action(obs, deterministic, hidden)
     
-    def get_actions(self, obs, deterministic=False):
+    def get_actions(self, obs, deterministic=False, hidden_states=None):
         """
         Get actions for batch of observations.
         
         Args:
             obs: [batch_size, obs_dim] numpy array
             deterministic: if True, return mean actions and threshold requote
+            hidden_states: List of (h, c) tuples per environment, or None for fresh states
         Returns:
             actions: [batch_size, 4] numpy array - [3 quote params (bid_spread, ask_spread, target_inv), 1 requote]
             log_probs: [batch_size] numpy array
             values: [batch_size] numpy array
+            new_hidden_states: Tuple of (h, c) where each is [1, batch_size, hidden_dim]
         """
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32)
+        batch_size = obs_tensor.shape[0]
+        
+        # Prepare hidden states: combine per-environment hidden states into batch
+        if hidden_states is not None and any(h is not None for h in hidden_states):
+            # Stack hidden states from all environments
+            h_list = []
+            c_list = []
+            for hidden in hidden_states:
+                if hidden is not None:
+                    h, c = hidden
+                    h_list.append(h)  # [1, 1, hidden_dim]
+                    c_list.append(c)
+                else:
+                    # Create zero hidden state for this environment
+                    device = obs_tensor.device
+                    lstm_hidden = self.model.lstm_hidden
+                    h_zero = torch.zeros(1, 1, lstm_hidden, device=device)
+                    c_zero = torch.zeros(1, 1, lstm_hidden, device=device)
+                    h_list.append(h_zero)
+                    c_list.append(c_zero)
+            
+            # Concatenate: [1, batch_size, hidden_dim]
+            batch_hidden = (torch.cat(h_list, dim=1), torch.cat(c_list, dim=1))
+        else:
+            batch_hidden = None
         
         with torch.no_grad():
             # LSTM model returns (quote_dist, requote_dist, values, hidden_state)
-            # We ignore hidden_state for now (stateless inference per step)
-            quote_dist, requote_dist, values, _ = self.model(obs_tensor)
+            quote_dist, requote_dist, values, new_hidden_states = self.model(obs_tensor, hidden=batch_hidden)
             
             if deterministic:
                 # Use mean for quote params, threshold 0.5 for requote
@@ -72,7 +98,7 @@ class SimplePPOPolicy:
             requote_log_probs = requote_dist.log_prob((requote_actions + 1.0) / 2.0)
             log_probs = quote_log_probs + requote_log_probs
         
-        return actions.numpy(), log_probs.numpy(), values.numpy()
+        return actions.numpy(), log_probs.numpy(), values.numpy(), new_hidden_states
     
     def learn(self, batch):
         """
@@ -104,9 +130,10 @@ class SimplePPOPolicy:
             }
         
         # Clip advantages and returns to prevent numerical instability
-        # With REWARD_SCALE=100 and GAMMA=0.997, returns should be more manageable
+        # With C++ scaling by 10000 and REWARD_SCALE=1.0, step rewards are ~1.0 (0.01% of balance)
+        # Over 2048 steps with GAMMA=0.99, returns are typically in [-100, 100] range
         advantages = torch.clamp(advantages, -10.0, 10.0)
-        returns = torch.clamp(returns, -500.0, 500.0)  # Reduced from 1000 since REWARD_SCALE is now 100
+        returns = torch.clamp(returns, -500.0, 500.0)  # Conservative clamp for safety
         
         # Normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)

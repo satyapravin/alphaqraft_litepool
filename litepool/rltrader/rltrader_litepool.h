@@ -60,7 +60,7 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) StateSpec(const Config& conf) {
-    return MakeDict("obs"_.Bind(Spec<double>({18})),  // 13 market + 4 AMM flow + 1 agent state (leverage)
+    return MakeDict("obs"_.Bind(Spec<double>({30})),  // 13 market + 4 AMM flow + 8 trade + 5 agent state
                     "info:mid_price"_.Bind(Spec<double>({-1})),
                     "info:balance"_.Bind(Spec<double>({-1})),
                     "info:unrealized_pnl"_.Bind(Spec<double>({-1})),
@@ -178,12 +178,21 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     }
 
 
+    std::string trade_filename;
     if (this->is_prod) {
       exch_raw_ptr = new RLTrader::CryptoExchange(symbol, hedge_symbol, api_key, api_secret);
+      // No trade file for production (live exchange)
+      trade_filename = "";
     } else {
       int idx = env_id % 64;
-      std::string filename = foldername + std::to_string(idx + 1) + ".csv";
-      exch_raw_ptr = new RLTrader::SimExchange(filename, 250, start_read, max_read);
+      // New folder structure: foldername/books/1.csv(.gz) and foldername/trades/1.csv(.gz)
+      // Try .csv.gz first, then fallback to .csv
+      std::string book_filename = foldername + "books/" + std::to_string(idx + 1) + ".csv.gz";
+      trade_filename = foldername + "trades/" + std::to_string(idx + 1) + ".csv.gz";
+      
+      // Note: CsvReader should handle .gz files if compiled with zlib support
+      // If not, user should provide uncompressed .csv files
+      exch_raw_ptr = new RLTrader::SimExchange(book_filename, 250, start_read, max_read);
     }
 
     instr_ptr.reset(instr_raw_ptr);
@@ -193,7 +202,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     config.min_size_pct = min_size_pct;        // From Python config
     config.max_size_pct = max_size_pct;        // From Python config
     strategy_ptr = std::make_unique<RLTrader::Strategy>(*instr_ptr, *exchange_ptr, balance, 20, config);
-    adaptor_ptr = std::make_unique<RLTrader::EnvAdaptor>(*strategy_ptr, *exchange_ptr, ticks_per_step);
+    adaptor_ptr = std::make_unique<RLTrader::EnvAdaptor>(*strategy_ptr, *exchange_ptr, trade_filename, ticks_per_step);
   }
 
   void Reset() override {
@@ -204,7 +213,33 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     initial_balance_ = balance;  // Store initial balance for consistent reward scaling
     steps = 0;
     had_fills_prev_step_ = false;  // Reset fill tracking
+    
+    // Reset exchange first (picks random starting row)
+    exchange_ptr->reset();
+    
+    // Get starting timestamp from book reader to sync trade reader
+    // We need to peek at the first row after reset
+    RLTrader::SimExchange* sim_exch = dynamic_cast<RLTrader::SimExchange*>(exchange_ptr.get());
+    long long book_start_timestamp = 0;
+    if (sim_exch) {
+        // Peek at first row by calling next_read once
+        size_t slot;
+        RLTrader::OrderBook book;
+        if (exchange_ptr->next_read(slot, book)) {
+            book_start_timestamp = sim_exch->getCurrentTimestamp();
+            // Reset exchange again to start from beginning (next_read consumed the row)
+            exchange_ptr->reset();
+        }
+    }
+    
+    // Reset adaptor (which will reset trade reader if present)
     adaptor_ptr->reset();
+    
+    // Sync trade reader to book's starting timestamp
+    if (book_start_timestamp > 0) {
+        adaptor_ptr->syncTradeReader(book_start_timestamp);
+    }
+    
     isDone = false;
     // Note: Don't clear terminal_info_ here - it gets cleared after WriteState uses it
     WriteState();
@@ -317,38 +352,77 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     double mid_price = info["mid_price"];
     double leverage = info["leverage"];
     
-    // 1. LIFO Spread Capture delta (profit from closed round-trips)
-    // This is the profit from completing round-trips (buy low, sell high)
-    // Represents realized PnL from closed trades (excluding fees)
+    // 1. Realized PnL components: combine both accounting methods
+    // - realized_pnl_delta: matches episode logs (balance - initialBalance, average price method)
+    // - spread_capture_delta: cleaner for market making (LIFO, captures round-trip profits)
+    // Use 50/50 blend to balance accuracy with market-making signal quality
+    double current_realized_pnl = info["realized_pnl"];
+    double realized_pnl_delta = current_realized_pnl - prev_realized_pnl;
+    prev_realized_pnl = current_realized_pnl;
+    if (initial_balance_ > 0) {
+        realized_pnl_delta /= initial_balance_;
+    }
+    
     double spread_capture_delta = info["spread_capture"] - prev_spread_capture;
     prev_spread_capture = info["spread_capture"];
+    if (initial_balance_ > 0) {
+        spread_capture_delta /= initial_balance_;
+    }
+    
+    // Blend: 50% realized_pnl (matches accounting) + 50% spread_capture (cleaner signal)
+    constexpr double REALIZED_WEIGHT = 0.5;
+    constexpr double SPREAD_CAPTURE_WEIGHT = 0.5;
+    double realized_component = REALIZED_WEIGHT * realized_pnl_delta + SPREAD_CAPTURE_WEIGHT * spread_capture_delta;
     
     // 2. Unrealized PnL delta (actual mark-to-market, reduced weight)
     // Use actual unrealized PnL from position tracking (not approximation)
     // This represents mark-to-market PnL from open positions
+    // Normalized by initial balance to make it scale-independent
     double current_unrealized_pnl = info["unrealized_pnl"];
     double unrealized_delta = current_unrealized_pnl - prev_unrealized_pnl;
     prev_unrealized_pnl = current_unrealized_pnl;
+    if (initial_balance_ > 0) {
+        unrealized_delta /= initial_balance_;
+    }
     
     // 3. Fee rebate reward: with maker_fee < 0, fees becomes more negative when trading
     // We reward the agent for earning rebates (flip sign so rebates = positive reward)
+    // Normalized by initial balance to make it scale-independent
     double current_fees = info["fees"];
     double fee_delta = -(current_fees - prev_fees);  // Positive when rebates earned
     prev_fees = current_fees;
+    if (initial_balance_ > 0) {
+        fee_delta /= initial_balance_;
+    }
     
-    // 4. Inventory deviation penalty: only penalize excess inventory beyond target
-    // Reduced cost: inventory management is important but shouldn't dominate reward
-    // The penalty is applied every step, so it needs to be small relative to spread capture
-    constexpr double INVENTORY_DEV_COST = 0.01;  // Reduced from 0.05 to 0.01 (5x reduction)
-    double target_inventory = info["target_inventory"];
-    double target_leverage = target_inventory * 0.5;
-    double inventory_deviation = std::abs(leverage - target_leverage);
-    double inventory_penalty = INVENTORY_DEV_COST * inventory_deviation;
+    // 4. Inventory management is handled by strategy's skew mechanism (not reward penalty)
+    // The strategy automatically adjusts spreads based on inventory_error to encourage
+    // trades that reduce inventory deviation. Unrealized PnL provides natural feedback.
+    // No artificial penalty needed - let the agent learn from actual P/L.
     
-    // Total reward: spread capture (closed trades) + unrealized (open positions) + fees - inventory cost
-    // Both realized and unrealized PnL are at full weight to directly represent actual profits
+    // 4. Leverage limit penalty: high negative reward if leverage hits ±1.0
+    // This strongly discourages the agent from reaching maximum leverage
+    // The penalty should be large enough to dominate other rewards
+    constexpr double LEVERAGE_LIMIT_PENALTY = -10.0;  // Large negative penalty (normalized)
+    double leverage_limit_penalty = 0.0;
+    if (info["hit_leverage_limit"] > 0.5) {
+        leverage_limit_penalty = LEVERAGE_LIMIT_PENALTY;
+        // Also terminate episode early when leverage limit is hit
+        isDone = true;
+    }
+    
+    // Total reward: blended realized (50% realized_pnl + 50% spread_capture) + unrealized + fees - leverage_limit_penalty
+    // This balances accounting accuracy (realized_pnl) with market-making signal quality (spread_capture)
+    // Unrealized PnL is at full weight to directly represent actual profits
+    // Inventory management is handled by strategy's quoting model, not reward penalty
     constexpr double UNREALIZED_WEIGHT = 1.0;
-    double reward = spread_capture_delta + UNREALIZED_WEIGHT * unrealized_delta + fee_delta - inventory_penalty;
+    double reward = realized_component + UNREALIZED_WEIGHT * unrealized_delta + fee_delta + leverage_limit_penalty;
+    
+    // Scale reward by 10000 to make it more readable (0.0001 → 1.0)
+    // This is just a scaling factor, doesn't change the learning signal
+    constexpr double REWARD_SCALE = 10000.0;
+    reward *= REWARD_SCALE;
+    
     state["reward"_] = reward;
     
     state["obs"_].Assign(data.begin(), data.size());

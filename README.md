@@ -46,7 +46,7 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 
 **Note**: The `skew` action was removed to avoid conflicts with `target_inventory`. Quote asymmetry (skew) is now computed automatically based on the difference between current position and target inventory.
 
-## Observation Space (26 signals)
+## Observation Space (30 signals)
 
 **Market Signals (13):**
 - Spread metrics: `market_spread`, `bid_depth`, `ask_depth`, `depth_imbalance`
@@ -70,26 +70,37 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 - `sell_pressure`: EMA-based sell pressure indicator
 - `time_since_last_trade`: Normalized temporal signal for trade recency
 
-**Agent State (1):**
+**Agent State (5):**
 - `current_leverage`: Agent's current position leverage (critical for inventory management)
+- `normalized_position`: Position value normalized by initial balance (direct inventory signal)
+- `normalized_unrealized_pnl`: Unrealized P&L normalized by initial balance (mark-to-market performance)
+- `normalized_realized_pnl`: Realized P&L normalized by initial balance (locked-in performance)
+- `normalized_spread_capture`: Spread capture normalized by initial balance (direct reward signal)
 
 ## Reward Function
 
 ```
-reward = realized_pnl_delta + unrealized_pnl_delta + fee_rebate_delta - inventory_deviation_penalty
+reward = realized_component + unrealized_pnl_delta + fee_rebate_delta - leverage_limit_penalty
 ```
 
-- **Realized P&L Delta**: Profit/loss from completed trades
-- **Unrealized P&L Delta**: Mark-to-market changes (anchored to slow-moving price MA)
-- **Fee Rebates**: Maker fee rebates earned (incentivizes market participation)
-- **Inventory Deviation Penalty**: Penalizes deviation from agent's chosen `target_inventory` (aligns incentives - agent can hold positions it explicitly chooses)
+where `realized_component = 0.5 * realized_pnl_delta + 0.5 * spread_capture_delta`
+
+- **Realized Component (50/50 blend)**:
+  - **Realized P&L Delta**: Profit/loss from completed trades using average price accounting (matches balance tracking)
+  - **Spread Capture Delta**: Profit from completed round-trips using LIFO accounting (cleaner market-making signal)
+  - The 50/50 blend balances accounting accuracy with market-making signal quality
+- **Unrealized P&L Delta**: Mark-to-market changes on open positions (normalized by initial balance)
+- **Fee Rebate Delta**: Maker fee rebates earned, normalized by initial balance (incentivizes market participation)
+- **Leverage Limit Penalty**: Large negative reward (-10.0 normalized) when leverage hits ±1.0, terminates episode early
+
+**Note**: Spread capture uses LIFO (last-in-first-out) accounting to track round-trip profits, which provides a cleaner signal for market making than the average price method. The delta is computed as the change in cumulative spread capture between steps, normalized by initial balance.
 
 ## Model Architecture
 
 **LSTM Actor-Critic** with temporal pattern recognition:
 
 ```
-Observations [26] → MLP Feature Extractor [128] → LSTM [64] → Combined [192]
+Observations [30] → MLP Feature Extractor [128] → LSTM [64] → Combined [192]
                                                               ↓
                                                      ┌───────┴───────┐
                                                      ↓               ↓
@@ -151,7 +162,7 @@ python tianshou_ppo.py
 | `BASE_SPREAD_BPS` | 3.0 | Base spread in basis points |
 | `MIN_SIZE_PCT` | 5.0% | Order size as % of balance |
 | `Model Params` | ~82k | LSTM Actor-Critic parameters |
-| `OBS_DIM` | 26 | Observation space (13 market + 4 AMM + 8 trade + 1 agent state) |
+| `OBS_DIM` | 30 | Observation space (13 market + 4 AMM + 8 trade + 5 agent state) |
 
 ## Data Format
 
