@@ -273,14 +273,17 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
       
       auto step_start = std::chrono::high_resolution_clock::now();
       
-      if (++step_count % 500 == 0) {
-          if (step_count > 500) {
-              double avg_time_ms = (total_cpp_time / 500.0) * 1000.0;
-              std::cerr << "[C++ Timing] Steps " << (step_count - 500) << "-" << step_count 
-                       << ": avg=" << avg_time_ms << "ms, total=" << total_cpp_time << "s" << std::endl;  // flush
-              total_cpp_time = 0.0;
-          }
-      } 
+      // Timing logs disabled to prevent stderr/stdout interleaving with Python logs
+      // Uncomment for debugging performance issues:
+      // if (++step_count % 500 == 0) {
+      //     if (step_count > 500) {
+      //         double avg_time_ms = (total_cpp_time / 500.0) * 1000.0;
+      //         std::cerr << "[C++ Timing] Steps " << (step_count - 500) << "-" << step_count 
+      //                  << ": avg=" << avg_time_ms << "ms, total=" << total_cpp_time << "s" << std::endl;
+      //         total_cpp_time = 0.0;
+      //     }
+      // }
+      ++step_count;  // Keep counter for potential future use 
       RLTrader::RLAction action;
       // 4-action space: bid_spread, ask_spread, target_inventory, should_requote
       // Note: skew removed - automatically computed from inventory error
@@ -460,8 +463,8 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     }
     
     // Blend: 50% realized_pnl (matches accounting) + 50% spread_capture (cleaner signal)
-    constexpr double REALIZED_WEIGHT = 0.5;
-    constexpr double SPREAD_CAPTURE_WEIGHT = 0.5;
+    constexpr double REALIZED_WEIGHT = 1.0;
+    constexpr double SPREAD_CAPTURE_WEIGHT = 1.0;
     double realized_component = REALIZED_WEIGHT * realized_pnl_delta + SPREAD_CAPTURE_WEIGHT * spread_capture_delta;
     
     // 2. Unrealized PnL delta (actual mark-to-market, reduced weight)

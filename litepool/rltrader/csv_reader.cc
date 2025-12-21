@@ -103,7 +103,6 @@ void CsvReader::rewindIterator() {
 void CsvReader::reset() {
     // Guard: Reset state
     num_reads = 0;
-    headers.clear();
     iterator.reset();
     more_data = true;
     
@@ -112,24 +111,45 @@ void CsvReader::reset() {
     rows.clear();
     rows.shrink_to_fit();  // Release memory to prevent accumulation
     
-    std::random_device rd;  
-    std::mt19937 gen(rd()); 
-    std::uniform_int_distribution<> distr(0, start_read);
-    int start_line = distr(gen);
-    
-    // Guard: Verify start_line is within valid range
-    if (start_line < 0 || start_line > start_read) {
-        throw std::runtime_error("Invalid start_line: " + std::to_string(start_line));
+    // OPTIMIZATION: If we've already parsed headers and cached the start position,
+    // seek directly to it instead of re-scanning line by line.
+    // This makes auto-reset O(1) instead of O(start_line).
+    if (cached_start_pos > 0 && !headers.empty()) {
+        // Fast path: seek to cached position
+        if (!this->filestream.is_open()) {
+            this->filestream.open(filename, std::ios::in);
+        }
+        this->filestream.clear();
+        this->filestream.seekg(cached_start_pos, std::ios::beg);
+        // Read next batch from cached position
+        this->readCSV(0);  // start_line=0 since we've already seeked
+    } else {
+        // First time: do full line-by-line scan and cache position
+        headers.clear();
+        
+        std::random_device rd;  
+        std::mt19937 gen(rd()); 
+        std::uniform_int_distribution<> distr(0, start_read);
+        int start_line = distr(gen);
+        
+        // Guard: Verify start_line is within valid range
+        if (start_line < 0 || start_line > start_read) {
+            throw std::runtime_error("Invalid start_line: " + std::to_string(start_line));
+        }
+        
+        if (this->filestream.is_open()) {
+            this->filestream.close();
+        }
+        this->filestream.open(filename, std::ios::in);
+        if (!this->filestream.is_open()) {
+            throw std::runtime_error("Could not open file: " + filename);
+        }
+        this->readCSV(start_line);
+        
+        // Cache the file position after skipping lines (for fast reset)
+        cached_start_pos = filestream.tellg();
     }
     
-    if (this->filestream.is_open()) {
-        this->filestream.close();
-    }
-    this->filestream.open(filename, std::ios::in);
-    if (!this->filestream.is_open()) {
-        throw std::runtime_error("Could not open file: " + filename);
-    }
-    this->readCSV(start_line);
     this->iterator.populate(&rows);
     
     // Guard: Verify reset completed successfully

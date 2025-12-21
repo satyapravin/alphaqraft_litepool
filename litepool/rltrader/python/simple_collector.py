@@ -56,13 +56,16 @@ class SimpleCollector:
     
     def collect(self):
         """
-        Collect n_steps of experience from all environments.
+        Collect experience until ALL environments complete exactly one episode.
+        
+        This ensures synchronized episode collection - every environment completes
+        its full episode before we move to the next epoch. Litepool auto-resets
+        environments when they complete (done or truncated), so we don't need
+        to explicitly reset - just wait for all to complete.
         
         Returns:
             batch: dict with trajectory data and computed advantages/returns
         """
-        n_steps = self.n_steps
-        
         # Initialize if first call
         if self.obs is None:
             self.obs, info = self.env.reset()
@@ -74,33 +77,21 @@ class SimpleCollector:
                     self.n_envs = 1
             self.dones = np.zeros(self.n_envs, dtype=bool)
             self.episode_rewards = np.zeros(self.n_envs, dtype=np.float32)
-            self.episode_steps = np.zeros(self.n_envs, dtype=np.int32)  # Track steps per episode
-            # Initialize LSTM hidden states (zeros for all environments)
-            self.hidden_states = [None] * self.n_envs
-            # Initialize previous episode_ended tracking
-            self._prev_episode_ended = np.zeros(self.n_envs, dtype=bool)
-        
-        # Reset completed episode statistics at start of each batch collection
-        # This ensures we only track episodes completed in THIS batch
-        self.completed_episode_rewards = []
-        self.completed_episode_realized_pnl = []
-        self.completed_episode_unrealized_pnl = []
-        
-        # CRITICAL FIX: If any environments are done from previous epoch, reset ALL environments.
-        # This is because n_steps == max_episode_steps, so all envs should be synchronized.
-        # Auto-reset during collection would consume a loop iteration without stepping,
-        # causing an off-by-one error (2047 steps instead of 2048).
-        # By resetting all at the start, we ensure the loop gets full n_steps of actual steps.
-        if self.dones is not None and self.dones.any():
-            self.obs, _ = self.env.reset()
-            self.dones = np.zeros(self.n_envs, dtype=bool)
-            self.episode_rewards = np.zeros(self.n_envs, dtype=np.float32)
             self.episode_steps = np.zeros(self.n_envs, dtype=np.int32)
             self.hidden_states = [None] * self.n_envs
             self._prev_episode_ended = np.zeros(self.n_envs, dtype=bool)
         
+        # Reset completed episode statistics at start of each batch collection
+        self.completed_episode_rewards = []
+        self.completed_episode_realized_pnl = []
+        self.completed_episode_unrealized_pnl = []
+        
+        # Track which environments have completed their episode this epoch
+        episode_completed = np.zeros(self.n_envs, dtype=bool)
+        
         # Ensure n_envs is set (should be set by now)
         n_envs = self.n_envs
+        n_steps = self.n_steps
         
         # Storage
         obs_list = []
@@ -109,45 +100,29 @@ class SimpleCollector:
         values_list = []
         rewards_list = []
         dones_list = []
-        # Note: truncs_list removed - was only used for early exit logic which has been removed
         infos_list = []
         
         # Timing tracking
         step_times = []
         last_log_step = 0
         
-        # Rollout
+        # Rollout - collect exactly n_steps
+        # With max_episode_steps = n_steps, all environments should complete at the same time
         for step_idx in range(n_steps):
             # Timing logging every 500 steps
             if step_idx % 500 == 0 and step_idx > 0:
                 if len(step_times) > 0:
                     avg_time = np.mean(step_times)
                     total_time = np.sum(step_times)
-                    #print(f"[Python Timing] Steps {last_log_step}-{step_idx}: avg={avg_time*1000:.2f}ms, total={total_time:.3f}s, count={len(step_times)}")
                     step_times.clear()
                     last_log_step = step_idx
             
-            # Note: Early exit logic removed - it caused issues with partial batches
-            # and misaligned data. Let the collection run for full n_steps.
-            # The environment auto-resets on done/trunc, so this is safe.
-            
             # Get actions from policy with current hidden states
-            # Time model inference to diagnose slowdown
             model_start = time.perf_counter()
             actions, log_probs, values, new_hidden_states = self.policy.get_actions(
                 self.obs, hidden_states=self.hidden_states
             )
             model_time = time.perf_counter() - model_start
-            #if step_idx % 100 == 0:  # Log every 100 steps
-            #    print(f"[Model Timing] Step {step_idx}: model_inference={model_time*1000:.2f}ms")
-            
-            # Store current step
-            # CRITICAL: Don't copy obs - it's already a new array from env.step()
-            # Copying 2048 times (6 envs * 30 dims) is expensive
-            obs_list.append(self.obs)
-            actions_list.append(actions)
-            log_probs_list.append(log_probs)
-            values_list.append(values)
             
             # Environment step with timeout protection
             try:
@@ -157,17 +132,18 @@ class SimpleCollector:
                 step_times.append(step_time)
             except Exception as e:
                 print(f"ERROR in env.step() at rollout step {step_idx}: {e}")
-                # If we have some data collected, return what we have
                 if len(obs_list) > 0:
                     print(f"WARNING: Returning partial batch with {len(obs_list)} steps due to env.step() error")
                     break
                 raise
             
+            # Store step data
+            obs_list.append(self.obs)
+            actions_list.append(actions)
+            log_probs_list.append(log_probs)
+            values_list.append(values)
             rewards_list.append(rewards)
             dones_list.append(dones)
-            # Note: truncs not stored - was only used for early exit logic which has been removed
-            # Store infos directly - only convert when needed for logging
-            # The conversion was too slow when done on every step
             infos_list.append(infos)
             
             # IMPORTANT: In gymnasium, dones is actually "terminated" (done & ~trunc)
@@ -235,15 +211,15 @@ class SimpleCollector:
             if self.log_episodes and episode_ended.any():
                 self._log_episode_end(infos, episode_ended)
             
+            # Mark environments that have completed their episode
+            episode_completed |= episode_ended
             
             # Update state
             self.obs = next_obs
             self.dones = dones
         
-        # If we broke early due to all environments being done, we need to handle the partial batch
-        # Make sure we have at least some data
-        if len(obs_list) == 0:
-            raise RuntimeError("No data collected - all environments may be stuck")
+        # All environments should complete with max_episode_steps = n_steps
+        # This is verified by the episode_completed array (used for logging only)
         
         # Get bootstrap value with current hidden states
         with torch.no_grad():
@@ -286,10 +262,8 @@ class SimpleCollector:
             bootstrap_values = bootstrap_values.numpy()
         
         # Convert to tensors
-        # Handle case where we collected fewer steps than n_steps
+        # With episode-based collection, actual steps may vary slightly
         actual_n_steps = len(obs_list)
-        if actual_n_steps < n_steps:
-            print(f"INFO: Collected {actual_n_steps} steps instead of {n_steps} (all environments may be done)")
         
         # CRITICAL: Ensure all lists have the same length
         # When we break early, we've already fixed the mismatch by popping the last items

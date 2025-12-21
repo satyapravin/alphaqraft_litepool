@@ -118,6 +118,7 @@ namespace RLTrader {
         bool more_data;
         int start_read;
         int num_reads;
+        std::streampos cached_start_pos = 0;  // Cache file position after initial line skip for fast reset
 
     public:
         CsvReader(const std::string& filename, int start_read);
