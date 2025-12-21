@@ -498,11 +498,11 @@ def train():
               f"PL {total_policy_loss/n_updates:7.4f} | "
               f"VL {total_value_loss/n_updates:7.4f} | "
               f"Ent {total_entropy/n_updates:6.4f} | "
-              f"Std {loss_info['action_std']:5.3f}")
+              f"Std {loss_info['action_std']:5.3f}", flush=True)
         
         # Print episode statistics if any episodes completed in this epoch
         if completed_episode_rewards:
-            print(f"  Completed {len(completed_episode_rewards)} episode(s) in this epoch")
+            print(f"\n  Completed {len(completed_episode_rewards)} episode(s) in this epoch\n", flush=True)
         
         # === Log detailed metrics ===
         if epoch % 10 == 0 or epoch == 0:

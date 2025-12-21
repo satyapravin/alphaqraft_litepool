@@ -277,7 +277,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
           if (step_count > 500) {
               double avg_time_ms = (total_cpp_time / 500.0) * 1000.0;
               std::cerr << "[C++ Timing] Steps " << (step_count - 500) << "-" << step_count 
-                       << ": avg=" << avg_time_ms << "ms, total=" << total_cpp_time << "s\n";
+                       << ": avg=" << avg_time_ms << "ms, total=" << total_cpp_time << "s" << std::endl;  // flush
               total_cpp_time = 0.0;
           }
       } 
@@ -495,8 +495,8 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     // Forced requotes (first step, no orders, after fills) are not penalized
     // Small penalty to encourage letting orders sit and get filled
     constexpr double REQUOTE_PENALTY = -0.0001;  // Small penalty per voluntary requote (pre-scaling)
-    double requote_penalty = rl_chose_requote_ ? REQUOTE_PENALTY : 0.0;
-    
+    double requote_penalty = rl_chose_requote_ ? REQUOTE_PENALTY / initial_balance_ : 0.0;
+
     // 5. Leverage limit penalty: high negative reward if leverage hits ±1.0
     // This strongly discourages the agent from reaching maximum leverage
     // The penalty should be large enough to dominate other rewards

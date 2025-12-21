@@ -256,56 +256,39 @@ class SimplePPOPolicy:
                 'action_std': 0.0,
             }
         
-        # Value loss (clipped)
+        # Value loss (using Huber loss for robustness to outliers)
         # CRITICAL: Use unnormalized returns for value loss computation
         # Value function should learn to predict actual returns, not normalized ones
-        # Advantages are normalized for policy learning, but returns must remain unnormalized
         # With reward_scale=1.0, returns should be in [-200, 200] range
         returns_for_value_clamped = torch.clamp(returns_for_value, -200.0, 200.0)
-        
-        # EARLY EXIT: If returns are exploding, skip update to prevent hanging
-        max_return = torch.abs(returns_for_value_clamped).max().item()
-        if max_return > 10000.0:
-            print(f"WARNING: Returns exploding (max={max_return:.1f}), skipping update to prevent hang")
-            return {
-                'loss': 0.0,
-                'policy_loss': 0.0,
-                'value_loss': 0.0,
-                'entropy': 0.0,
-                'approx_kl': 0.0,
-                'action_std': 0.0,
-            }
         
         # Value clipping for PPO (prevent large updates)
         values_clipped = old_values + torch.clamp(
             values - old_values, -self.clip_eps, self.clip_eps
         )
         
-        # Compute value loss (squared error)
-        # CRITICAL: Use unnormalized returns for value loss
-        # Value function should learn to predict actual returns, not normalized ones
-        # Advantages are normalized for policy learning, but returns must remain unnormalized
-        value_loss_unclipped = (values - returns_for_value_clamped).pow(2)
-        value_loss_clipped = (values_clipped - returns_for_value_clamped).pow(2)
-        value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
+        # Compute value loss using Huber loss (smooth L1) for robustness
+        # Huber loss is linear for large errors (instead of quadratic), preventing explosion
+        # delta=10.0 means: quadratic for |error| < 10, linear for |error| >= 10
+        huber_delta = 10.0
+        value_error_unclipped = values - returns_for_value_clamped
+        value_error_clipped = values_clipped - returns_for_value_clamped
         
-        # EARLY EXIT: If value loss is too large, skip update to prevent hanging
-        if value_loss.item() > 10000.0:
-            print(f"WARNING: Value loss too large ({value_loss.item():.1f}), skipping update to prevent hang")
-            return {
-                'loss': 0.0,
-                'policy_loss': 0.0,
-                'value_loss': value_loss.item(),
-                'entropy': 0.0,
-                'approx_kl': 0.0,
-                'action_std': 0.0,
-            }
+        # Huber loss: 0.5 * x^2 if |x| < delta, else delta * (|x| - 0.5 * delta)
+        def huber_loss(error, delta):
+            abs_error = torch.abs(error)
+            quadratic = 0.5 * error.pow(2)
+            linear = delta * (abs_error - 0.5 * delta)
+            return torch.where(abs_error < delta, quadratic, linear)
         
-        # Additional safety: clamp value loss itself to prevent explosion
-        # With vf_coef=0.1, value_loss=100 contributes only 10 to total loss
-        # Max possible value loss with range [-200, 200]: 0.5 * (200 - (-200))^2 = 40,000
-        # But in practice, value loss is normally much smaller (0.01-1.0 with reward_scale=1.0)
-        # Clamp to [0, 100] to allow normal learning while preventing explosion
+        value_loss_unclipped = huber_loss(value_error_unclipped, huber_delta)
+        value_loss_clipped = huber_loss(value_error_clipped, huber_delta)
+        value_loss = torch.max(value_loss_unclipped, value_loss_clipped).mean()
+        
+        # Clamp value loss to prevent any remaining explosion
+        # With Huber loss, max contribution per sample is delta * (max_error - 0.5 * delta)
+        # For delta=10, max_error=400 (returns clamped to [-200,200]): 10 * (400 - 5) = 3950
+        # Clamp to 100 to keep gradients reasonable
         value_loss = torch.clamp(value_loss, 0.0, 100.0)
         
         # Entropy loss

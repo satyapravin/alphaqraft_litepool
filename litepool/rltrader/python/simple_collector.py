@@ -86,6 +86,19 @@ class SimpleCollector:
         self.completed_episode_realized_pnl = []
         self.completed_episode_unrealized_pnl = []
         
+        # CRITICAL FIX: If any environments are done from previous epoch, reset ALL environments.
+        # This is because n_steps == max_episode_steps, so all envs should be synchronized.
+        # Auto-reset during collection would consume a loop iteration without stepping,
+        # causing an off-by-one error (2047 steps instead of 2048).
+        # By resetting all at the start, we ensure the loop gets full n_steps of actual steps.
+        if self.dones is not None and self.dones.any():
+            self.obs, _ = self.env.reset()
+            self.dones = np.zeros(self.n_envs, dtype=bool)
+            self.episode_rewards = np.zeros(self.n_envs, dtype=np.float32)
+            self.episode_steps = np.zeros(self.n_envs, dtype=np.int32)
+            self.hidden_states = [None] * self.n_envs
+            self._prev_episode_ended = np.zeros(self.n_envs, dtype=bool)
+        
         # Ensure n_envs is set (should be set by now)
         n_envs = self.n_envs
         
@@ -222,6 +235,7 @@ class SimpleCollector:
             if self.log_episodes and episode_ended.any():
                 self._log_episode_end(infos, episode_ended)
             
+            
             # Update state
             self.obs = next_obs
             self.dones = dones
@@ -235,12 +249,34 @@ class SimpleCollector:
         with torch.no_grad():
             obs_tensor = torch.as_tensor(self.obs, dtype=torch.float32)
             # Prepare hidden states for bootstrap (combine all env hidden states)
-            if self.hidden_states[0] is not None:
-                # Stack hidden states: [1, n_envs, hidden_dim]
+            # CRITICAL: Some hidden states may be None (after episode reset), need to handle mixed case
+            non_none_states = [hs for hs in self.hidden_states if hs is not None]
+            if len(non_none_states) == len(self.hidden_states):
+                # All hidden states are valid - stack them
                 h_list = [h for h, _ in self.hidden_states]
                 c_list = [c for _, c in self.hidden_states]
                 bootstrap_hidden = (
                     torch.cat(h_list, dim=1),  # [1, n_envs, hidden_dim]
+                    torch.cat(c_list, dim=1)
+                )
+            elif len(non_none_states) > 0:
+                # Mixed case: some None, some valid - use zeros for None entries
+                # Get hidden dim from first valid hidden state
+                sample_h, sample_c = non_none_states[0]
+                hidden_dim = sample_h.shape[-1]
+                device = sample_h.device
+                h_list = []
+                c_list = []
+                for hs in self.hidden_states:
+                    if hs is not None:
+                        h_list.append(hs[0])
+                        c_list.append(hs[1])
+                    else:
+                        # Use zeros for environments that just reset
+                        h_list.append(torch.zeros(1, 1, hidden_dim, device=device))
+                        c_list.append(torch.zeros(1, 1, hidden_dim, device=device))
+                bootstrap_hidden = (
+                    torch.cat(h_list, dim=1),
                     torch.cat(c_list, dim=1)
                 )
             else:
@@ -451,5 +487,5 @@ class SimpleCollector:
                       f"Fees ${fees:6.4f} | "
                       f"Net ${net_pnl:8.4f} | "
                       f"Trades {int(trade_count):3d} | "
-                      f"Pos {net_amount_btc:7.5f} BTC")
+                      f"Pos {net_amount_btc:7.5f} BTC", flush=True)
 
