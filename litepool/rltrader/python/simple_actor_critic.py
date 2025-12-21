@@ -20,9 +20,9 @@ Architecture:
 - Captures temporal dependencies in market dynamics
 
 4-action space:
-- bid_spread: [-1, 1] -> exponential mapping to spread multiplier
-- ask_spread: [-1, 1] -> exponential mapping to spread multiplier  
-- target_inventory: [-1, 1] desired inventory level (skew computed automatically)
+- bid_spread: [-1, 1] -> exponential mapping to spread multiplier [0.5x, 50x]
+- ask_spread: [-1, 1] -> exponential mapping to spread multiplier [0.5x, 50x]
+- target_inventory: [-1, 1] -> scaled to ±2% target leverage (skew computed automatically)
 - requote: binary decision to update quotes (>0 = requote)
 """
 import numpy as np

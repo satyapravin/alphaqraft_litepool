@@ -53,18 +53,18 @@ void Strategy::reset() {
 }
 
 void Strategy::updateTargetInventory(double target_inventory_action) {
-    // RL action is already in [-1, 1], representing target leverage from -100% to +100%
-    // No scaling - let agent express full range of inventory preferences
-    // The actual position is still hard-limited to ±10%, but agent can "desire" more
-    // This gives clearer signal about directional preference
+    // RL action in [-1, 1] → scaled to [-0.02, +0.02] for target leverage
+    // This limits the target inventory to ±2% of balance (conservative positioning)
+    constexpr double TARGET_INVENTORY_SCALE = 0.02;
+    double scaled_action = target_inventory_action * TARGET_INVENTORY_SCALE;
     
     // EMA smoothing: target_inventory_ema = alpha * new_target + (1 - alpha) * old_target
     // TARGET_EMA_ALPHA = 0.05 means ~20 step half-life (smooth updates)
-    target_inventory_ema = TARGET_EMA_ALPHA * target_inventory_action + 
+    target_inventory_ema = TARGET_EMA_ALPHA * scaled_action + 
                           (1.0 - TARGET_EMA_ALPHA) * target_inventory_ema;
     
-    // Clamp to [-1, 1] - full range allowed
-    target_inventory_ema = std::clamp(target_inventory_ema, -1.0, 1.0);
+    // Clamp to [-0.02, +0.02] - conservative target inventory range
+    target_inventory_ema = std::clamp(target_inventory_ema, -TARGET_INVENTORY_SCALE, TARGET_INVENTORY_SCALE);
 }
 
 void Strategy::updateVolatility(double mid_price) {
@@ -129,8 +129,8 @@ std::pair<double, double> Strategy::computeQuotePrices(
     // === Step 5: Apply inventory skew by adjusting spreads directly ===
     // If long (leverage > 0): widen bid spread, tighten ask spread → more likely to sell
     // If short (leverage < 0): tighten bid spread, widen ask spread → more likely to buy
-    // target_inventory_ema is in [-1, 1], scale to leverage units [-0.1, 0.1]
-    double target_leverage = target_inventory_ema * 0.1;  // Scale to match leverage range
+    // target_inventory_ema is already in [-0.02, +0.02] (target leverage range)
+    double target_leverage = target_inventory_ema;  // Already in leverage units
     double inventory_error = leverage - target_leverage;
     
     // Skew factor: positive when long (widen bid, tighten ask), negative when short

@@ -39,9 +39,9 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 
 | Action | Range | Description |
 |--------|-------|-------------|
-| `bid_spread` | [-1, 1] | Controls bid quote width (mapped to [0.2x, 3.0x] spread multiplier) |
-| `ask_spread` | [-1, 1] | Controls ask quote width (mapped to [0.2x, 3.0x] spread multiplier) |
-| `target_inventory` | [-1, 1] | Desired inventory level (skew computed automatically from error) |
+| `bid_spread` | [-1, 1] | Controls bid quote width (mapped to [0.5x, 50x] spread multiplier) |
+| `ask_spread` | [-1, 1] | Controls ask quote width (mapped to [0.5x, 50x] spread multiplier) |
+| `target_inventory` | [-1, 1] | Desired inventory level (scaled to ±2% leverage, skew computed automatically) |
 | `requote` | {0, 1} | Binary decision to cancel and requote |
 
 **Note**: The `skew` action was removed to avoid conflicts with `target_inventory`. Quote asymmetry (skew) is now computed automatically based on the difference between current position and target inventory.

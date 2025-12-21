@@ -39,7 +39,7 @@ namespace RLTrader {
         // Ask spread control: [-1, 1] → multiplier on base spread for ask side
         double ask_spread = 0.0;             // Tighten (<0) or widen (>0) ask spread
         
-        // Target inventory: [-1, 1] → target leverage/position
+        // Target inventory: [-1, 1] → scaled to ±2% target leverage
         // Positive = target long position, Negative = target short position
         // Skew is automatically computed from (current_leverage - target) to push toward target
         double target_inventory = 0.0;
@@ -102,7 +102,7 @@ namespace RLTrader {
         int max_ticks;
         
         // State variables
-        double target_inventory_ema = 0.0;    // Smoothed target inventory (clamped to [-0.1, 0.1])
+        double target_inventory_ema = 0.0;    // Smoothed target inventory (clamped to [-0.02, +0.02])
         
         // Track last placed quote prices for diagnostics
         double last_bid_price = 0.0;
