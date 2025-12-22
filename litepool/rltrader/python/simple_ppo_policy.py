@@ -288,8 +288,8 @@ class SimplePPOPolicy:
         # Clamp value loss to prevent any remaining explosion
         # With Huber loss, max contribution per sample is delta * (max_error - 0.5 * delta)
         # For delta=10, max_error=400 (returns clamped to [-200,200]): 10 * (400 - 5) = 3950
-        # Clamp to 100 to keep gradients reasonable
-        value_loss = torch.clamp(value_loss, 0.0, 100.0)
+        # Clamp to 1000 to allow larger value updates while keeping gradients bounded
+        value_loss = torch.clamp(value_loss, 0.0, 1000.0)
         
         # Entropy loss
         entropy_loss = entropy.mean()

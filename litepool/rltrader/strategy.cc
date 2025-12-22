@@ -53,9 +53,9 @@ void Strategy::reset() {
 }
 
 void Strategy::updateTargetInventory(double target_inventory_action) {
-    // RL action in [-1, 1] → scaled to [-0.02, +0.02] for target leverage
-    // This limits the target inventory to ±2% of balance (conservative positioning)
-    constexpr double TARGET_INVENTORY_SCALE = 0.02;
+    // RL action in [-1, 1] → scaled to [-0.1, +0.1] for target leverage
+    // This limits the target inventory to ±10% of balance
+    constexpr double TARGET_INVENTORY_SCALE = 0.1;
     double scaled_action = target_inventory_action * TARGET_INVENTORY_SCALE;
     
     // EMA smoothing: target_inventory_ema = alpha * new_target + (1 - alpha) * old_target
@@ -63,7 +63,7 @@ void Strategy::updateTargetInventory(double target_inventory_action) {
     target_inventory_ema = TARGET_EMA_ALPHA * scaled_action + 
                           (1.0 - TARGET_EMA_ALPHA) * target_inventory_ema;
     
-    // Clamp to [-0.02, +0.02] - conservative target inventory range
+    // Clamp to [-0.1, +0.1] - target inventory range
     target_inventory_ema = std::clamp(target_inventory_ema, -TARGET_INVENTORY_SCALE, TARGET_INVENTORY_SCALE);
 }
 

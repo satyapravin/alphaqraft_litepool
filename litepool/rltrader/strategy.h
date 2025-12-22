@@ -39,7 +39,7 @@ namespace RLTrader {
         // Ask spread control: [-1, 1] → multiplier on base spread for ask side
         double ask_spread = 0.0;             // Tighten (<0) or widen (>0) ask spread
         
-        // Target inventory: [-1, 1] → scaled to ±2% target leverage
+        // Target inventory: [-1, 1] → scaled to ±10% target leverage
         // Positive = target long position, Negative = target short position
         // Skew is automatically computed from (current_leverage - target) to push toward target
         double target_inventory = 0.0;
@@ -102,7 +102,7 @@ namespace RLTrader {
         int max_ticks;
         
         // State variables
-        double target_inventory_ema = 0.0;    // Smoothed target inventory (clamped to [-0.02, +0.02])
+        double target_inventory_ema = 0.0;    // Smoothed target inventory (clamped to [-0.1, +0.1])
         
         // Track last placed quote prices for diagnostics
         double last_bid_price = 0.0;
@@ -120,7 +120,7 @@ namespace RLTrader {
         static constexpr double TARGET_EMA_ALPHA = 0.05;     // Target inventory smoothing
         static constexpr double VOL_EMA_ALPHA = 0.1;         // Volatility EMA (~10 sample half-life)
         static constexpr double VOL_SPREAD_MULT = 50.0;      // How much volatility widens spread
-        static constexpr double INVENTORY_SKEW_MULT = 1.0;   // Reduced: smoother quote shifts, agent spreads respected more
+        static constexpr double INVENTORY_SKEW_MULT = 5.0;   // Reduced: smoother quote shifts, agent spreads respected more
         // REMOVED: ACTION_SKEW_MULT - skew is now fully determined by inventory error
         // Agent controls inventory via target_inventory action only (no conflicting skew action)
         static constexpr double MAX_SPREAD_MULT = 50.0;      // Maximum spread multiplier from action (allows huge spreads for liquidity crunches)
