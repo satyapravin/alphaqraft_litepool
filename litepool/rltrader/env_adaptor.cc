@@ -153,9 +153,6 @@ void EnvAdaptor::computeInfo(OrderBook &book) {
     info["last_bid_price"] = strategy.getLastBidPrice();
     info["last_ask_price"] = strategy.getLastAskPrice();
     info["last_mid_price"] = strategy.getLastMidPrice();
-    
-    // Leverage limit flag (for reward penalty)
-    info["hit_leverage_limit"] = strategy.hitLeverageLimit() ? 1.0 : 0.0;
 }
 
 

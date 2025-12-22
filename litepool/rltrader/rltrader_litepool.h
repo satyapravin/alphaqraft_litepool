@@ -80,6 +80,7 @@ class RlTraderEnvFns {
                     "info:last_bid_price"_.Bind(Spec<double>({-1})),
                     "info:last_ask_price"_.Bind(Spec<double>({-1})),
                     "info:last_mid_price"_.Bind(Spec<double>({-1})),
+                    "info:abs_deviation_from_target"_.Bind(Spec<double>({-1})),
                     // Terminal info from completed episode (available after auto-reset)
                     "info:final_realized_pnl"_.Bind(Spec<double>({-1})),
                     "info:final_unrealized_pnl"_.Bind(Spec<double>({-1})),
@@ -486,6 +487,11 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     state["info:last_ask_price"_] = info["last_ask_price"];
     state["info:last_mid_price"_] = info["last_mid_price"];
     
+    // Leverage deviation from target (for monitoring and debugging)
+    double target_leverage_info = strategy_ptr->getTargetInventory();
+    double abs_deviation_from_target = std::abs(leverage - target_leverage_info);
+    state["info:abs_deviation_from_target"_] = abs_deviation_from_target;
+    
     // Expose terminal info from completed episode (for episode logging)
     // This is populated when isDone becomes true, before auto-reset
     if (has_terminal_info_) {
@@ -568,24 +574,25 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     constexpr double REQUOTE_PENALTY = -0.0001;  // Small penalty per voluntary requote (pre-scaling)
     double requote_penalty = rl_chose_requote_ ? REQUOTE_PENALTY / initial_balance_ : 0.0;
 
-    // 5. Leverage penalty: exponential penalty based on absolute leverage
-    // This provides a smooth learning signal that grows as leverage approaches limits
-    // - Below threshold (0.5): no penalty, allows normal trading
-    // - Above threshold: exponential growth, strongly discourages high leverage
-    // - At |leverage| = 1.0: penalty ≈ -1100 (similar to previous hard cutoff)
-    double abs_leverage = std::abs(leverage);
-    constexpr double LEVERAGE_THRESHOLD = 0.5;     // Start penalizing above 50% leverage
+    // 5. Leverage penalty: exponential penalty based on deviation from target leverage
+    // This provides a smooth learning signal that penalizes deviation from the agent's target
+    // - Below threshold: no penalty, allows normal trading around target
+    // - Above threshold: exponential growth, strongly discourages large deviations
+    // - Penalizes both positive and negative deviations equally (absolute deviation)
+    double target_leverage = strategy_ptr->getTargetInventory();  // Already in leverage units [-0.1, +0.1]
+    double leverage_deviation = std::abs(leverage - target_leverage);
+    constexpr double DEVIATION_THRESHOLD = 0.05;   // Start penalizing above 5% deviation from target
     constexpr double LEVERAGE_PENALTY_SCALE = -100.0;
     constexpr double LEVERAGE_EXPONENT = 5.0;      // Controls how fast penalty grows
-    double excess_leverage = std::max(0.0, abs_leverage - LEVERAGE_THRESHOLD);
-    double leverage_limit_penalty = LEVERAGE_PENALTY_SCALE * (std::exp(LEVERAGE_EXPONENT * excess_leverage) - 1.0);
+    double excess_deviation = std::max(0.0, leverage_deviation - DEVIATION_THRESHOLD);
+    double leverage_limit_penalty = LEVERAGE_PENALTY_SCALE * (std::exp(LEVERAGE_EXPONENT * excess_deviation) - 1.0);
     
     // Total reward: blended realized + unrealized + fees + penalties
     // - Realized: 50% realized_pnl + 50% spread_capture (balances accounting with MM signal)
     // - Unrealized: full weight to represent mark-to-market profits
     // - Fees: boosted weight (2x) to encourage more fills (agent was quoting too wide)
     // - Requote penalty: small cost for voluntary requotes to encourage order persistence
-    // - Leverage limit penalty: large cost when hitting max leverage
+    // - Leverage deviation penalty: exponential penalty for deviating from target leverage
     constexpr double UNREALIZED_WEIGHT = 1.0;
     constexpr double FEE_WEIGHT = 2.0;  // Boosted to encourage fills
     double reward = realized_component + UNREALIZED_WEIGHT * unrealized_delta + FEE_WEIGHT * fee_delta + requote_penalty + leverage_limit_penalty;
