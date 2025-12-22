@@ -83,8 +83,7 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 reward = realized_component 
        + unrealized_pnl_delta 
        + 2.0 * fee_rebate_delta 
-       + requote_penalty 
-       + leverage_penalty
+       + requote_penalty
 ```
 
 where `realized_component = 0.5 * realized_pnl_delta + 0.5 * spread_capture_delta`
@@ -100,35 +99,6 @@ All deltas are normalized by initial balance to make rewards scale-independent. 
 | **Unrealized P&L Delta** | 1.0 | Mark-to-market changes on open positions |
 | **Fee Rebate Delta** | 2.0 | Maker rebates earned (boosted to encourage fills) |
 | **Requote Penalty** | -0.0001 | Per voluntary requote (normalized, encourages order persistence) |
-| **Leverage Penalty** | Exponential | Smooth exponential penalty based on deviation from target leverage |
-
-### Leverage Penalty (Exponential)
-
-The leverage penalty provides a smooth learning signal that penalizes deviation from the agent's target leverage:
-
-```
-penalty = -100.0 * (exp(5.0 * excess_deviation) - 1.0)
-where excess_deviation = max(0, |leverage - target_leverage| - 0.05)
-```
-
-**Key Features:**
-- **Target-aware**: Only penalizes deviation from the agent's chosen target leverage (from `target_inventory` action)
-- **Threshold**: No penalty for deviations ≤ 5% from target (allows normal trading around target)
-- **Exponential growth**: Penalty grows exponentially as deviation increases
-- **Symmetric**: Penalizes both positive and negative deviations equally
-
-**Penalty Examples** (assuming target_leverage = 0.0):
-- Deviation ≤ 0.05: **No penalty** (within threshold)
-- Deviation = 0.1: **-65** (normalized, before 10,000x scaling)
-- Deviation = 0.2: **-172**
-- Deviation = 0.3: **-349**
-- Deviation = 0.4: **-639**
-- Deviation = 0.5: **-1,118** (maximum typical deviation)
-
-This exponential design:
-- **Encourages target tracking**: Agent learns to maintain positions close to its target
-- **Maintains episode consistency**: Episodes run to `max_episode_steps` unless data runs out
-- **Flexible positioning**: Agent can choose any target leverage in [-0.1, +0.1] without penalty if it stays close to it
 
 ### Design Notes
 
@@ -233,22 +203,14 @@ MAKER_FEE = -0.000025    # Maker rebate (-0.25 bps)
 TAKER_FEE = 0.0005       # Taker fee (5 bps)
 ```
 
-## Recent Improvements
+## Info Fields
 
-### Episode Truncation Fix
-- **Fixed**: Environment truncation now correctly terminates episodes at `max_episode_steps` (2048 steps)
-- **Implementation**: Simplified truncation logic by ensuring `IsDone()` returns `true` when `steps >= max_episode_steps`, allowing the base class `Allocate()` to correctly set `done` and `trunc` flags
-- **Impact**: All environments now consistently truncate at the specified episode length, preventing infinite episodes
+The environment exposes several info fields for monitoring and debugging:
 
-### Exponential Leverage Deviation Penalty
-- **Changed**: Replaced absolute leverage penalty with deviation-from-target penalty
-- **Benefits**: 
-  - Penalizes deviation from agent's chosen target leverage (from `target_inventory` action)
-  - Allows agent to maintain any target position without penalty if it stays close to target
-  - Provides smooth learning signal that encourages tracking the target
-  - Maintains consistent episode lengths (no early termination)
-- **Formula**: `penalty = -100.0 * (exp(5.0 * excess_deviation) - 1.0)` where `excess_deviation = max(0, |leverage - target_leverage| - 0.05)`
-- **Info Field**: Replaced `hit_leverage_limit` with `abs_deviation_from_target` for better monitoring
+- `deviation_from_target`: Signed deviation of current leverage from target leverage
+  - Positive when leverage > target (over-leveraged)
+  - Negative when leverage < target (under-leveraged)
+  - Useful for tracking how well the agent maintains its target position
 
 ## License
 
