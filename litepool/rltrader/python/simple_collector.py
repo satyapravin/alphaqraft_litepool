@@ -277,22 +277,6 @@ class SimpleCollector:
                 print(f"DEBUG: All environments completed at least one episode. step_idx={step_idx}, episode_completed={episode_completed}, episode_steps={self.episode_steps}", flush=True)
                 break
             
-            # DEBUG: Log status every 100 steps to track progress
-            if step_idx % 100 == 0 and step_idx > 0:
-                incomplete = [i for i in range(self.n_envs) if not episode_completed[i]]
-                not_truncated = []
-                if isinstance(truncs, np.ndarray):
-                    not_truncated = [i for i in range(self.n_envs) if not truncs[i]]
-                if incomplete or not_truncated:
-                    print(f"DEBUG: step_idx={step_idx}, incomplete_envs={incomplete}, not_truncated={not_truncated}, episode_steps={self.episode_steps}, truncs={truncs if isinstance(truncs, np.ndarray) else truncs}", flush=True)
-            
-            # DEBUG: Log truncation status when we're close to n_steps
-            if step_idx >= n_steps - 10 and step_idx < n_steps + 10:
-                if isinstance(truncs, np.ndarray):
-                    truncated_envs = [i for i in range(self.n_envs) if truncs[i]]
-                    not_truncated_envs = [i for i in range(self.n_envs) if not truncs[i]]
-                    if not_truncated_envs:
-                        print(f"DEBUG: step_idx={step_idx}, truncated_envs={truncated_envs}, not_truncated_envs={not_truncated_envs}, episode_steps={self.episode_steps}", flush=True)
         
         # All environments should complete with max_episode_steps = n_steps
         # This is verified by the episode_completed array (used for logging only)

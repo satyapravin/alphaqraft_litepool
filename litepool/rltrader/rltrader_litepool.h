@@ -361,23 +361,59 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
           has_data = false;
       }
       
-      ++steps;
-      
-      // Check if episode should end
+      // CRITICAL: current_step_ is incremented in PreProcess() BEFORE Step() is called.
+      // So when WriteState() calls Allocate(), current_step_ represents the step we're
+      // currently processing (the step number for this Step() call).
+      // We increment steps AFTER reading data, so steps represents steps completed.
       int max_episode_steps = spec_.config["max_episode_steps"_];
       
-      // Episode ends if:
-      // 1. We've reached max_episode_steps (2048) - normal completion
-      // 2. We've run out of data (has_data is false) - early termination
-      // Note: If has_data is false, we can't advance further (each step needs a CSV row)
-      // So we must end the episode. The collector will handle synchronization.
+      // Increment step count (we attempted/completed this step)
+      ++steps;
+      
+      // CRITICAL: Episode MUST end when steps >= max_episode_steps.
+      // The truncation check in Allocate() uses: trunc = done && (current_step_ >= max_episode_steps)
+      // Since PreProcess() increments current_step_ before Step(), when we process step N:
+      // - PreProcess() sets current_step_ = N
+      // - Step() increments steps, so if steps was N-1, it becomes N
+      // - When WriteState() calls Allocate(), current_step_ = N and steps = N
+      // So when steps = max_episode_steps, current_step_ should also be max_episode_steps.
+      // We MUST set isDone = true unconditionally when steps >= max_episode_steps.
+      // 
+      // IMPORTANT: Check steps >= max_episode_steps FIRST, before checking has_data.
+      // This ensures that if we've reached max steps, we always truncate, even if has_data is false.
+      // If has_data is false but steps < max_episode_steps, that's early termination (not truncated).
       if (steps >= max_episode_steps) {
+          // Reached max episode steps - episode ends (truncated)
+          // CRITICAL: Always set isDone = true when steps >= max_episode_steps, regardless of has_data
           isDone = true;
       } else if (!has_data) {
           // No more data - must end episode (can't advance without CSV rows)
+          // This is early termination, not truncation (trunc will be false because current_step_ < max_episode_steps)
           isDone = true;
       } else {
+          // Continue episode
           isDone = false;
+      }
+      
+      // SAFEGUARD: Double-check that isDone is set correctly when we've reached max steps
+      // This prevents the bug where env 4 continues past 2048 steps
+      // This should never trigger if the logic above is correct, but it's a safety net
+      if (steps >= max_episode_steps && !isDone) {
+          // Force isDone = true - this should never happen but prevents infinite loops
+          isDone = true;
+      }
+      
+      // CRITICAL: Ensure isDone is ALWAYS true when steps >= max_episode_steps
+      // This is the ultimate safeguard - even if the logic above somehow fails,
+      // we MUST end the episode when we've exceeded max_episode_steps.
+      // This prevents environments from running indefinitely (like env 4 reaching 4095 steps).
+      // 
+      // IMPORTANT: This check MUST happen BEFORE WriteState() is called, because
+      // WriteState() calls Allocate() which calls IsDone() to determine done/trunc.
+      // If isDone is false when Allocate() is called, it will set done=false and trunc=false,
+      // and our override in WriteState() might not work correctly.
+      if (steps >= max_episode_steps) {
+          isDone = true;
       }
       
       // Detect if fills occurred during this step by checking trade count change
@@ -391,6 +427,15 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
           has_terminal_info_ = true;
       }
       
+      // FINAL SAFEGUARD: Double-check isDone one more time before WriteState()
+      // This ensures that even if something reset isDone above, we catch it here.
+      // This is the last chance to fix isDone before Allocate() is called.
+      if (steps >= max_episode_steps && !isDone) {
+          // This should never happen, but if it does, force isDone = true
+          // This is critical to prevent infinite loops
+          isDone = true;
+      }
+      
       WriteState();
       
       // Measure C++ processing time at end of Step() (includes WriteState())
@@ -400,8 +445,8 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   }
 
   void WriteState() {
-    // CRITICAL: Allocate FIRST to ensure done_write() is properly set up
-    // This prevents deadlock if getState/getInfo throws
+    // Allocate state buffer - base class Allocate() calls IsDone() which returns
+    // true when steps >= max_episode_steps, so done will be set correctly
     State state = Allocate(1);
     
     std::array<double, RLTrader::OBS_DIM> data;
@@ -420,6 +465,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
         // If getInfo fails, use empty info (all zeros)
         isDone = true;
     }
+    
     state["info:mid_price"_] = info["mid_price"];
     state["info:balance"_] = info["balance"];
     state["info:unrealized_pnl"_] = info["unrealized_pnl"];
@@ -522,16 +568,17 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     constexpr double REQUOTE_PENALTY = -0.0001;  // Small penalty per voluntary requote (pre-scaling)
     double requote_penalty = rl_chose_requote_ ? REQUOTE_PENALTY / initial_balance_ : 0.0;
 
-    // 5. Leverage limit penalty: high negative reward if leverage hits ±1.0
-    // This strongly discourages the agent from reaching maximum leverage
-    // The penalty should be large enough to dominate other rewards
-    constexpr double LEVERAGE_LIMIT_PENALTY = -10.0;  // Large negative penalty (normalized)
-    double leverage_limit_penalty = 0.0;
-    if (info["hit_leverage_limit"] > 0.5) {
-        leverage_limit_penalty = LEVERAGE_LIMIT_PENALTY;
-        // Also terminate episode early when leverage limit is hit
-        isDone = true;
-    }
+    // 5. Leverage penalty: exponential penalty based on absolute leverage
+    // This provides a smooth learning signal that grows as leverage approaches limits
+    // - Below threshold (0.5): no penalty, allows normal trading
+    // - Above threshold: exponential growth, strongly discourages high leverage
+    // - At |leverage| = 1.0: penalty ≈ -1100 (similar to previous hard cutoff)
+    double abs_leverage = std::abs(leverage);
+    constexpr double LEVERAGE_THRESHOLD = 0.5;     // Start penalizing above 50% leverage
+    constexpr double LEVERAGE_PENALTY_SCALE = -100.0;
+    constexpr double LEVERAGE_EXPONENT = 5.0;      // Controls how fast penalty grows
+    double excess_leverage = std::max(0.0, abs_leverage - LEVERAGE_THRESHOLD);
+    double leverage_limit_penalty = LEVERAGE_PENALTY_SCALE * (std::exp(LEVERAGE_EXPONENT * excess_leverage) - 1.0);
     
     // Total reward: blended realized + unrealized + fees + penalties
     // - Realized: 50% realized_pnl + 50% spread_capture (balances accounting with MM signal)
@@ -553,7 +600,16 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     state["obs"_].Assign(data.begin(), data.size());
   }
 
-  bool IsDone() override { return isDone; }
+  bool IsDone() override { 
+      // CRITICAL: Always return true if steps >= max_episode_steps, regardless of isDone
+      // This ensures that Allocate() will set done=true and trunc=true correctly.
+      // This is the ultimate safeguard to prevent environments from running past max_episode_steps.
+      int max_episode_steps = spec_.config["max_episode_steps"_];
+      if (steps >= max_episode_steps) {
+          return true;  // Force done when we've exceeded max steps
+      }
+      return isDone; 
+  }
 };
 
 using RlTraderLitePool = AsyncLitePool<RlTraderEnv>;

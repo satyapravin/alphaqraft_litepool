@@ -84,7 +84,7 @@ reward = realized_component
        + unrealized_pnl_delta 
        + 2.0 * fee_rebate_delta 
        + requote_penalty 
-       + leverage_limit_penalty
+       + leverage_penalty
 ```
 
 where `realized_component = 0.5 * realized_pnl_delta + 0.5 * spread_capture_delta`
@@ -99,15 +99,37 @@ All deltas are normalized by initial balance to make rewards scale-independent. 
 | **Spread Capture Delta** | 0.5 | Profit from round-trips (LIFO accounting, cleaner MM signal) |
 | **Unrealized P&L Delta** | 1.0 | Mark-to-market changes on open positions |
 | **Fee Rebate Delta** | 2.0 | Maker rebates earned (boosted to encourage fills) |
-| **Requote Penalty** | -1.0 | Per voluntary requote (forces order persistence) |
-| **Leverage Limit Penalty** | -100,000 | When leverage hits ±1.0 (terminates episode) |
+| **Requote Penalty** | -0.0001 | Per voluntary requote (normalized, encourages order persistence) |
+| **Leverage Penalty** | Exponential | Smooth exponential penalty based on absolute leverage |
+
+### Leverage Penalty (Exponential)
+
+The leverage penalty provides a smooth learning signal that grows exponentially as leverage approaches limits:
+
+```
+penalty = -100.0 * (exp(5.0 * excess_leverage) - 1.0)
+where excess_leverage = max(0, |leverage| - 0.5)
+```
+
+**Penalty Examples:**
+- |leverage| ≤ 0.5: **No penalty** (normal trading range)
+- |leverage| = 0.6: **-65** (normalized, before 10,000x scaling)
+- |leverage| = 0.7: **-172**
+- |leverage| = 0.8: **-349**
+- |leverage| = 0.9: **-639**
+- |leverage| = 1.0: **-1,118** (maximum penalty)
+
+This exponential design:
+- **Provides gradual feedback**: Agent learns to reduce leverage before hitting limits
+- **Maintains episode consistency**: Episodes run to `max_episode_steps` unless data runs out
+- **Strong deterrent**: Maximum penalty is severe enough to prevent excessive risk-taking
 
 ### Design Notes
 
 - **Fee weight boosted (2x)**: Encourages tighter spreads and more trading activity
 - **Requote penalty**: Only penalizes *voluntary* requotes (agent choice), not forced requotes (first step, no orders, after fills)
 - **Spread capture (LIFO)**: Provides cleaner signal than average price method for market making
-- **Leverage limit**: Large penalty + early termination prevents excessive risk-taking
+- **Exponential leverage penalty**: Smooth learning signal that prevents excessive leverage without hard cutoffs
 
 ## Model Architecture
 
@@ -204,6 +226,21 @@ MIN_SIZE_PCT = 1.0       # Order size (%) per level (5 levels = 5% total per sid
 MAKER_FEE = -0.000025    # Maker rebate (-0.25 bps)
 TAKER_FEE = 0.0005       # Taker fee (5 bps)
 ```
+
+## Recent Improvements
+
+### Episode Truncation Fix
+- **Fixed**: Environment truncation now correctly terminates episodes at `max_episode_steps` (2048 steps)
+- **Implementation**: Simplified truncation logic by ensuring `IsDone()` returns `true` when `steps >= max_episode_steps`, allowing the base class `Allocate()` to correctly set `done` and `trunc` flags
+- **Impact**: All environments now consistently truncate at the specified episode length, preventing infinite episodes
+
+### Exponential Leverage Penalty
+- **Changed**: Replaced hard cutoff leverage limit with smooth exponential penalty function
+- **Benefits**: 
+  - Provides gradual learning signal as leverage approaches limits
+  - Maintains consistent episode lengths (no early termination)
+  - Agent learns to reduce leverage proactively rather than only from catastrophic events
+- **Formula**: `penalty = -100.0 * (exp(5.0 * excess_leverage) - 1.0)` where `excess_leverage = max(0, |leverage| - 0.5)`
 
 ## License
 
