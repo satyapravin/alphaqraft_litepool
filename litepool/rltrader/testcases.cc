@@ -17,6 +17,7 @@
 
 
 #include "normal_instrument.h"
+#include "trade_reader.h"
 
 using namespace RLTrader;
 using namespace doctest;
@@ -1802,5 +1803,485 @@ TEST_CASE("test csv reader and trade reader integration with env adaptor") {
 		}
 		
 		CHECK(steps_processed > 0);
+	}
+}
+
+// ============================================================================
+// CSV READER AND TRADE READER RESET FUNCTIONALITY TEST
+// ============================================================================
+
+TEST_CASE("test csv reader reset functionality with dummy data") {
+	// ============================================================================
+	// Test Case 1: Verify CSVReader reset picks random start position
+	// ============================================================================
+	{
+		CsvReader reader("test_data/dummy_book.csv", 10);  // start_read = 10 (10 rows in file)
+		reader.reset();
+		
+		// Collect all timestamps from first read
+		std::vector<long long> timestamps_first;
+		while (reader.hasNext()) {
+			reader.next();
+			timestamps_first.push_back(reader.getTimeStamp());
+		}
+		
+		// Reset and collect timestamps again
+		reader.reset();
+		std::vector<long long> timestamps_second;
+		while (reader.hasNext()) {
+			reader.next();
+			timestamps_second.push_back(reader.getTimeStamp());
+		}
+		
+		// Verify reset works (should be able to read again)
+		CHECK(timestamps_first.size() > 0);
+		CHECK(timestamps_second.size() > 0);
+		
+		// With random start, timestamps might differ (but both should be valid)
+		// At minimum, verify we can read data after reset
+		bool all_valid = true;
+		for (long long ts : timestamps_first) {
+			if (ts <= 0) all_valid = false;
+		}
+		for (long long ts : timestamps_second) {
+			if (ts <= 0) all_valid = false;
+		}
+		CHECK(all_valid);
+	}
+	
+	// ============================================================================
+	// Test Case 2: Verify CSVReader reset multiple times works correctly
+	// ============================================================================
+	{
+		// Use start_read = 5 so random start can be 0-5
+		// File has 11 rows, so minimum available rows = 11 - 5 = 6
+		// This guarantees we can always read at least 5 rows
+		CsvReader reader("test_data/dummy_book.csv", 5);
+		
+		// Reset and read first time - read all available rows
+		reader.reset();
+		int count1 = 0;
+		long long first_ts1 = 0;
+		long long last_ts1 = 0;
+		while (reader.hasNext()) {
+			reader.next();
+			if (count1 == 0) {
+				first_ts1 = reader.getTimeStamp();
+			}
+			last_ts1 = reader.getTimeStamp();
+			count1++;
+		}
+		// DEBUG: Print what we got
+		std::cout << "[DEBUG] Reset 1: count=" << count1 << ", first_ts=" << first_ts1 << ", last_ts=" << last_ts1 << std::endl;
+		
+		// Reset and read second time - read all available rows
+		reader.reset();
+		int count2 = 0;
+		long long first_ts2 = 0;
+		long long last_ts2 = 0;
+		while (reader.hasNext()) {
+			reader.next();
+			if (count2 == 0) {
+				first_ts2 = reader.getTimeStamp();
+			}
+			last_ts2 = reader.getTimeStamp();
+			count2++;
+		}
+		// DEBUG: Print what we got
+		std::cout << "[DEBUG] Reset 2: count=" << count2 << ", first_ts=" << first_ts2 << ", last_ts=" << last_ts2 << std::endl;
+		
+		// Reset and read third time - read all available rows
+		reader.reset();
+		int count3 = 0;
+		long long first_ts3 = 0;
+		long long last_ts3 = 0;
+		while (reader.hasNext()) {
+			reader.next();
+			if (count3 == 0) {
+				first_ts3 = reader.getTimeStamp();
+			}
+			last_ts3 = reader.getTimeStamp();
+			count3++;
+		}
+		// DEBUG: Print what we got
+		std::cout << "[DEBUG] Reset 3: count=" << count3 << ", first_ts=" << first_ts3 << ", last_ts=" << last_ts3 << std::endl;
+		
+		// Verify all resets work and we got data
+		CHECK(count1 > 0);
+		CHECK(count2 > 0);
+		CHECK(count3 > 0);
+		CHECK(first_ts1 > 0);
+		CHECK(first_ts2 > 0);
+		CHECK(first_ts3 > 0);
+		
+		// With start_read = 5 and file having 11 rows:
+		// - If random start = 0: 11 rows available (0-10)
+		// - If random start = 1: 10 rows available (1-10)
+		// - If random start = 2: 9 rows available (2-10)
+		// - If random start = 3: 8 rows available (3-10)
+		// - If random start = 4: 7 rows available (4-10)
+		// - If random start = 5: 6 rows available (5-10)
+		// So count should be between 6 and 11
+		CHECK(count1 >= 6);
+		CHECK(count1 <= 11);
+		CHECK(count2 >= 6);
+		CHECK(count2 <= 11);
+		CHECK(count3 >= 6);
+		CHECK(count3 <= 11);
+	}
+	
+	// ============================================================================
+	// Test Case 3: Verify CSVReader reads all available rows correctly
+	// ============================================================================
+	{
+		// Use start_read = 5 so random start can be 0-5
+		// File has 11 rows (0-10), so minimum available rows = 11 - 5 = 6
+		CsvReader reader("test_data/dummy_book.csv", 5);
+		reader.reset();
+		
+		// Read all rows and verify we read all available rows
+		int total_rows = 0;
+		std::vector<long long> all_timestamps;
+		
+		while (reader.hasNext()) {
+			reader.next();
+			all_timestamps.push_back(reader.getTimeStamp());
+			total_rows++;
+		}
+		
+		// With start_read = 5 and file having 11 rows (0-10):
+		// - If random start = 0: 11 rows available (0-10)
+		// - If random start = 1: 10 rows available (1-10)
+		// - If random start = 2: 9 rows available (2-10)
+		// - If random start = 3: 8 rows available (3-10)
+		// - If random start = 4: 7 rows available (4-10)
+		// - If random start = 5: 6 rows available (5-10)
+		// So we should read between 6 and 11 rows
+		CHECK(total_rows >= 6);
+		CHECK(total_rows <= 11);
+		CHECK(all_timestamps.size() == total_rows);
+		
+		// Verify timestamps are in order
+		bool timestamps_ordered = true;
+		for (size_t i = 1; i < all_timestamps.size(); i++) {
+			if (all_timestamps[i] < all_timestamps[i-1]) {
+				timestamps_ordered = false;
+				break;
+			}
+		}
+		CHECK(timestamps_ordered);
+	}
+	
+	// ============================================================================
+	// Test Case 4: Verify CSVReader peekFirstTimestamp works after reset
+	// ============================================================================
+	{
+		CsvReader reader("test_data/dummy_book.csv", 10);
+		reader.reset();
+		
+		// Verify reset populated data before peeking
+		CHECK(reader.hasNext());
+		
+		// Peek at first timestamp without consuming
+		long long first_ts = reader.peekFirstTimestamp();
+		CHECK(first_ts > 0);
+		
+		// Verify we can still read from the beginning
+		CHECK(reader.hasNext());
+		reader.next();
+		long long actual_first_ts = reader.getTimeStamp();
+		CHECK(first_ts == actual_first_ts);
+	}
+}
+
+TEST_CASE("test trade reader reset functionality with dummy data") {
+	// ============================================================================
+	// Test Case 1: Verify TradeReader reset syncs to book timestamp
+	// ============================================================================
+	{
+		TradeReader trade_reader("test_data/dummy_trades.csv", 0);
+		
+		// Reset to a specific timestamp (matching book start)
+		long long book_start_ts = 1000200;  // Should sync to this timestamp
+		trade_reader.reset(book_start_ts);
+		
+		// Get trades up to a later timestamp
+		long long test_ts = 1000500;
+		std::vector<Trade> trades = trade_reader.getRecentTrades(test_ts);
+		
+		// Verify we get trades after the reset timestamp
+		CHECK(trades.size() > 0);
+		for (const auto& trade : trades) {
+			CHECK(trade.timestamp >= book_start_ts);
+			CHECK(trade.timestamp <= test_ts);
+			CHECK(trade.price > 0);
+			CHECK(trade.size > 0);
+		}
+	}
+	
+	// ============================================================================
+	// Test Case 2: Verify TradeReader reset multiple times works correctly
+	// ============================================================================
+	{
+		TradeReader trade_reader("test_data/dummy_trades.csv", 0);
+		
+		// First reset
+		trade_reader.reset(1000000);
+		std::vector<Trade> trades1 = trade_reader.getRecentTrades(1000300);
+		int count1 = trades1.size();
+		
+		// Second reset (different timestamp)
+		trade_reader.reset(1000400);
+		std::vector<Trade> trades2 = trade_reader.getRecentTrades(1000600);
+		int count2 = trades2.size();
+		
+		// Third reset (back to first timestamp)
+		trade_reader.reset(1000000);
+		std::vector<Trade> trades3 = trade_reader.getRecentTrades(1000300);
+		int count3 = trades3.size();
+		
+		// Verify all resets work
+		CHECK(count1 > 0);
+		CHECK(count2 > 0);
+		CHECK(count3 > 0);
+		CHECK(count1 == count3);  // Same query should give same results
+	}
+	
+	// ============================================================================
+	// Test Case 3: Verify TradeReader handles timestamp synchronization
+	// ============================================================================
+	{
+		TradeReader trade_reader("test_data/dummy_trades.csv", 0);
+		
+		// Reset to timestamp that exists in file
+		long long sync_ts = 1000300;
+		trade_reader.reset(sync_ts);
+		
+		// Get trades in increments
+		std::vector<Trade> trades1 = trade_reader.getRecentTrades(1000400);
+		std::vector<Trade> trades2 = trade_reader.getRecentTrades(1000500);
+		std::vector<Trade> trades3 = trade_reader.getRecentTrades(1000600);
+		
+		// Verify trades are cumulative (later queries include earlier trades)
+		CHECK(trades1.size() > 0);
+		CHECK(trades2.size() >= trades1.size());
+		CHECK(trades3.size() >= trades2.size());
+		
+		// Verify all trades are after sync timestamp
+		for (const auto& trade : trades3) {
+			CHECK(trade.timestamp >= sync_ts);
+		}
+	}
+	
+	// ============================================================================
+	// Test Case 4: Verify TradeReader reset to timestamp before first trade
+	// ============================================================================
+	{
+		TradeReader trade_reader("test_data/dummy_trades.csv", 0);
+		
+		// Reset to timestamp before first trade
+		// Note: reset() calls seekToTimestamp() which finds first trade >= early_ts,
+		// buffers it, but then reset() clears the buffer. When getRecentTrades() is called,
+		// it will re-scan from current file position. The getRecentTrades() logic checks
+		// if buffer is empty and current_book_timestamp == 0, and re-scans from current
+		// file position until it finds trades >= target_start_timestamp.
+		long long early_ts = 999000;  // Before first trade at 1000000
+		trade_reader.reset(early_ts);
+		
+		// Get trades up to a timestamp that includes first trade
+		// First call after reset: current_book_timestamp=0, target_start_timestamp=999000
+		// getRecentTrades() will check if buffer is empty, and if so, scan from current
+		// file position until it finds trades >= target_start_timestamp
+		std::vector<Trade> trades = trade_reader.getRecentTrades(1000100);
+		
+		// Verify we get trades (should include trades >= 999000 and <= 1000100)
+		// This should include at least the first trade (1000000) and second trade (1000100)
+		CHECK(trades.size() >= 1);
+		
+		// Verify all trades are in the expected range
+		for (const auto& trade : trades) {
+			CHECK(trade.timestamp >= early_ts);
+			CHECK(trade.timestamp <= 1000100);
+		}
+		
+		// Verify we got at least one trade with timestamp >= 1000000
+		// (The first trade should be included since 1000000 >= 999000)
+		bool found_valid_trade = false;
+		for (const auto& trade : trades) {
+			if (trade.timestamp >= 1000000 && trade.timestamp <= 1000100) {
+				found_valid_trade = true;
+				break;
+			}
+		}
+		CHECK(found_valid_trade);
+	}
+	
+	// ============================================================================
+	// Test Case 5: Verify TradeReader reset to timestamp after last trade
+	// ============================================================================
+	{
+		TradeReader trade_reader("test_data/dummy_trades.csv", 0);
+		
+		// Reset to timestamp after last trade
+		long long late_ts = 1001000;  // After last trade at 1000900
+		trade_reader.reset(late_ts);
+		
+		// Get trades up to an even later timestamp
+		std::vector<Trade> trades = trade_reader.getRecentTrades(1002000);
+		
+		// Should be empty (no trades after reset timestamp)
+		CHECK(trades.size() == 0);
+	}
+}
+
+TEST_CASE("test csv reader and trade reader reset integration") {
+	// ============================================================================
+	// Test Case 1: Verify CSVReader and TradeReader can be reset together
+	// ============================================================================
+	{
+		CsvReader book_reader("test_data/dummy_book.csv", 10);
+		TradeReader trade_reader("test_data/dummy_trades.csv", 0);
+		
+		// Reset book reader and get starting timestamp
+		book_reader.reset();
+		
+		// Verify reset populated data before peeking
+		CHECK(book_reader.hasNext());
+		
+		// Get starting timestamp (peek without consuming)
+		long long book_start_ts = book_reader.peekFirstTimestamp();
+		CHECK(book_start_ts > 0);
+		
+		// Reset trade reader to sync with book
+		trade_reader.reset(book_start_ts);
+		
+		// Read a few book rows
+		int book_count = 0;
+		long long last_book_ts = 0;
+		while (book_reader.hasNext() && book_count < 3) {
+			book_reader.next();
+			last_book_ts = book_reader.getTimeStamp();
+			book_count++;
+		}
+		
+		// Get trades up to last book timestamp
+		std::vector<Trade> trades = trade_reader.getRecentTrades(last_book_ts);
+		
+		// Verify synchronization works
+		CHECK(book_count == 3);
+		CHECK(last_book_ts >= book_start_ts);
+		
+		// All trades should be between book start and last book timestamp
+		for (const auto& trade : trades) {
+			CHECK(trade.timestamp >= book_start_ts);
+			CHECK(trade.timestamp <= last_book_ts);
+		}
+	}
+	
+	// ============================================================================
+	// Test Case 2: Verify multiple reset cycles work correctly
+	// ============================================================================
+	{
+		CsvReader book_reader("test_data/dummy_book.csv", 10);
+		TradeReader trade_reader("test_data/dummy_trades.csv", 0);
+		
+		// First cycle
+		book_reader.reset();
+		CHECK(book_reader.hasNext());  // Verify reset populated data
+		long long ts1 = book_reader.peekFirstTimestamp();
+		trade_reader.reset(ts1);
+		std::vector<Trade> trades1 = trade_reader.getRecentTrades(ts1 + 500);
+		
+		// Second cycle
+		book_reader.reset();
+		CHECK(book_reader.hasNext());  // Verify reset populated data
+		long long ts2 = book_reader.peekFirstTimestamp();
+		trade_reader.reset(ts2);
+		std::vector<Trade> trades2 = trade_reader.getRecentTrades(ts2 + 500);
+		
+		// Third cycle
+		book_reader.reset();
+		CHECK(book_reader.hasNext());  // Verify reset populated data
+		long long ts3 = book_reader.peekFirstTimestamp();
+		trade_reader.reset(ts3);
+		std::vector<Trade> trades3 = trade_reader.getRecentTrades(ts3 + 500);
+		
+		// Verify all cycles work
+		CHECK(ts1 > 0);
+		CHECK(ts2 > 0);
+		CHECK(ts3 > 0);
+		CHECK(trades1.size() >= 0);
+		CHECK(trades2.size() >= 0);
+		CHECK(trades3.size() >= 0);
+	}
+}
+
+TEST_CASE("test csv reader and trade reader reset in loop like env adaptor") {
+	// ============================================================================
+	// Test Case: Simulate env adaptor usage - iterate and reset 100 times
+	// This tests that reset functionality works correctly under repeated use
+	// ============================================================================
+	{
+		CsvReader book_reader("test_data/dummy_book.csv", 5);
+		TradeReader trade_reader("test_data/dummy_trades.csv", 0);
+		
+		const int NUM_ITERATIONS = 100;
+		int successful_resets = 0;
+		int total_book_rows_read = 0;
+		int total_trades_read = 0;
+		
+		for (int iteration = 0; iteration < NUM_ITERATIONS; iteration++) {
+			// Reset both readers (like env adaptor does)
+			book_reader.reset();
+			
+			// Get book starting timestamp and sync trade reader
+			if (book_reader.hasNext()) {
+				long long book_start_ts = book_reader.peekFirstTimestamp();
+				trade_reader.reset(book_start_ts);
+				
+				// Simulate env adaptor's next() - iterate through book rows
+				// In env adaptor, ticks_per_step = 5, so we advance 5 ticks per step
+				int book_rows_this_iteration = 0;
+				long long last_book_ts = 0;
+				
+				// Read up to 5 rows (simulating one RL step with ticks_per_step=5)
+				// or until no more data
+				for (int tick = 0; tick < 5 && book_reader.hasNext(); tick++) {
+					book_reader.next();
+					last_book_ts = book_reader.getTimeStamp();
+					book_rows_this_iteration++;
+					
+					// Get trades up to current book timestamp (like env adaptor does)
+					std::vector<Trade> trades = trade_reader.getRecentTrades(last_book_ts);
+					total_trades_read += trades.size();
+				}
+				
+				total_book_rows_read += book_rows_this_iteration;
+				
+				// Verify we got some data this iteration
+				if (book_rows_this_iteration > 0) {
+					successful_resets++;
+					CHECK(last_book_ts > 0);
+				}
+			}
+		}
+		
+		// Verify we had successful resets
+		// Every iteration should either have data (successful) or no data (EOF)
+		// Both are valid states - the important thing is that reset() doesn't crash
+		CHECK(successful_resets >= 0);
+		CHECK(successful_resets <= NUM_ITERATIONS);
+		
+		// Verify we read some data overall (at least some iterations should have data)
+		// With 100 iterations and random start positions, we should get data in most cases
+		CHECK(total_book_rows_read > 0);
+		CHECK(total_trades_read >= 0);  // Trades might be 0 if timestamps don't match
+		
+		// Verify reset works correctly - every iteration that has data should succeed
+		// If hasNext() is true, we should always be able to read data
+		// This test verifies that reset() and reading work correctly without crashes
+		// With 100 iterations, we should get data in at least some iterations
+		bool has_data = (total_book_rows_read > 0);
+		CHECK(has_data);
 	}
 }

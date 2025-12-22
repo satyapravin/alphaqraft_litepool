@@ -74,7 +74,7 @@ env = litepool.make(
     foldername="/home/pravin/dev/alphaqraft_litepool/data/training/",
     balance=100000.0,  # Starting capital: $100,000 USD
                        # With BTC ~$100k, 2% of $100k = $2,000 = ~0.02 BTC per order
-    start=360000,
+    start=36000,
     max_episode_steps=2048,  # 
     base_spread_bps=BASE_SPREAD_BPS,  # Base spread in basis points
     min_size_pct=MIN_SIZE_PCT,        # Minimum order size as % of balance
@@ -174,6 +174,9 @@ def train():
         start_epoch, global_step = resume
         start_epoch += 1
         print(f"Resuming from epoch {start_epoch}, step {global_step}")
+        # CRITICAL: Reset collector state to ensure clean start after checkpoint load
+        # This forces env.reset() on first collect() and clears stale hidden states
+        collector.reset()
     else:
         start_epoch = 0
         global_step = 0

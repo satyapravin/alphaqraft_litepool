@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <fstream>
 #include <unordered_map>
+#include <random>
 
 namespace RLTrader {
     struct DataRow {
@@ -70,6 +71,14 @@ namespace RLTrader {
                 rowsPtr = ptr;
                 current = 0;  // Initialize to 0
             }
+            
+            void setCurrent(size_t pos) {
+                current = pos;
+            }
+            
+            size_t getCurrent() const {
+                return current;
+            }
 
             [[nodiscard]] bool hasNext() const {
                 return rowsPtr && current < rowsPtr->size();
@@ -114,11 +123,15 @@ namespace RLTrader {
         std::vector<std::string> headers;
         std::vector<DataRow> rows;
         static std::vector<double> parseLineToDoubles(const std::string& line);
-        void readCSV(int start_line);
+        bool readNextLine();  // Read next line from file and add to rows
         bool more_data;
         int start_read;
         int num_reads;
-        std::streampos cached_start_pos = 0;  // Cache file position after initial line skip for fast reset
+        std::streampos header_end_pos = 0;  // Position after header line
+        std::mt19937 rng_;                  // Persistent RNG for random seeking (seeded in constructor)
+        
+        // Parse header line only (no data read)
+        void parseHeaderLine(const std::string& line);
 
     public:
         CsvReader(const std::string& filename, int start_read);

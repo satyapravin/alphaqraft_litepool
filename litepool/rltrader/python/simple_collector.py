@@ -54,6 +54,19 @@ class SimpleCollector:
         self.completed_episode_unrealized_pnl = []  # Track unrealized PnL from completed episodes
         self.hidden_states = None  # Track LSTM hidden states per environment: list of (h, c) tuples
     
+    def reset(self):
+        """Reset collector state. Call after loading checkpoint to ensure clean state."""
+        self.obs = None
+        self.dones = None
+        self.episode_rewards = None
+        self.episode_steps = None
+        self.completed_episode_rewards = []
+        self.completed_episode_realized_pnl = []
+        self.completed_episode_unrealized_pnl = []
+        self.hidden_states = None
+        self._prev_episode_ended = None
+        # Note: Don't reset episode_count - preserve for logging continuity
+    
     def collect(self):
         """
         Collect experience until ALL environments complete exactly one episode.
@@ -106,9 +119,12 @@ class SimpleCollector:
         step_times = []
         last_log_step = 0
         
-        # Rollout - collect exactly n_steps
-        # With max_episode_steps = n_steps, all environments should complete at the same time
-        for step_idx in range(n_steps):
+        # Rollout - collect until ALL environments complete at least one episode
+        # With max_episode_steps = n_steps, all environments should complete at step 2048
+        # But we continue collecting until all have completed to ensure synchronization
+        step_idx = 0
+        max_steps = n_steps * 2  # Safety limit: allow up to 2x n_steps to prevent infinite loops
+        while step_idx < max_steps:
             # Timing logging every 500 steps
             if step_idx % 500 == 0 and step_idx > 0:
                 if len(step_times) > 0:
@@ -149,6 +165,17 @@ class SimpleCollector:
             # IMPORTANT: In gymnasium, dones is actually "terminated" (done & ~trunc)
             # But we want to log episodes when they end, regardless of truncation
             # So we need to check both dones (terminated) and truncs
+            # CRITICAL: Ensure truncs is a valid array (handle None or missing truncs)
+            if truncs is None:
+                # If truncs is None, assume no truncations (all False)
+                if isinstance(dones, np.ndarray):
+                    truncs = np.zeros_like(dones, dtype=bool)
+                else:
+                    truncs = False
+            elif not isinstance(truncs, np.ndarray):
+                # Convert scalar to array
+                truncs = np.array([truncs] * self.n_envs, dtype=bool)
+            
             episode_ended = dones | truncs  # Episode ends if terminated OR truncated
             
             # Track which environments ended in the PREVIOUS step (before auto-reset)
@@ -209,6 +236,10 @@ class SimpleCollector:
             # Auto-reset happens on the NEXT step in litepool.
             # Use episode_ended (dones | truncs) to catch all episode endings
             if self.log_episodes and episode_ended.any():
+                # DEBUG: Log which environments are ending and at what step
+                ending_envs = [i for i in range(self.n_envs) if episode_ended[i]]
+                ending_steps = [self.episode_steps[i] for i in ending_envs]
+                print(f"DEBUG: step_idx={step_idx}, episode_ended for envs {ending_envs} at steps {ending_steps}", flush=True)
                 self._log_episode_end(infos, episode_ended)
             
             # Mark environments that have completed their episode
@@ -218,8 +249,75 @@ class SimpleCollector:
             self.obs = next_obs
             self.dones = dones
         
+            # Increment step counter
+            step_idx += 1
+            
+            # CRITICAL: Check if all environments have completed at step 2048 (truncated)
+            # We want ALL environments to complete at max_episode_steps, not just complete any episode
+            # If an environment completes early (runs out of data), it auto-resets and starts a new episode
+            # So we need to check if ALL are truncated (completed at max_episode_steps) at the same step
+            # Note: truncs is already normalized to np.ndarray by code above (lines 169-177)
+            all_truncated = False
+            if isinstance(truncs, np.ndarray) and truncs.size > 0:
+                all_truncated = truncs.all()
+            elif truncs is True:  # Scalar True (shouldn't happen after normalization, but handle it)
+                all_truncated = True
+            
+            # Stop if all environments are truncated (completed at max_episode_steps) AND we have at least n_steps
+            if all_truncated and step_idx >= n_steps:
+                # All environments completed at max_episode_steps - synchronized completion
+                print(f"DEBUG: All environments truncated at step {step_idx}. episode_completed={episode_completed}, episode_steps={self.episode_steps}, truncs={truncs}", flush=True)
+                break
+            
+            # Also stop if all have completed at least one episode AND we've collected enough steps
+            # This handles the case where some complete early but we still want to proceed
+            if episode_completed.all() and step_idx >= n_steps:
+                # All environments completed at least one episode and we have enough data
+                # DEBUG: Log completion status
+                print(f"DEBUG: All environments completed at least one episode. step_idx={step_idx}, episode_completed={episode_completed}, episode_steps={self.episode_steps}", flush=True)
+                break
+            
+            # DEBUG: Log status every 100 steps to track progress
+            if step_idx % 100 == 0 and step_idx > 0:
+                incomplete = [i for i in range(self.n_envs) if not episode_completed[i]]
+                not_truncated = []
+                if isinstance(truncs, np.ndarray):
+                    not_truncated = [i for i in range(self.n_envs) if not truncs[i]]
+                if incomplete or not_truncated:
+                    print(f"DEBUG: step_idx={step_idx}, incomplete_envs={incomplete}, not_truncated={not_truncated}, episode_steps={self.episode_steps}, truncs={truncs if isinstance(truncs, np.ndarray) else truncs}", flush=True)
+            
+            # DEBUG: Log truncation status when we're close to n_steps
+            if step_idx >= n_steps - 10 and step_idx < n_steps + 10:
+                if isinstance(truncs, np.ndarray):
+                    truncated_envs = [i for i in range(self.n_envs) if truncs[i]]
+                    not_truncated_envs = [i for i in range(self.n_envs) if not truncs[i]]
+                    if not_truncated_envs:
+                        print(f"DEBUG: step_idx={step_idx}, truncated_envs={truncated_envs}, not_truncated_envs={not_truncated_envs}, episode_steps={self.episode_steps}", flush=True)
+        
         # All environments should complete with max_episode_steps = n_steps
         # This is verified by the episode_completed array (used for logging only)
+        
+        # Check if all environments completed
+        if not episode_completed.all():
+            incomplete_envs = [i for i in range(self.n_envs) if not episode_completed[i]]
+            print(f"WARNING: {len(incomplete_envs)} environment(s) did not complete their episode: {incomplete_envs}")
+            print(f"  Collected {step_idx} steps (requested {n_steps})")
+            print(f"  Episode completion status: {episode_completed}")
+            print(f"  Episode steps per env: {self.episode_steps}")
+            # Check final state to see why they didn't complete
+            if len(dones_list) > 0:
+                final_dones = dones_list[-1] if isinstance(dones_list[-1], np.ndarray) else np.array([dones_list[-1]])
+                final_truncs = None
+                if len(infos_list) > 0:
+                    # Try to extract trunc from last step's info
+                    last_info = infos_list[-1]
+                    # trunc is in the state, not info - we need to check the actual state
+                print(f"  Final dones: {final_dones}")
+        
+        if step_idx >= max_steps:
+            print(f"WARNING: Hit safety limit of {max_steps} steps. Some environments may not have completed.")
+            print(f"  Episode completion status: {episode_completed}")
+            print(f"  Episode steps per env: {self.episode_steps}")
         
         # Get bootstrap value with current hidden states
         with torch.no_grad():
@@ -387,79 +485,93 @@ class SimpleCollector:
         before auto-reset (since regular info keys are reset to 0 after auto-reset).
         
         Args:
-            infos: Info dict from env.step()
+            infos: Info dict from env.step() (can be dict or list of dicts)
             episode_ended: Boolean array indicating which environments ended (dones | truncs)
         """
         for env_id in range(self.n_envs):
             if episode_ended[env_id]:
-                self.episode_count += 1
-                
-                # Use final_* keys which have terminal info cached before reset
-                realized_pnl = 0.0
-                unrealized_pnl = 0.0
-                trade_count = 0.0
-                fees = 0.0
-                net_amount_btc = 0.0
-                
-                if isinstance(infos, dict):
-                    # First try final_* keys (cached terminal info)
-                    if 'final_realized_pnl' in infos:
-                        val = infos['final_realized_pnl']
-                        realized_pnl = float(val[env_id] if hasattr(val, '__getitem__') else val)
-                    if 'final_unrealized_pnl' in infos:
-                        val = infos['final_unrealized_pnl']
-                        unrealized_pnl = float(val[env_id] if hasattr(val, '__getitem__') else val)
-                    if 'final_trade_count' in infos:
-                        val = infos['final_trade_count']
-                        trade_count = float(val[env_id] if hasattr(val, '__getitem__') else val)
-                    if 'final_fees' in infos:
-                        val = infos['final_fees']
-                        fees = float(val[env_id] if hasattr(val, '__getitem__') else val)
-                    if 'final_net_amount_btc' in infos:
-                        val = infos['final_net_amount_btc']
-                        net_amount_btc = float(val[env_id] if hasattr(val, '__getitem__') else val)
+                try:
+                    self.episode_count += 1
                     
-                    # Fallback to regular keys if final_* are 0 (episode ended normally, not auto-reset)
-                    if realized_pnl == 0 and trade_count == 0:
-                        if 'realized_pnl' in infos:
-                            val = infos['realized_pnl']
-                            realized_pnl = float(val[env_id] if hasattr(val, '__getitem__') else val)
-                        if 'unrealized_pnl' in infos:
-                            val = infos['unrealized_pnl']
-                            unrealized_pnl = float(val[env_id] if hasattr(val, '__getitem__') else val)
-                        if 'trade_count' in infos:
-                            val = infos['trade_count']
-                            trade_count = float(val[env_id] if hasattr(val, '__getitem__') else val)
-                        if 'fees' in infos:
-                            val = infos['fees']
-                            fees = float(val[env_id] if hasattr(val, '__getitem__') else val)
-                        if 'net_amount_btc' in infos:
-                            val = infos['net_amount_btc']
-                            net_amount_btc = float(val[env_id] if hasattr(val, '__getitem__') else val)
+                    # Use final_* keys which have terminal info cached before reset
+                    realized_pnl = 0.0
+                    unrealized_pnl = 0.0
+                    trade_count = 0.0
+                    fees = 0.0
+                    net_amount_btc = 0.0
+                    
+                    # Handle both dict (shared keys) and list (per-env dicts) structures
+                    env_info = None
+                    if isinstance(infos, dict):
+                        env_info = infos
+                    elif isinstance(infos, (list, tuple)) and len(infos) > env_id:
+                        env_info = infos[env_id]
+                    
+                    if env_info is not None and isinstance(env_info, dict):
+                        # First try final_* keys (cached terminal info)
+                        if 'final_realized_pnl' in env_info:
+                            val = env_info['final_realized_pnl']
+                            realized_pnl = float(val if not hasattr(val, '__getitem__') or not hasattr(val, '__len__') or len(val) <= env_id else val[env_id])
+                        if 'final_unrealized_pnl' in env_info:
+                            val = env_info['final_unrealized_pnl']
+                            unrealized_pnl = float(val if not hasattr(val, '__getitem__') or not hasattr(val, '__len__') or len(val) <= env_id else val[env_id])
+                        if 'final_trade_count' in env_info:
+                            val = env_info['final_trade_count']
+                            trade_count = float(val if not hasattr(val, '__getitem__') or not hasattr(val, '__len__') or len(val) <= env_id else val[env_id])
+                        if 'final_fees' in env_info:
+                            val = env_info['final_fees']
+                            fees = float(val if not hasattr(val, '__getitem__') or not hasattr(val, '__len__') or len(val) <= env_id else val[env_id])
+                        if 'final_net_amount_btc' in env_info:
+                            val = env_info['final_net_amount_btc']
+                            net_amount_btc = float(val if not hasattr(val, '__getitem__') or not hasattr(val, '__len__') or len(val) <= env_id else val[env_id])
+                        
+                        # Fallback to regular keys if final_* are 0 (episode ended normally, not auto-reset)
+                        if realized_pnl == 0 and trade_count == 0:
+                            if 'realized_pnl' in env_info:
+                                val = env_info['realized_pnl']
+                                realized_pnl = float(val if not hasattr(val, '__getitem__') or not hasattr(val, '__len__') or len(val) <= env_id else val[env_id])
+                            if 'unrealized_pnl' in env_info:
+                                val = env_info['unrealized_pnl']
+                                unrealized_pnl = float(val if not hasattr(val, '__getitem__') or not hasattr(val, '__len__') or len(val) <= env_id else val[env_id])
+                            if 'trade_count' in env_info:
+                                val = env_info['trade_count']
+                                trade_count = float(val if not hasattr(val, '__getitem__') or not hasattr(val, '__len__') or len(val) <= env_id else val[env_id])
+                            if 'fees' in env_info:
+                                val = env_info['fees']
+                                fees = float(val if not hasattr(val, '__getitem__') or not hasattr(val, '__len__') or len(val) <= env_id else val[env_id])
+                            if 'net_amount_btc' in env_info:
+                                val = env_info['net_amount_btc']
+                                net_amount_btc = float(val if not hasattr(val, '__getitem__') or not hasattr(val, '__len__') or len(val) <= env_id else val[env_id])
                 
-                net_pnl = realized_pnl + unrealized_pnl - fees
-                
-                # Get cumulative reward for this episode (normalized, fraction of balance)
-                episode_reward = self.episode_rewards[env_id]
-                
-                # Track completed episode statistics for epoch average
-                self.completed_episode_rewards.append(episode_reward)
-                self.completed_episode_realized_pnl.append(realized_pnl)
-                self.completed_episode_unrealized_pnl.append(unrealized_pnl)
-                
-                # Get episode step count before resetting
-                episode_steps = int(self.episode_steps[env_id])
-                
-                # Reset reward accumulator and step count for this environment
-                self.episode_rewards[env_id] = 0.0
-                self.episode_steps[env_id] = 0
-                
-                print(f"  [Episode {self.episode_count:4d}] Env {env_id} | Steps {episode_steps:5d} | "
-                      f"Reward {episode_reward:8.4f} | "
-                      f"R.PnL ${realized_pnl:8.4f} | "
-                      f"U.PnL ${unrealized_pnl:8.4f} | "
-                      f"Fees ${fees:6.4f} | "
-                      f"Net ${net_pnl:8.4f} | "
-                      f"Trades {int(trade_count):3d} | "
-                      f"Pos {net_amount_btc:7.5f} BTC", flush=True)
+                    net_pnl = realized_pnl + unrealized_pnl - fees
+                    
+                    # Get cumulative reward for this episode (normalized, fraction of balance)
+                    episode_reward = self.episode_rewards[env_id]
+                    
+                    # Track completed episode statistics for epoch average
+                    self.completed_episode_rewards.append(episode_reward)
+                    self.completed_episode_realized_pnl.append(realized_pnl)
+                    self.completed_episode_unrealized_pnl.append(unrealized_pnl)
+                    
+                    # Get episode step count before resetting
+                    episode_steps = int(self.episode_steps[env_id])
+                    
+                    # Reset reward accumulator and step count for this environment
+                    self.episode_rewards[env_id] = 0.0
+                    self.episode_steps[env_id] = 0
+                    
+                    print(f"  [Episode {self.episode_count:4d}] Env {env_id} | Steps {episode_steps:5d} | "
+                          f"Reward {episode_reward:8.4f} | "
+                          f"R.PnL ${realized_pnl:8.4f} | "
+                          f"U.PnL ${unrealized_pnl:8.4f} | "
+                          f"Fees ${fees:6.4f} | "
+                          f"Net ${net_pnl:8.4f} | "
+                          f"Trades {int(trade_count):3d} | "
+                          f"Pos {net_amount_btc:7.5f} BTC", flush=True)
+                except Exception as e:
+                    # Log error but continue with other environments
+                    print(f"  WARNING: Failed to log episode end for Env {env_id}: {e}", flush=True)
+                    # Still reset counters to prevent accumulation
+                    self.episode_rewards[env_id] = 0.0
+                    self.episode_steps[env_id] = 0
 

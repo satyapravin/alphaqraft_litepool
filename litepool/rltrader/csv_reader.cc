@@ -23,44 +23,47 @@ using namespace RLTrader;
 CsvReader::CsvReader(const std::string& fname, int start_read_lines):filename(fname), // NOLINT(*-pass-by-value)
                                                                                          more_data(true), start_read(start_read_lines),
                                                                                          num_reads(0), rows{} {
+    // Seed RNG with random_device for unpredictable randomization
+    // This is done once at construction, not on every reset
+    std::random_device rd;
+    rng_.seed(rd());
+}
+
+void CsvReader::parseHeaderLine(const std::string& line) {
+    // Parse header line to extract column names (skip first 4 columns)
+    std::istringstream headerStream(line);
+    std::string header;
+    std::getline(headerStream, header, ','); // Skip exchange
+    std::getline(headerStream, header, ','); // Skip symbol
+    std::getline(headerStream, header, ','); // Skip timestamp (will be used as ID)
+    std::getline(headerStream, header, ','); // Skip local_timestamp
+
+    headers.clear();
+    while (std::getline(headerStream, header, ',')) {
+        headers.push_back(header);
+    }
 }
 
 bool CsvReader::hasNext() {
     bool retval = this->iterator.hasNext();
     if (!retval) {
         if (more_data) {
-            // Continue reading sequentially from current file position
-            // (start_line parameter is ignored when headers already exist)
-            // Guard: Clear EOF flag before reading to ensure we can read more data
-            if (filestream.eof()) {
-                filestream.clear();  // Clear EOF flag
-            }
-            
-            // CRITICAL: Check if file stream is actually readable before calling readCSV
-            // If file is at EOF and stream is bad, don't try to read
-            if (!filestream.good() && filestream.eof()) {
+            // Read next line from file
+            // The iterator's current is at rows.size() (exhausted)
+            // After adding a line, current < rows.size() should be true
+            if (readNextLine()) {
+                // Re-populate iterator to ensure pointer is valid after vector might have reallocated
+                // But preserve current position (don't reset to 0)
+                size_t saved_current = this->iterator.getCurrent();
+                this->iterator.populate(&rows);
+                this->iterator.setCurrent(saved_current);
+                return this->iterator.hasNext();
+            } else {
+                // No more data available
                 more_data = false;
                 return false;
             }
-            
-            // Store current more_data state before readCSV
-            bool had_more_data = more_data;
-            this->readCSV(0);
-            this->iterator.populate(&rows);
-            
-            // CRITICAL BUG FIX: If readCSV read 0 rows, more_data should be false
-            // But if it's still true, we have an infinite loop risk
-            // Check if rows is still empty after readCSV
-            if (rows.empty() && had_more_data && more_data) {
-                // This shouldn't happen, but if it does, we're stuck
-                // Set more_data to false to prevent infinite loop
-                more_data = false;
-                return false;
-            }
-            
-            return this->iterator.hasNext();
-        }
-        else {
+        } else {
             // No more data available - episode should end
             return false;
         }
@@ -88,8 +91,13 @@ double CsvReader::getDouble(const std::string& keyName) const {
 long long CsvReader::peekFirstTimestamp() const {
     // Peek at first row without consuming it
     // After reset, iterator is at position 0, so rows[0] is the first row
+    // CRITICAL: Check if rows is empty or if iterator is not populated
     if (rows.empty()) {
-        throw std::runtime_error("No data available to peek");
+        throw std::runtime_error("No data available to peek - rows is empty");
+    }
+    // Also check if iterator is pointing to valid data
+    if (!iterator.hasNext()) {
+        throw std::runtime_error("No data available to peek - iterator has no next");
     }
     // Access first row directly (iterator is at position 0 after reset)
     return rows[0].id;
@@ -101,167 +109,130 @@ void CsvReader::rewindIterator() {
 }
 
 void CsvReader::reset() {
-    // Guard: Reset state
+    // === Reset State ===
     num_reads = 0;
     iterator.reset();
     more_data = true;
-    
-    // Clear iterator's pointer before clearing rows
     iterator.populate(nullptr);
-    rows.clear();
-    rows.shrink_to_fit();  // Release memory to prevent accumulation
+    // Don't clear rows here - readCSV() will clear it, avoiding double-clear and slow destruction
     
-    // OPTIMIZATION: If we've already parsed headers and cached the start position,
-    // seek directly to it instead of re-scanning line by line.
-    // This makes auto-reset O(1) instead of O(start_line).
-    if (cached_start_pos > 0 && !headers.empty()) {
-        // Fast path: seek to cached position
-        if (!this->filestream.is_open()) {
-            this->filestream.open(filename, std::ios::in);
-        }
-        this->filestream.clear();
-        this->filestream.seekg(cached_start_pos, std::ios::beg);
-        // Read next batch from cached position
-        this->readCSV(0);  // start_line=0 since we've already seeked
-    } else {
-        // First time: do full line-by-line scan and cache position
-        headers.clear();
-        
-        std::random_device rd;  
-        std::mt19937 gen(rd()); 
-        std::uniform_int_distribution<> distr(0, start_read);
-        int start_line = distr(gen);
-        
-        // Guard: Verify start_line is within valid range
-        if (start_line < 0 || start_line > start_read) {
-            throw std::runtime_error("Invalid start_line: " + std::to_string(start_line));
-        }
-        
-        if (this->filestream.is_open()) {
-            this->filestream.close();
-        }
+    // === Generate Random Start Position ===
+    // Use persistent RNG (seeded in constructor) for consistent randomization
+    std::uniform_int_distribution<> distr(0, start_read);
+    int start_line = distr(rng_);
+    
+    // === Ensure File Is Open ===
+    if (!this->filestream.is_open()) {
         this->filestream.open(filename, std::ios::in);
         if (!this->filestream.is_open()) {
             throw std::runtime_error("Could not open file: " + filename);
         }
-        this->readCSV(start_line);
-        
-        // Cache the file position after skipping lines (for fast reset)
-        cached_start_pos = filestream.tellg();
     }
+    filestream.clear();
+    
+    // === Parse Header If First Time ===
+    if (headers.empty()) {
+        filestream.seekg(0, std::ios::beg);
+        std::string header_line;
+        if (!std::getline(filestream, header_line)) {
+            throw std::runtime_error("Failed to read header line from: " + filename);
+        }
+        parseHeaderLine(header_line);
+        header_end_pos = filestream.tellg();
+        filestream.clear();
+    }
+    
+    // === Seek to Random Position (Line-by-Line for Exact Positioning) ===
+    filestream.seekg(header_end_pos, std::ios::beg);
+    filestream.clear();
+    
+    // Use line-by-line seeking for exact positioning (required for backtesting)
+    std::string line;
+    for (int i = 0; i < start_line && std::getline(filestream, line); ++i) {
+        // Skip lines until we reach the random start position
+    }
+    
+    // === Read First Line ===
+    // Clear rows and read the first line at the random start position
+    std::vector<DataRow>().swap(rows);
+    readNextLine();
     
     this->iterator.populate(&rows);
     
-    // Guard: Verify reset completed successfully
-    if (num_reads < 0) {
-        throw std::runtime_error("num_reads is negative after reset");
+    // === Validate Reset ===
+    if (rows.empty()) {
+        more_data = false;
     }
 }
 
-void CsvReader::readCSV(int start_line) {
+bool CsvReader::readNextLine() {
     if (!filestream.is_open()) {
-        throw std::runtime_error("Could not open file");
+        more_data = false;
+        return false;
+    }
+
+    // Clear stream state before reading (EOF/fail bits from previous ops)
+    if (filestream.eof()) {
+        filestream.clear();
+    }
+    
+    // Check stream state before reading
+    if (!filestream.good() && filestream.eof()) {
+        more_data = false;
+        return false;
     }
 
     std::string line;
-    bool batch_read = false;
+    if (!std::getline(filestream, line)) {
+        // EOF reached
+        more_data = false;
+        return false;
+    }
 
+    // Parse the line
+    ++num_reads;
+    std::istringstream lineStream(line);
+    std::string cell;
+
+    // Skip exchange (1st column)
+    if (!std::getline(lineStream, cell, ',')) {
+        // Empty or malformed line - try next line
+        return readNextLine();
+    }
+
+    // Skip symbol (2nd column)
+    if (!std::getline(lineStream, cell, ',')) {
+        return readNextLine();
+    }
+
+    // Use timestamp (3rd column) as ID
+    if (!std::getline(lineStream, cell, ',')) {
+        return readNextLine();
+    }
+    
+    long long id;
     try {
-        if (headers.empty()) {
-            filestream.clear();
-            filestream.seekg(0, std::ios::beg);
-            if (!std::getline(filestream, line)) {
-                throw std::runtime_error("Failed to read header line");
-            }
-
-            std::istringstream headerStream(line);
-            std::string header;
-            std::getline(headerStream, header, ','); // Skip exchange
-            std::getline(headerStream, header, ','); // Skip symbol
-            std::getline(headerStream, header, ','); // Skip timestamp (will be used as ID)
-            std::getline(headerStream, header, ','); // Skip local_timestamp
-
-            while (std::getline(headerStream, header, ',')) {
-                headers.push_back(header);
-            }
-
-            // Skip to start_line, but handle case where file is shorter than expected
-            for(int linenum = 0; linenum < start_line; ++linenum) {
-                if (!std::getline(filestream, line)) {
-                    // File is shorter than expected - set more_data to false and return
-                    more_data = false;
-                    rows.clear();
-                    return;  // Exit early - no data available
-                }
-            }
-        }
-
-        rows.clear();
-        int num_lines = 0;
-        
-        // Guard: Ensure file stream is in good state before reading
-        if (!filestream.good() && !filestream.eof()) {
-            more_data = false;
-            return;  // File stream is in bad state
-        }
-        
-        while (std::getline(filestream, line)) {
-            ++num_reads;
-            std::istringstream lineStream(line);
-            std::string cell;
-
-            // Skip exchange (1st column)
-            if (!std::getline(lineStream, cell, ',')) {
-                continue;  // Skip malformed lines
-            }
-
-            // Skip symbol (2nd column)
-            if (!std::getline(lineStream, cell, ',')) {
-                continue;  // Skip malformed lines
-            }
-
-            // Use timestamp (3rd column) as ID
-            if (!std::getline(lineStream, cell, ',')) {
-                continue;  // Skip malformed lines
-            }
-            long long id = std::stoll(cell);
-            
-            // Skip local_timestamp (4th column) in parseLineToDoubles
-            std::vector<double> values = parseLineToDoubles(line);
-
-            if (values.size() != headers.size()) {
-                LOG(WARNING) << "Skipping malformed line: " << line;
-                continue;  // Skip malformed lines
-            }
-
-            std::unordered_map<std::string, double> data;
-            for (size_t i = 0; i < values.size(); ++i) {
-                data[headers[i]] = values[i];
-            }
-
-            rows.emplace_back(id, data);
-
-            if (++num_lines >= 2500) {
-                batch_read = true;
-                break;
-            }
-        }
-
-        // Guard: Verify data availability
-        // If we read 0 rows, we've reached end of file
-        if (!batch_read) {
-            more_data = false;  // End of file reached
-        }
-        
-        // Guard: If rows is empty after reading, no more data available
-        if (rows.empty() && !batch_read) {
-            more_data = false;
-        }
+        id = std::stoll(cell);
+    } catch (...) {
+        // Invalid timestamp - skip this line
+        return readNextLine();
     }
-    catch (const std::exception& e) {
-        more_data = false;  // Exception means no more data
-        throw std::runtime_error("Error reading CSV: " + std::string(e.what()));
+    
+    // Parse remaining columns as doubles
+    std::vector<double> values = parseLineToDoubles(line);
+
+    if (values.size() != headers.size()) {
+        // Malformed line - skip
+        return readNextLine();
     }
+
+    std::unordered_map<std::string, double> data;
+    for (size_t i = 0; i < values.size(); ++i) {
+        data[headers[i]] = values[i];
+    }
+
+    rows.emplace_back(id, data);
+    return true;
 }
 
 std::vector<double> CsvReader::parseLineToDoubles(const std::string& line) {

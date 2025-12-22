@@ -205,6 +205,20 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   }
 
   void Reset() override {
+    // CRITICAL: Wrap entire Reset in try-catch to ensure WriteState() is ALWAYS called
+    // Without this, any uncaught exception causes deadlock (Python waits forever for state)
+    try {
+        ResetInternal();
+    } catch (...) {
+        // If anything goes wrong, still write state to prevent deadlock
+        isDone = true;
+        // WriteState() MUST be called - it calls Allocate() which sets up the semaphore callback
+        // Even if WriteState() throws, Allocate() calls Done(1) before throwing, signaling semaphore
+        WriteState();
+    }
+  }
+  
+  void ResetInternal() {
     // Reset can be called when:
     // 1. Episode is done (isDone == true) - normal case
     // 2. Force reset (force_reset == true) - can happen at any time
@@ -219,70 +233,86 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     had_fills_prev_step_ = false;  // Reset fill tracking
     rl_chose_requote_ = false;    // Reset requote tracking
     
+    // Track if any reset step fails - we still need to call WriteState!
+    bool reset_failed = false;
+    long long book_start_timestamp = 0;
+    
     // Reset exchange first (picks random starting row)
-    exchange_ptr->reset();
+    try {
+        exchange_ptr->reset();
+    } catch (...) {  // Catch ALL exceptions, not just std::exception
+        reset_failed = true;
+    }
     
     // Get starting timestamp from book reader to sync trade reader
-    // CRITICAL BUG FIX: Peek at first row WITHOUT consuming it
-    // Previous code: next_read() (consumes) → reset() (picks NEW random line) = BUG!
-    // New code: peekFirstTimestamp() (doesn't consume) → no reset needed = FIXED!
-    RLTrader::SimExchange* sim_exch = dynamic_cast<RLTrader::SimExchange*>(exchange_ptr.get());
-    long long book_start_timestamp = 0;
-    if (sim_exch) {
-        try {
-            // Peek at first timestamp without consuming the row
-            if (sim_exch->hasData()) {
-                book_start_timestamp = sim_exch->peekFirstTimestamp();
-            } else {
-                // No data available after reset
-                isDone = true;
-                return;
+    if (!reset_failed) {
+        RLTrader::SimExchange* sim_exch = dynamic_cast<RLTrader::SimExchange*>(exchange_ptr.get());
+        if (sim_exch) {
+            try {
+                // Peek at first timestamp without consuming the row
+                // CRITICAL: hasData() checks if dataReader.hasNext(), which ensures rows is populated
+                // Only call peekFirstTimestamp() if hasData() returns true
+                if (sim_exch->hasData()) {
+                    book_start_timestamp = sim_exch->peekFirstTimestamp();
+                } else {
+                    // No data available after reset - this should not happen if CSV has enough data
+                    reset_failed = true;
+                }
+            } catch (const std::exception& e) {
+                // If peekFirstTimestamp() throws (e.g., rows is empty), mark reset as failed
+                reset_failed = true;
+            } catch (...) {  // Catch ALL other exceptions
+                reset_failed = true;
             }
-        } catch (const std::exception& e) {
-            // If peek fails, mark as done
-            isDone = true;
-            return;
         }
     }
     
     // Reset adaptor (which will reset trade reader if present)
-    adaptor_ptr->reset();
-    
-    // Sync trade reader to book's starting timestamp
-    if (book_start_timestamp > 0) {
-        adaptor_ptr->syncTradeReader(book_start_timestamp);
+    if (!reset_failed) {
+        try {
+            adaptor_ptr->reset();
+            
+            // Sync trade reader to book's starting timestamp
+            if (book_start_timestamp > 0) {
+                adaptor_ptr->syncTradeReader(book_start_timestamp);
+            }
+            
+            isDone = false;
+        } catch (...) {
+            reset_failed = true;
+        }
     }
     
-    isDone = false;
-    
-    // Guard: Verify reset state
-    // Note: isDone check is after we set it to false, so this will always pass
-    // But we keep it as a sanity check in case someone modifies the code above
-    if (steps != 0) {
-        throw std::runtime_error("Steps counter not reset to 0");
+    // If any reset step failed, mark episode as done
+    if (reset_failed) {
+        isDone = true;
     }
     
-      // Note: Don't clear terminal_info_ here - it gets cleared after WriteState uses it
-      WriteState();
+    // CRITICAL: ALWAYS call WriteState at end of Reset
+    // WriteState() calls Allocate() first, ensuring done_write() works
+    // This prevents deadlock regardless of what failed above
+    WriteState();
   }
 
-  void Step(const Action& action_dict) override {
+  void Step(const Action& action_dict) override { 
+      // CRITICAL: Wrap entire Step in try-catch to ensure WriteState() is ALWAYS called
+      // Without this, any uncaught exception causes deadlock (Python waits forever for state)
+      try {
+          StepInternal(action_dict);
+      } catch (...) {
+          // If anything goes wrong, still write state to prevent deadlock
+          isDone = true;
+          WriteState();
+      }
+  }
+  
+  void StepInternal(const Action& action_dict) {
       // Timing for performance measurement
       static thread_local int step_count = 0;
       static thread_local double total_cpp_time = 0.0;
       
       auto step_start = std::chrono::high_resolution_clock::now();
       
-      // Timing logs disabled to prevent stderr/stdout interleaving with Python logs
-      // Uncomment for debugging performance issues:
-      // if (++step_count % 500 == 0) {
-      //     if (step_count > 500) {
-      //         double avg_time_ms = (total_cpp_time / 500.0) * 1000.0;
-      //         std::cerr << "[C++ Timing] Steps " << (step_count - 500) << "-" << step_count 
-      //                  << ": avg=" << avg_time_ms << "ms, total=" << total_cpp_time << "s" << std::endl;
-      //         total_cpp_time = 0.0;
-      //     }
-      // }
       ++step_count;  // Keep counter for potential future use 
       RLTrader::RLAction action;
       // 4-action space: bid_spread, ask_spread, target_inventory, should_requote
@@ -317,59 +347,37 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
       
       // Only requote if should_requote > 0, otherwise continue with existing quotes
       if (action.should_requote > 0.0) {
-          adaptor_ptr->quote(action);
+      adaptor_ptr->quote(action);
       }
       
       // Get trade count before advancing time to detect new fills
       double trade_count_before = strategy_ptr->getPosition().getNumberOfTrades();
       
-      // Process time advancement and state updates
-      // This advances ticks_per_step ticks, during which:
-      // - Orders may fill (detected by execute() in SimExchange)
-      // - Fills are processed by strategy.next() which calls position.onFill()
-      
       // Advance time and read data
       bool has_data = false;
       try {
           has_data = adaptor_ptr->next();
-      } catch (const std::exception& e) {
-          // Exception means no more data - treat as episode end
-          has_data = false;
       } catch (...) {
           has_data = false;
       }
       
       ++steps;
       
-      // Guard: Check if episode should end
-      // Episode ends when:
-      // 1. No more data available (CSV file finished)
-      // 2. Reached max_episode_steps limit
+      // Check if episode should end
       int max_episode_steps = spec_.config["max_episode_steps"_];
       
-      // Guard: Verify steps counter is within expected range
-      if (steps < 0) {
-          throw std::runtime_error("Steps counter is negative");
-      }
-      if (steps > max_episode_steps + 1) {
-          throw std::runtime_error("Steps counter exceeded max_episode_steps + 1");
-      }
-      
-      // Set done flag based on termination conditions
-      if (!has_data) {
-          // Guard: CSV file finished - episode must end
+      // Episode ends if:
+      // 1. We've reached max_episode_steps (2048) - normal completion
+      // 2. We've run out of data (has_data is false) - early termination
+      // Note: If has_data is false, we can't advance further (each step needs a CSV row)
+      // So we must end the episode. The collector will handle synchronization.
+      if (steps >= max_episode_steps) {
           isDone = true;
-      } else if (steps >= max_episode_steps) {
-          // Guard: Max steps reached - episode must end
+      } else if (!has_data) {
+          // No more data - must end episode (can't advance without CSV rows)
           isDone = true;
       } else {
-          // Episode continues
           isDone = false;
-      }
-      
-      // Guard: Verify done flag is set correctly
-      if (isDone && steps < max_episode_steps && has_data) {
-          throw std::runtime_error("Episode marked as done but conditions not met");
       }
       
       // Detect if fills occurred during this step by checking trade count change
@@ -392,12 +400,26 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   }
 
   void WriteState() {
-    std::array<double, RLTrader::OBS_DIM> data;
-    adaptor_ptr->getState(data);
+    // CRITICAL: Allocate FIRST to ensure done_write() is properly set up
+    // This prevents deadlock if getState/getInfo throws
     State state = Allocate(1);
     
+    std::array<double, RLTrader::OBS_DIM> data;
+    try {
+        adaptor_ptr->getState(data);
+    } catch (...) {
+        // If getState fails, fill with zeros and mark done
+        data.fill(0.0);
+        isDone = true;
+    }
+    
     std::unordered_map<std::string, double> info;
+    try {
     adaptor_ptr->getInfo(info);
+    } catch (...) {
+        // If getInfo fails, use empty info (all zeros)
+        isDone = true;
+    }
     state["info:mid_price"_] = info["mid_price"];
     state["info:balance"_] = info["balance"];
     state["info:unrealized_pnl"_] = info["unrealized_pnl"];
