@@ -545,20 +545,46 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     constexpr double SPREAD_CAPTURE_WEIGHT = 10.0;  // Boosted to match unrealized scale
     double realized_component = REALIZED_WEIGHT * realized_pnl_delta + SPREAD_CAPTURE_WEIGHT * spread_capture_delta;
     
-    // Track unrealized P&L for prev state (needed for delta tracking even if not in reward)
-    prev_unrealized_pnl = info["unrealized_pnl"];
-    prev_fees = info["fees"];
+    // 2. Unrealized loss penalty (losses only, no reward for gains)
+    // Penalize holding losing positions to encourage cutting losses
+    double current_unrealized_pnl = info["unrealized_pnl"];
+    double unrealized_delta = current_unrealized_pnl - prev_unrealized_pnl;
+    prev_unrealized_pnl = current_unrealized_pnl;
+    if (initial_balance_ > 1e-9) {
+        unrealized_delta /= initial_balance_;
+    } else {
+        unrealized_delta = 0.0;
+    }
+    // Only penalize losses (negative delta), gains get 0 reward
+    constexpr double UNREALIZED_LOSS_WEIGHT = 1.0;  // Penalize losses at 1x
+    double unrealized_loss_penalty = (unrealized_delta < 0) ? UNREALIZED_LOSS_WEIGHT * unrealized_delta : 0.0;
     
-    // 2. Requote penalty: small cost for voluntary requotes
+    // 3. Fee reward only on round-trip completion (doubled for both legs)
+    // When spread_capture changes, a position was closed
+    // Give 2x fee reward to account for both opening and closing fees
+    double current_fees = info["fees"];
+    double fee_delta = -(current_fees - prev_fees);  // Positive when rebates earned
+    prev_fees = current_fees;
+    if (initial_balance_ > 1e-9) {
+        fee_delta /= initial_balance_;
+    } else {
+        fee_delta = 0.0;
+    }
+    // Only give fee reward when position was closed (spread_capture changed)
+    constexpr double FEE_WEIGHT = 2.0;  // 2x to account for both legs
+    double fee_reward = (std::abs(spread_capture_delta) > 1e-12) ? FEE_WEIGHT * fee_delta : 0.0;
+    
+    // 4. Requote penalty: small cost for voluntary requotes
     // Only penalizes when RL chose to requote (not forced requotes after fills, first step, etc.)
     constexpr double REQUOTE_PENALTY = -0.0001;
     double requote_penalty = rl_chose_requote_ ? REQUOTE_PENALTY / initial_balance_ : 0.0;
     
-    // Total reward = realized + spread_capture only (NO unrealized, NO fees, NO deviation)
-    // Agent MUST complete round-trips to earn rewards
-    // Fees removed from reward - agent was gaming it by only opening positions (B:480/S:0)
-    // Spread capture (10x) is the only way to earn without closing being a loss
-    double reward = realized_component + requote_penalty;
+    // Total reward = realized + spread_capture + unrealized_loss_penalty + fee_on_close + requote
+    // - Realized P&L: 1x (locked-in profits/losses)
+    // - Spread capture: 10x (round-trip profit)
+    // - Unrealized losses: 1x penalty (encourage cutting losses, no reward for gains)
+    // - Fee rebates: 2x but ONLY when closing (prevents gaming by only opening)
+    double reward = realized_component + unrealized_loss_penalty + fee_reward + requote_penalty;
     
     // Scale reward by 10000 to make it more readable (0.0001 → 1.0)
     // This is just a scaling factor, doesn't change the learning signal

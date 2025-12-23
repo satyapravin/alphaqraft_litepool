@@ -82,8 +82,10 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 ## Reward Function
 
 ```
-reward = 1.0 * realized_pnl_delta + 10.0 * spread_capture_delta + requote_penalty
-# NOTE: No fees, no unrealized P&L - agent must complete round-trips to earn rewards
+reward = 1.0 * realized_pnl_delta + 10.0 * spread_capture_delta
+       + unrealized_loss_penalty   # 1x, only for losses (gains = 0)
+       + fee_reward_on_close       # 2x, only when spread_capture changes
+       + requote_penalty
 ```
 
 All deltas are normalized by initial balance to make rewards scale-independent. Final reward is scaled by 10,000 for readability.
@@ -94,8 +96,8 @@ All deltas are normalized by initial balance to make rewards scale-independent. 
 |-----------|--------|-------------|
 | **Realized P&L Delta** | 1.0 | Profit/loss from completed trades (average price accounting) |
 | **Spread Capture Delta** | 10.0 | Profit from round-trips (LIFO, boosted to match unrealized P&L scale) |
-| **Unrealized P&L Delta** | 0.0 | Not in reward - no credit for paper gains |
-| **Fee Rebate Delta** | 0.0 | Removed - agent was gaming by only opening positions |
+| **Unrealized Losses** | 1.0 | Penalty for losses only (no reward for gains) |
+| **Fee Rebates (on close)** | 2.0 | Only when round-trip completes (2x for both legs) |
 | **Requote Penalty** | -0.0001 | Per voluntary requote (normalized, encourages order persistence) |
 
 ### Design Notes
