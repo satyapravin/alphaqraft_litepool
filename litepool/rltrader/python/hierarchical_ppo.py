@@ -524,7 +524,11 @@ class HierarchicalPPOTrainer:
                 else:
                     sell_trades = int(sell_val)
         
-        # Print epoch summary
+        # Get action standard deviations from policies
+        mm_spread_std = torch.exp(self.policy.mm_agent.spread_log_std).mean().item()
+        inv_std = torch.exp(self.policy.inventory_agent.actor_log_std).mean().item()
+        
+        # Print epoch summary with full learning diagnostics
         print(f"Epoch {epoch:5d} | "
               f"Step {self.global_step:8d} | "
               f"MM.Rew {avg_mm_reward:8.2f} | "
@@ -532,10 +536,11 @@ class HierarchicalPPOTrainer:
               f"R.PnL ${avg_realized_pnl:7.2f} | "
               f"U.PnL ${avg_unrealized_pnl:7.2f} | "
               f"ReqRate {requote_rate:.1%} | "
-              f"Trades {total_trades:4d} (B:{buy_trades}/S:{sell_trades}) | "
-              f"PL_mm {losses['policy_loss_mm']:.4f} | "
-              f"PL_inv {losses['policy_loss_inv']:.4f} | "
-              f"Ent {losses['entropy_mm']:.3f}/{losses['entropy_inv']:.3f}")
+              f"Trades {total_trades:4d} (B:{buy_trades}/S:{sell_trades})")
+        print(f"         Loss: PL_mm {losses['policy_loss_mm']:.4f} VL_mm {losses['value_loss_mm']:.4f} | "
+              f"PL_inv {losses['policy_loss_inv']:.4f} VL_inv {losses['value_loss_inv']:.4f} | "
+              f"Ent {losses['entropy_mm']:.3f}/{losses['entropy_inv']:.3f} | "
+              f"Std {mm_spread_std:.3f}/{inv_std:.3f}")
         
         # Print completed episodes
         if self.completed_episodes:
