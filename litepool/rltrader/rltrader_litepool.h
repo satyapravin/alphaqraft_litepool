@@ -127,8 +127,12 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   // Reward tracking
   double prev_realized_pnl = 0.0;
   double prev_unrealized_pnl = 0.0;  // Actual unrealized PnL (mark-to-market)
+  double unrealized_delta_ema = 0.0; // EMA-smoothed unrealized P&L delta
   double prev_fees = 0.0;  // Track fees for fee rebate reward
   double prev_spread_capture = 0.0;  // LIFO spread capture tracking
+  
+  // EMA smoothing for unrealized P&L (reduces noise from price oscillations)
+  static constexpr double UNREALIZED_EMA_ALPHA = 0.2;  // ~5 step half-life
   double initial_balance_ = 0.0; // Store initial balance for consistent reward scaling
   
   // Terminal info cache (stores metrics before reset for episode logging)
@@ -227,6 +231,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     
     prev_realized_pnl = 0.0;
     prev_unrealized_pnl = 0.0;
+    unrealized_delta_ema = 0.0;
     prev_fees = 0.0;
     prev_spread_capture = 0.0;
     initial_balance_ = balance;  // Store initial balance for consistent reward scaling
@@ -545,20 +550,23 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     constexpr double SPREAD_CAPTURE_WEIGHT = 10.0;  // Boosted to match unrealized scale
     double realized_component = REALIZED_WEIGHT * realized_pnl_delta + SPREAD_CAPTURE_WEIGHT * spread_capture_delta;
     
-    // 2. Unrealized P&L - symmetric low weight
+    // 2. Unrealized P&L - EMA-smoothed, symmetric low weight
     // Market makers hold inventory by design, so price oscillations cause U.PnL fluctuations
+    // EMA smoothing reduces noise from short-term price spikes
     // Using symmetric weight so gains and losses mostly cancel, only net trend matters
-    // Low weight (0.5x) to prevent U.PnL from dominating realized P&L
     double current_unrealized_pnl = info["unrealized_pnl"];
-    double unrealized_delta = current_unrealized_pnl - prev_unrealized_pnl;
+    double raw_unrealized_delta = current_unrealized_pnl - prev_unrealized_pnl;
     prev_unrealized_pnl = current_unrealized_pnl;
     if (initial_balance_ > 1e-9) {
-        unrealized_delta /= initial_balance_;
+        raw_unrealized_delta /= initial_balance_;
     } else {
-        unrealized_delta = 0.0;
+        raw_unrealized_delta = 0.0;
     }
+    // EMA smoothing: alpha=0.2 gives ~5 step half-life
+    unrealized_delta_ema = UNREALIZED_EMA_ALPHA * raw_unrealized_delta + 
+                           (1.0 - UNREALIZED_EMA_ALPHA) * unrealized_delta_ema;
     constexpr double UNREALIZED_WEIGHT = 0.5;  // Symmetric, low weight
-    double unrealized_component = UNREALIZED_WEIGHT * unrealized_delta;
+    double unrealized_component = UNREALIZED_WEIGHT * unrealized_delta_ema;
     
     // 3. Fee reward only on round-trip completion (doubled for both legs)
     // When spread_capture changes, a position was closed
