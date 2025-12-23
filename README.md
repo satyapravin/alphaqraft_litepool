@@ -85,33 +85,34 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 
 ## Reward Function
 
+### Hierarchical (Two-Agent) Rewards
+
 ```
-reward = 1.0 * realized_pnl_delta + 10.0 * spread_capture_delta
-       + 0.5 * unrealized_pnl_ema       # EMA-smoothed (α=0.2), symmetric
-       + fee_reward_on_close            # 2x, only when spread_capture changes
-       + 10.0 * deviation_improvement   # rewards moving toward target
-       + requote_penalty
+mm_reward  = (realized_pnl + spread_capture + fees) × 10,000
+inv_reward = unrealized_pnl_delta × 10,000
 ```
 
-All deltas are normalized by initial balance to make rewards scale-independent. Final reward is scaled by 10,000 for readability.
+| Reward Stream | Agent | Optimizes |
+|---------------|-------|-----------|
+| `info:mm_reward` | MM Agent | Execution quality (closing positions profitably) |
+| `info:inv_reward` | Inventory Agent | Market direction (when to hold/exit) |
 
-### Reward Components
+### Combined Reward (Single-Agent Backwards Compatibility)
 
-| Component | Weight | Description |
-|-----------|--------|-------------|
-| **Realized P&L Delta** | 1.0 | Profit/loss from completed trades |
-| **Spread Capture Delta** | 10.0 | LIFO profit from round-trips (incentivizes closing) |
-| **Unrealized P&L** | 0.5 | EMA-smoothed (α=0.2), symmetric |
-| **Fee Rebates (on close)** | 2.0 | Only when round-trip completes |
-| **Deviation Improvement** | 10.0 | Rewards moving toward target |
-| **Requote Penalty** | -0.0001 | Per voluntary requote |
+```
+reward = mm_reward + inv_reward  # Total wealth change
+```
 
-### Design Notes
+All deltas are normalized by initial balance. Final reward scaled by 10,000 for readability.
 
-- **Spread capture (10x)**: Strong incentive to complete round-trips
-- **Deviation improvement (10x)**: Rewards moving toward target (buy OR sell)
-- **EMA-smoothed unrealized**: Reduces noise from price oscillations
-- **Fee on close only**: Prevents gaming by only opening positions
+### Components
+
+| Component | Used In | Description |
+|-----------|---------|-------------|
+| `realized_pnl_delta` | mm_reward | Profit/loss from closed positions |
+| `spread_capture_delta` | mm_reward | LIFO round-trip profit |
+| `fee_delta` | mm_reward | Maker rebates earned |
+| `unrealized_pnl_delta` | inv_reward | Mark-to-market P&L change |
 
 ## Model Architecture
 

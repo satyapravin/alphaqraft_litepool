@@ -87,6 +87,8 @@ class RolloutBuffer:
     log_probs_inv: np.ndarray
     values_mm: np.ndarray
     values_inv: np.ndarray
+    # Info tracking for logging
+    infos: List = None
     advantages_mm: np.ndarray = None
     advantages_inv: np.ndarray = None
     returns_mm: np.ndarray = None
@@ -105,6 +107,7 @@ class RolloutBuffer:
             log_probs_inv=np.zeros((n_steps, num_envs), dtype=np.float32),
             values_mm=np.zeros((n_steps, num_envs), dtype=np.float32),
             values_inv=np.zeros((n_steps, num_envs), dtype=np.float32),
+            infos=[],
         )
     
     def compute_gae(self, last_values_mm: np.ndarray, last_values_inv: np.ndarray,
@@ -139,6 +142,21 @@ class RolloutBuffer:
         self.returns_inv = self.advantages_inv + self.values_inv
 
 
+@dataclass
+class EpisodeInfo:
+    """Track info for a completed episode."""
+    env_id: int
+    steps: int
+    mm_reward: float
+    inv_reward: float
+    total_reward: float
+    realized_pnl: float
+    unrealized_pnl: float
+    fees: float
+    trade_count: int
+    net_amount_btc: float
+
+
 class HierarchicalPPOTrainer:
     """Trainer for hierarchical two-agent PPO."""
     
@@ -169,6 +187,7 @@ class HierarchicalPPOTrainer:
         self.episode_rewards = deque(maxlen=100)
         self.episode_mm_rewards = deque(maxlen=100)
         self.episode_inv_rewards = deque(maxlen=100)
+        self.completed_episodes: List[EpisodeInfo] = []
         
         # Rollout buffer
         obs_dim = 32
@@ -180,6 +199,16 @@ class HierarchicalPPOTrainer:
         # Tracking
         self.global_step = 0
         self.epochs_completed = 0
+        self.best_reward = float('-inf')
+        
+        # Per-env tracking
+        self.episode_steps = np.zeros(config.num_envs, dtype=np.int32)
+        self.episode_mm_total = np.zeros(config.num_envs)
+        self.episode_inv_total = np.zeros(config.num_envs)
+        
+        # Results directory
+        self.results_dir = Path("results/hierarchical")
+        self.results_dir.mkdir(parents=True, exist_ok=True)
     
     def _create_env(self):
         """Create the litepool environment."""
@@ -208,14 +237,24 @@ class HierarchicalPPOTrainer:
             max_size_pct=self.config.max_size_pct,
         )
     
+    def _extract_info_value(self, env_info: dict, key: str, env_id: int, default=0.0) -> float:
+        """Safely extract a value from env_info for a specific environment."""
+        val = env_info.get(key, default)
+        if isinstance(val, np.ndarray):
+            return float(val[env_id]) if env_id < len(val) else default
+        return float(val) if val is not None else default
+    
     def collect_rollout(self) -> Tuple[np.ndarray, np.ndarray]:
         """Collect one rollout of experience."""
         obs, _ = self.env.reset()
         self.policy.reset(self.config.num_envs)
         
-        # Tracking for logging
-        cum_mm_rewards = np.zeros(self.config.num_envs)
-        cum_inv_rewards = np.zeros(self.config.num_envs)
+        # Reset per-env tracking
+        self.episode_steps.fill(0)
+        self.episode_mm_total.fill(0)
+        self.episode_inv_total.fill(0)
+        self.completed_episodes.clear()
+        self.buffer.infos = []
         
         for step in range(self.config.n_steps):
             # Get action from hierarchical policy
@@ -234,25 +273,59 @@ class HierarchicalPPOTrainer:
             next_obs, reward, terminated, truncated, env_info = self.env.step(action)
             done = terminated | truncated
             
-            # Extract separate rewards
+            # Store info for logging
+            self.buffer.infos.append(env_info)
+            
+            # Extract separate rewards from env_info
             mm_reward = env_info.get('mm_reward', np.zeros(self.config.num_envs))
             inv_reward = env_info.get('inv_reward', np.zeros(self.config.num_envs))
+            
+            # Handle numpy array extraction
+            if isinstance(mm_reward, np.ndarray):
+                mm_reward = mm_reward.flatten()
+            else:
+                mm_reward = np.array([mm_reward] * self.config.num_envs)
+            if isinstance(inv_reward, np.ndarray):
+                inv_reward = inv_reward.flatten()
+            else:
+                inv_reward = np.array([inv_reward] * self.config.num_envs)
             
             self.buffer.mm_rewards[step] = mm_reward
             self.buffer.inv_rewards[step] = inv_reward
             self.buffer.dones[step] = done
             
-            cum_mm_rewards += mm_reward
-            cum_inv_rewards += inv_reward
+            # Accumulate per-env rewards
+            self.episode_mm_total += mm_reward
+            self.episode_inv_total += inv_reward
+            self.episode_steps += 1
             
             # Handle episode ends
             for env_id in range(self.config.num_envs):
                 if done[env_id]:
-                    self.episode_mm_rewards.append(cum_mm_rewards[env_id])
-                    self.episode_inv_rewards.append(cum_inv_rewards[env_id])
-                    self.episode_rewards.append(reward[env_id])
-                    cum_mm_rewards[env_id] = 0
-                    cum_inv_rewards[env_id] = 0
+                    # Extract terminal info from final_* fields
+                    episode_info = EpisodeInfo(
+                        env_id=env_id,
+                        steps=int(self.episode_steps[env_id]),
+                        mm_reward=float(self.episode_mm_total[env_id]),
+                        inv_reward=float(self.episode_inv_total[env_id]),
+                        total_reward=float(self.episode_mm_total[env_id] + self.episode_inv_total[env_id]),
+                        realized_pnl=self._extract_info_value(env_info, 'final_realized_pnl', env_id),
+                        unrealized_pnl=self._extract_info_value(env_info, 'final_unrealized_pnl', env_id),
+                        fees=self._extract_info_value(env_info, 'final_fees', env_id),
+                        trade_count=int(self._extract_info_value(env_info, 'final_trade_count', env_id)),
+                        net_amount_btc=self._extract_info_value(env_info, 'final_net_amount_btc', env_id),
+                    )
+                    self.completed_episodes.append(episode_info)
+                    
+                    # Add to running averages
+                    self.episode_mm_rewards.append(episode_info.mm_reward)
+                    self.episode_inv_rewards.append(episode_info.inv_reward)
+                    self.episode_rewards.append(episode_info.total_reward)
+                    
+                    # Reset per-env tracking
+                    self.episode_steps[env_id] = 0
+                    self.episode_mm_total[env_id] = 0
+                    self.episode_inv_total[env_id] = 0
                     self.policy.reset_env(env_id)
             
             obs = next_obs
@@ -307,6 +380,7 @@ class HierarchicalPPOTrainer:
         
         losses = {'policy_loss_mm': 0, 'value_loss_mm': 0, 'entropy_mm': 0,
                   'policy_loss_inv': 0, 'value_loss_inv': 0, 'entropy_inv': 0}
+        n_updates = 0
         
         for _ in range(self.config.update_epochs):
             # Random permutation for minibatches
@@ -388,23 +462,108 @@ class HierarchicalPPOTrainer:
                 losses['policy_loss_inv'] += policy_loss_inv.item()
                 losses['value_loss_inv'] += value_loss_inv.item()
                 losses['entropy_inv'] += entropy_inv.item()
+                n_updates += 1
         
         # Average losses
-        num_updates = self.config.update_epochs * (n_samples // self.config.minibatch_size)
-        for key in losses:
-            losses[key] /= num_updates
+        if n_updates > 0:
+            for key in losses:
+                losses[key] /= n_updates
         
         return losses
     
+    def _log_epoch(self, epoch: int, losses: Dict[str, float]):
+        """Log epoch statistics."""
+        # Compute averages from completed episodes
+        if self.completed_episodes:
+            avg_mm_reward = np.mean([e.mm_reward for e in self.completed_episodes])
+            avg_inv_reward = np.mean([e.inv_reward for e in self.completed_episodes])
+            avg_realized_pnl = np.mean([e.realized_pnl for e in self.completed_episodes])
+            avg_unrealized_pnl = np.mean([e.unrealized_pnl for e in self.completed_episodes])
+            total_trades = sum(e.trade_count for e in self.completed_episodes)
+        else:
+            avg_mm_reward = np.mean(self.episode_mm_rewards) if self.episode_mm_rewards else 0
+            avg_inv_reward = np.mean(self.episode_inv_rewards) if self.episode_inv_rewards else 0
+            avg_realized_pnl = 0
+            avg_unrealized_pnl = 0
+            total_trades = 0
+        
+        # Compute action statistics
+        actions = self.buffer.actions.reshape(-1, 4)
+        requote_actions = actions[:, 3]
+        requote_rate = (requote_actions > 0).mean()
+        
+        # Spread actions when requoting
+        requote_mask = requote_actions > 0
+        if requote_mask.sum() > 0:
+            quote_actions = actions[requote_mask]
+            avg_bid_spread = quote_actions[:, 0].mean()
+            avg_ask_spread = quote_actions[:, 1].mean()
+            avg_target = quote_actions[:, 2].mean()
+        else:
+            avg_bid_spread = 0
+            avg_ask_spread = 0
+            avg_target = 0
+        
+        # Buy/sell breakdown from last info
+        buy_trades = 0
+        sell_trades = 0
+        if self.buffer.infos and len(self.buffer.infos) > 0:
+            last_info = self.buffer.infos[-1]
+            if 'buy_trades' in last_info:
+                buy_val = last_info['buy_trades']
+                if isinstance(buy_val, np.ndarray):
+                    buy_trades = int(buy_val.sum())
+                else:
+                    buy_trades = int(buy_val)
+            if 'sell_trades' in last_info:
+                sell_val = last_info['sell_trades']
+                if isinstance(sell_val, np.ndarray):
+                    sell_trades = int(sell_val.sum())
+                else:
+                    sell_trades = int(sell_val)
+        
+        # Print epoch summary
+        print(f"Epoch {epoch:5d} | "
+              f"Step {self.global_step:8d} | "
+              f"MM.Rew {avg_mm_reward:8.2f} | "
+              f"Inv.Rew {avg_inv_reward:8.2f} | "
+              f"R.PnL ${avg_realized_pnl:7.2f} | "
+              f"U.PnL ${avg_unrealized_pnl:7.2f} | "
+              f"ReqRate {requote_rate:.1%} | "
+              f"Trades {total_trades:4d} (B:{buy_trades}/S:{sell_trades}) | "
+              f"PL_mm {losses['policy_loss_mm']:.4f} | "
+              f"PL_inv {losses['policy_loss_inv']:.4f} | "
+              f"Ent {losses['entropy_mm']:.3f}/{losses['entropy_inv']:.3f}")
+        
+        # Print completed episodes
+        if self.completed_episodes:
+            print(f"\n  Completed {len(self.completed_episodes)} episode(s):")
+            for ep in self.completed_episodes:
+                net_pnl = ep.realized_pnl + ep.unrealized_pnl + ep.fees
+                print(f"  [Episode] Env {ep.env_id} | "
+                      f"Steps {ep.steps:5d} | "
+                      f"MM.Rew {ep.mm_reward:7.2f} | "
+                      f"Inv.Rew {ep.inv_reward:7.2f} | "
+                      f"R.PnL ${ep.realized_pnl:7.2f} | "
+                      f"U.PnL ${ep.unrealized_pnl:7.2f} | "
+                      f"Fees ${ep.fees:6.2f} | "
+                      f"Net ${net_pnl:7.2f} | "
+                      f"Trades {ep.trade_count:4d} | "
+                      f"Pos {ep.net_amount_btc:+.5f} BTC")
+            print()
+    
     def train(self):
         """Main training loop."""
-        print("\n" + "="*60)
-        print("Hierarchical PPO Training")
-        print("="*60)
-        print(f"Inventory Agent: updates every {self.config.inventory_update_freq} steps")
-        print(f"MM Agent: updates every step")
+        print("\n" + "="*80)
+        print("Hierarchical PPO Training - Two-Agent Market Making")
+        print("="*80)
+        print(f"Inventory Agent: updates every {self.config.inventory_update_freq} steps (10 sec)")
+        print(f"MM Agent: updates every step (100ms)")
+        print(f"Steps per epoch: {self.config.n_steps}")
         print(f"Total epochs: {self.config.total_epochs}")
-        print("="*60 + "\n")
+        print(f"Observations: 32 signals (13 market + 4 AMM + 8 trade + 7 agent state)")
+        print(f"Actions: 4 (bid_spread, ask_spread, target_inventory, requote)")
+        print("="*80 + "\n")
         
         for epoch in range(self.config.total_epochs):
             epoch_start = time.time()
@@ -419,55 +578,57 @@ class HierarchicalPPOTrainer:
             
             # Logging
             if epoch % self.config.log_interval == 0:
-                avg_mm_reward = np.mean(self.episode_mm_rewards) if self.episode_mm_rewards else 0
-                avg_inv_reward = np.mean(self.episode_inv_rewards) if self.episode_inv_rewards else 0
-                
-                print(f"Epoch {epoch:5d} | "
-                      f"Step {self.global_step:8d} | "
-                      f"MM Rew {avg_mm_reward:7.2f} | "
-                      f"Inv Rew {avg_inv_reward:7.2f} | "
-                      f"PL_mm {losses['policy_loss_mm']:.4f} | "
-                      f"PL_inv {losses['policy_loss_inv']:.4f} | "
-                      f"Ent_mm {losses['entropy_mm']:.4f}")
+                self._log_epoch(epoch, losses)
             
-            # Save checkpoint
+            # Track best model
+            avg_reward = np.mean(self.episode_rewards) if self.episode_rewards else 0
+            if avg_reward > self.best_reward:
+                self.best_reward = avg_reward
+                self.save_checkpoint(str(self.results_dir / "best_model.pt"))
+            
+            # Save checkpoint periodically
             if epoch % self.config.save_interval == 0 and epoch > 0:
-                self.save_checkpoint(f"checkpoints/hierarchical_epoch_{epoch}.pt")
+                self.save_checkpoint(str(self.results_dir / f"epoch_{epoch}.pt"))
             
-            # GC
+            # Clear infos to prevent memory accumulation
+            self.buffer.infos = []
+            
+            # GC periodically
             if epoch % 100 == 0:
                 gc.collect()
         
         print("\nTraining complete!")
-        self.save_checkpoint("checkpoints/hierarchical_final.pt")
+        print(f"Best reward: {self.best_reward:.4f}")
+        self.save_checkpoint(str(self.results_dir / "final_model.pt"))
     
     def save_checkpoint(self, path: str):
         """Save training checkpoint."""
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         checkpoint = {
-            'policy': {
-                'inventory_agent': self.policy.inventory_agent.state_dict(),
-                'mm_agent': self.policy.mm_agent.state_dict(),
-            },
+            'inventory_agent': self.policy.inventory_agent.state_dict(),
+            'mm_agent': self.policy.mm_agent.state_dict(),
             'optimizer_inv': self.optimizer_inv.state_dict(),
             'optimizer_mm': self.optimizer_mm.state_dict(),
             'global_step': self.global_step,
             'epochs_completed': self.epochs_completed,
+            'best_reward': self.best_reward,
             'config': self.config,
         }
         torch.save(checkpoint, path)
-        print(f"Saved checkpoint to {path}")
+        print(f"  Saved checkpoint: {path}")
     
     def load_checkpoint(self, path: str):
         """Load training checkpoint."""
         checkpoint = torch.load(path, map_location=device)
-        self.policy.inventory_agent.load_state_dict(checkpoint['policy']['inventory_agent'])
-        self.policy.mm_agent.load_state_dict(checkpoint['policy']['mm_agent'])
+        self.policy.inventory_agent.load_state_dict(checkpoint['inventory_agent'])
+        self.policy.mm_agent.load_state_dict(checkpoint['mm_agent'])
         self.optimizer_inv.load_state_dict(checkpoint['optimizer_inv'])
         self.optimizer_mm.load_state_dict(checkpoint['optimizer_mm'])
         self.global_step = checkpoint['global_step']
         self.epochs_completed = checkpoint['epochs_completed']
+        self.best_reward = checkpoint.get('best_reward', float('-inf'))
         print(f"Loaded checkpoint from {path}")
+        print(f"  Resuming from epoch {self.epochs_completed}, step {self.global_step}")
 
 
 def main():
@@ -476,7 +637,7 @@ def main():
     trainer = HierarchicalPPOTrainer(config)
     
     # Check for existing checkpoint
-    checkpoint_path = Path("checkpoints/hierarchical_latest.pt")
+    checkpoint_path = Path("results/hierarchical/latest.pt")
     if checkpoint_path.exists():
         print(f"Found checkpoint at {checkpoint_path}")
         trainer.load_checkpoint(str(checkpoint_path))
@@ -487,4 +648,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
