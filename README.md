@@ -82,12 +82,12 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 ## Reward Function
 
 ```
-reward = ΔWealth - γ × position²
+reward = ΔWealth - γ × (leverage - target)²
 
 Where:
   ΔWealth = (realized_pnl + unrealized_pnl) - prev_wealth
   γ = 1.0 (risk aversion coefficient)
-  position² = leverage² (quadratic penalty for position size)
+  deviation² = (leverage - target_inventory)² (quadratic penalty for deviation)
 ```
 
 All deltas are normalized by initial balance to make rewards scale-independent. Final reward is scaled by 10,000 for readability.
@@ -97,15 +97,15 @@ All deltas are normalized by initial balance to make rewards scale-independent. 
 | Component | Weight | Description |
 |-----------|--------|-------------|
 | **Wealth Delta (ΔW)** | 1.0 | Change in total P&L (realized + unrealized) |
-| **Risk Penalty (-γ×pos²)** | -1.0 | Quadratic penalty for position size (γ=1.0) |
+| **Deviation Penalty (-γ×dev²)** | -1.0 | Quadratic penalty for deviation from target (γ=1.0) |
 
 ### Design Notes
 
 - **CARA utility**: Constant Absolute Risk Aversion - simple, economically principled
 - **Wealth delta**: Rewards making money (realized or unrealized, doesn't matter)
-- **Quadratic risk penalty**: Large positions are exponentially costly to hold
-- **Natural incentive to close**: Closing reduces position² → reduces penalty
-- **No gaming**: Can't exploit by only opening - accumulation is punished by risk penalty
+- **Quadratic deviation penalty**: Deviating from target is exponentially costly
+- **At target = no penalty**: Agent can hold intended inventory without cost
+- **Natural incentive**: Move toward target (buy when under, sell when over)
 
 ## Model Architecture
 

@@ -512,21 +512,21 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     }
     
     // === CARA-Style Reward ===
-    // Simple, economically principled reward: maximize wealth, penalize risk
+    // Simple, economically principled reward: maximize wealth, penalize deviation from target
     // 
-    // reward = ΔWealth - γ × position²
+    // reward = ΔWealth - γ × (leverage - target)²
     //
     // 1. ΔWealth: Change in total P&L (realized + unrealized)
     //    - Rewards making money regardless of how (closing or holding)
     //    - No complex component weighting needed
     //
-    // 2. Risk penalty: γ × (position/balance)²
-    //    - Quadratic penalty for position size
-    //    - Creates natural incentive to close (reduces position = reduces penalty)
-    //    - Larger positions are exponentially more costly to hold
-    //    - Can't exploit by only opening - accumulation is punished
+    // 2. Deviation penalty: γ × (leverage - target_inventory)²
+    //    - Quadratic penalty for deviating from target
+    //    - At target: no penalty (can hold intended position)
+    //    - Away from target: exponentially increasing penalty
+    //    - Creates incentive to move toward target (buy or sell as needed)
     //
-    // This naturally balances profit-seeking with risk management.
+    // This naturally balances profit-seeking with inventory management.
     
     // 1. Wealth change (realized + unrealized P&L)
     double current_wealth = info["realized_pnl"] + info["unrealized_pnl"];
@@ -540,10 +540,11 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
         wealth_delta = 0.0;
     }
     
-    // 2. Risk penalty: quadratic in position size
-    // leverage = |position_value| / equity, already computed above
-    double position_sq = leverage * leverage;
-    double risk_penalty = -RISK_AVERSION * position_sq;
+    // 2. Deviation penalty: quadratic in deviation from target inventory
+    double target_lev = strategy_ptr->getTargetInventory();
+    double deviation = leverage - target_lev;  // Signed deviation
+    double deviation_sq = deviation * deviation;
+    double risk_penalty = -RISK_AVERSION * deviation_sq;
     
     // Total reward = wealth_delta + risk_penalty
     // Simple, clean, economically motivated
