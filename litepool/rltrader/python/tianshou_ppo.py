@@ -14,7 +14,7 @@
 
 """
 Simple PPO training for GLFT market making.
-- 30-signal observations (13 market + 4 AMM flow + 8 trade + 5 agent state)
+- 31-signal observations (13 market + 4 AMM flow + 8 trade + 5 agent state + 1 deviation from target)
 - 4-action outputs: 3 continuous quote parameters + 1 binary requote decision
   * Actions 0-2: bid_spread, ask_spread, target_inventory (continuous)
   * Action 3: should_requote (binary decision: >0 = requote, <=0 = continue)
@@ -97,7 +97,7 @@ np.random.seed(42)
 # - Binary head (Bernoulli): 1 requote decision
 # - 3 hidden layers with LayerNorm for stable training
 model = SimpleActorCritic(
-    obs_dim=30,  # 13 market + 4 AMM flow + 8 trade + 5 agent state
+    obs_dim=31,  # 13 market + 4 AMM flow + 8 trade + 5 agent state + 1 deviation from target
     action_dim=4,  # 3 quote params (bid_spread, ask_spread, target_inventory) + 1 requote decision
     hidden_dim=128,  # MLP hidden dimension
     lstm_hidden=64,  # LSTM hidden dimension for temporal patterns
@@ -566,7 +566,7 @@ if __name__ == "__main__":
     print(f"Environments: {NUM_ENVS}")
     print(f"Threads: {NUM_THREADS}")
     print(f"Steps per rollout: {N_STEPS}")
-    print(f"Observations: 30 signals (13 market + 4 AMM flow + 8 trade + 5 agent state)")
+    print(f"Observations: 31 signals (13 market + 4 AMM flow + 8 trade + 5 agent state + 1 deviation from target)")
     print(f"Actions: 4 (3 continuous quote params + 1 binary requote decision)")
     print(f"  Quote params: bid_spread, ask_spread, target_inventory (continuous)")
     print(f"  Order size: fixed at min_size_pct ({MIN_SIZE_PCT}%) - no RL control")

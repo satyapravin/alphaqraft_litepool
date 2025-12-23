@@ -237,12 +237,20 @@ void EnvAdaptor::computeState(OrderBook& book)
         
         // [29] Normalized spread capture (spreadCapture / initialBalance)
         state[29] = std::tanh((posInfo.spreadCapture / initialBalance) * 10.0);  // Scale: ±10% of balance = ±tanh(1)
+        
+        // [30] Deviation from target leverage (leverage - target_leverage)
+        // Positive when over-leveraged, negative when under-leveraged
+        // Normalized using tanh to bound to [-1, 1] range
+        double target_leverage = strategy.getTargetInventory();
+        double leverage_deviation = posInfo.leverage - target_leverage;
+        state[30] = std::tanh(leverage_deviation * 10.0);  // Scale: ±0.1 deviation maps to ±tanh(1) ≈ ±0.76
     } else {
         // Zero out agent state signals if initial balance is invalid
         state[26] = 0.0;
         state[27] = 0.0;
         state[28] = 0.0;
         state[29] = 0.0;
+        state[30] = 0.0;
     }
     
     computeInfo(book);

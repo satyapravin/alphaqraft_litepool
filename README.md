@@ -46,7 +46,7 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 
 **Note**: The `skew` action was removed to avoid conflicts with `target_inventory`. Quote asymmetry (skew) is now computed automatically based on the difference between current position and target inventory.
 
-## Observation Space (30 signals)
+## Observation Space (31 signals)
 
 **Market Signals (13):**
 - Spread metrics: `market_spread`, `bid_depth`, `ask_depth`, `depth_imbalance`
@@ -70,12 +70,13 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 - `sell_pressure`: EMA-based sell pressure indicator
 - `time_since_last_trade`: Normalized temporal signal for trade recency
 
-**Agent State (5):**
+**Agent State (6):**
 - `current_leverage`: Agent's current position leverage (critical for inventory management)
 - `normalized_position`: Position value normalized by initial balance (direct inventory signal)
 - `normalized_unrealized_pnl`: Unrealized P&L normalized by initial balance (mark-to-market performance)
 - `normalized_realized_pnl`: Realized P&L normalized by initial balance (locked-in performance)
 - `normalized_spread_capture`: Spread capture normalized by initial balance (direct reward signal)
+- `deviation_from_target`: Signed deviation of current leverage from target leverage (positive = over-leveraged, negative = under-leveraged)
 
 ## Reward Function
 
@@ -174,7 +175,7 @@ python tianshou_ppo.py
 | `BASE_SPREAD_BPS` | 1.0 | Base spread in basis points |
 | `MIN_SIZE_PCT` | 1.0% | Order size as % of balance (per level, 5 levels = 5% total per side) |
 | `Model Params` | ~84k | LSTM Actor-Critic parameters |
-| `OBS_DIM` | 30 | Observation space (13 market + 4 AMM + 8 trade + 5 agent state) |
+| `OBS_DIM` | 31 | Observation space (13 market + 4 AMM + 8 trade + 6 agent state) |
 
 ## Data Format
 

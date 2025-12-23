@@ -60,7 +60,7 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) StateSpec(const Config& conf) {
-    return MakeDict("obs"_.Bind(Spec<double>({30})),  // 13 market + 4 AMM flow + 8 trade + 5 agent state
+    return MakeDict("obs"_.Bind(Spec<double>({31})),  // 13 market + 4 AMM flow + 8 trade + 5 agent state + 1 deviation from target
                     "info:mid_price"_.Bind(Spec<double>({-1})),
                     "info:balance"_.Bind(Spec<double>({-1})),
                     "info:unrealized_pnl"_.Bind(Spec<double>({-1})),
@@ -573,7 +573,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     // Only penalize when RL chose to requote without being forced
     // Forced requotes (first step, no orders, after fills) are not penalized
     // Small penalty to encourage letting orders sit and get filled
-    constexpr double REQUOTE_PENALTY = -0.0001;  // Small penalty per voluntary requote (pre-scaling)
+    constexpr double REQUOTE_PENALTY = -0.001;  // Small penalty per voluntary requote (pre-scaling)
     double requote_penalty = rl_chose_requote_ ? REQUOTE_PENALTY / initial_balance_ : 0.0;
     
     // Total reward: blended realized + unrealized + fees + penalties
