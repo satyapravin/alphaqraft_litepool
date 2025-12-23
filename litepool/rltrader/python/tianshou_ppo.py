@@ -570,7 +570,7 @@ if __name__ == "__main__":
     print(f"  Quote params: bid_spread, ask_spread, target_inventory (continuous)")
     print(f"  Order size: fixed at min_size_pct ({MIN_SIZE_PCT}%) - no RL control")
     print(f"  Requote: binary decision (>0 = requote, <=0 = continue)")
-    print(f"  Note: target_inventory is smoothed with EMA (alpha=0.05) to prevent flickering")
+    print(f"  Note: target_inventory is smoothed with EMA (alpha=0.2) for faster response")
     print(f"Strategy config: base_spread_bps={BASE_SPREAD_BPS} bps, min_size={MIN_SIZE_PCT}%, max_size={MAX_SIZE_PCT}%")
     print("=" * 60)
     train()

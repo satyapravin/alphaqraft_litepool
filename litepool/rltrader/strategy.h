@@ -117,7 +117,7 @@ namespace RLTrader {
         bool hit_leverage_limit_ = false;     // True if leverage hit ±1.0 and quoting stopped
         
         // Model parameters
-        static constexpr double TARGET_EMA_ALPHA = 0.01;     // Target inventory smoothing
+        static constexpr double TARGET_EMA_ALPHA = 0.2;      // Target inventory smoothing (faster response)
         static constexpr double VOL_EMA_ALPHA = 0.01;        // Volatility EMA (~100 sample half-life)
         static constexpr double VOL_SPREAD_MULT = 50.0;      // How much volatility widens spread
         static constexpr double INVENTORY_SKEW_MULT = 50.0;  // Reduced: smoother quote shifts, agent spreads respected more

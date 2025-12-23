@@ -576,24 +576,12 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     constexpr double REQUOTE_PENALTY = -0.0001;
     double requote_penalty = rl_chose_requote_ ? REQUOTE_PENALTY / initial_balance_ : 0.0;
     
-    // 5. Deviation penalty: penalize when actual leverage differs from target
-    // This incentivizes the agent to:
-    // - Stay close to its chosen target inventory
-    // - Correct deviations quickly (close positions that exceed target)
-    // - Not accumulate positions beyond target
-    // NOTE: Other reward components are normalized by initial_balance (~$1000),
-    // so deviation penalty needs a small weight to match scale.
-    // With 0.0001 weight: deviation of 0.1 → -0.1 per step (after 10000x scale)
-    double target_lev = strategy_ptr->getTargetInventory();
-    double deviation = std::abs(leverage - target_lev);
-    constexpr double DEVIATION_WEIGHT = 0.0001;  // Small weight to match normalized scale
-    double deviation_penalty = -DEVIATION_WEIGHT * deviation;
-    
-    // Total reward = realized + unrealized + fees + requote + deviation penalty
-    // All deltas normalized by initial balance, final reward scaled by 10,000
-    constexpr double UNREALIZED_WEIGHT = 0.1;  // Minimal - force agent to close for real rewards
+    // Total reward = realized + fees + requote (NO unrealized, NO deviation penalty)
+    // Agent MUST close positions to earn rewards - unrealized P&L gives nothing
+    // This forces the agent to complete round-trips instead of accumulating positions
+    constexpr double UNREALIZED_WEIGHT = 0.0;  // ZERO - no reward for paper gains
     constexpr double FEE_WEIGHT = 10.0;  // Boosted to incentivize trading activity
-    double reward = realized_component + UNREALIZED_WEIGHT * unrealized_delta + FEE_WEIGHT * fee_delta + requote_penalty + deviation_penalty;
+    double reward = realized_component + UNREALIZED_WEIGHT * unrealized_delta + FEE_WEIGHT * fee_delta + requote_penalty;
     
     // Scale reward by 10000 to make it more readable (0.0001 → 1.0)
     // This is just a scaling factor, doesn't change the learning signal
