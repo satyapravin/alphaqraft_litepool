@@ -83,8 +83,9 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 
 ```
 reward = 1.0 * realized_pnl_delta + 10.0 * spread_capture_delta
-       + 0.5 * unrealized_pnl_ema    # EMA-smoothed (α=0.2), symmetric
-       + fee_reward_on_close         # 2x, only when spread_capture changes
+       + 0.5 * unrealized_pnl_ema       # EMA-smoothed (α=0.2), symmetric
+       + fee_reward_on_close            # 2x, only when spread_capture changes
+       + 10.0 * deviation_improvement   # rewards moving toward target (buying OR selling)
        + requote_penalty
 ```
 
@@ -98,6 +99,7 @@ All deltas are normalized by initial balance to make rewards scale-independent. 
 | **Spread Capture Delta** | 10.0 | Profit from round-trips (LIFO, boosted to match unrealized P&L scale) |
 | **Unrealized P&L** | 0.5 | EMA-smoothed (α=0.2), symmetric - reduces noise from oscillations |
 | **Fee Rebates (on close)** | 2.0 | Only when round-trip completes (2x for both legs) |
+| **Deviation Improvement** | 10.0 | Rewards moving toward target (buying when under, SELLING when over) |
 | **Requote Penalty** | -0.0001 | Per voluntary requote (normalized, encourages order persistence) |
 
 ### Design Notes

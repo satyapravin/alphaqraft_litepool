@@ -130,6 +130,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   double unrealized_delta_ema = 0.0; // EMA-smoothed unrealized P&L delta
   double prev_fees = 0.0;  // Track fees for fee rebate reward
   double prev_spread_capture = 0.0;  // LIFO spread capture tracking
+  double prev_leverage = 0.0;  // Track leverage for deviation improvement reward
   
   // EMA smoothing for unrealized P&L (reduces noise from price oscillations)
   static constexpr double UNREALIZED_EMA_ALPHA = 0.2;  // ~5 step half-life
@@ -234,6 +235,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     unrealized_delta_ema = 0.0;
     prev_fees = 0.0;
     prev_spread_capture = 0.0;
+    prev_leverage = 0.0;
     initial_balance_ = balance;  // Store initial balance for consistent reward scaling
     steps = 0;
     had_fills_prev_step_ = false;  // Reset fill tracking
@@ -588,12 +590,25 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     constexpr double REQUOTE_PENALTY = -0.0001;
     double requote_penalty = rl_chose_requote_ ? REQUOTE_PENALTY / initial_balance_ : 0.0;
     
-    // Total reward = realized + spread_capture + unrealized + fee_on_close + requote
+    // 5. Deviation improvement reward: incentivize moving TOWARD target inventory
+    // Agent was accumulating way past target (40% when target=10%) and never selling
+    // This rewards getting closer to target, whether by buying (when under) or selling (when over)
+    // Key insight: If at 40% and target=10%, SELLING reduces deviation → positive reward for closing!
+    double target_lev = strategy_ptr->getTargetInventory();
+    double prev_deviation = std::abs(prev_leverage - target_lev);
+    double curr_deviation = std::abs(leverage - target_lev);
+    double deviation_improvement = prev_deviation - curr_deviation;  // Positive when getting closer
+    prev_leverage = leverage;  // Update for next step
+    constexpr double DEVIATION_IMPROVEMENT_WEIGHT = 10.0;  // Strong incentive to move toward target
+    double deviation_reward = DEVIATION_IMPROVEMENT_WEIGHT * deviation_improvement;
+    
+    // Total reward = realized + spread_capture + unrealized + fee_on_close + requote + deviation_improvement
     // - Realized P&L: 1x (locked-in profits/losses)
     // - Spread capture: 10x (round-trip profit)
-    // - Unrealized P&L: 0.5x symmetric (gains and losses, oscillations cancel out)
-    // - Fee rebates: 2x but ONLY when closing (prevents gaming by only opening)
-    double reward = realized_component + unrealized_component + fee_reward + requote_penalty;
+    // - Unrealized P&L: 0.5x EMA-smoothed symmetric
+    // - Fee rebates: 2x but ONLY when closing
+    // - Deviation improvement: 10x (rewards moving toward target, whether buying or SELLING)
+    double reward = realized_component + unrealized_component + fee_reward + requote_penalty + deviation_reward;
     
     // Scale reward by 10000 to make it more readable (0.0001 → 1.0)
     // This is just a scaling factor, doesn't change the learning signal
