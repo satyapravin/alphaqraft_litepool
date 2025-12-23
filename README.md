@@ -109,9 +109,10 @@ All deltas are normalized by initial balance. Final reward scaled by 10,000 for 
 | Component | Used In | Description |
 |-----------|---------|-------------|
 | `realized_pnl_delta` | mm_reward | Profit/loss from closed positions |
-| `spread_capture_delta` | mm_reward | LIFO round-trip profit |
 | `fee_delta` | mm_reward | Maker rebates earned |
 | `unrealized_pnl_delta` | inv_reward | Mark-to-market P&L change |
+
+**Note**: Rewards directly match episode logs: `MM.Rew ≈ R.PnL + Fees`, `Inv.Rew ≈ U.PnL`
 
 ## Model Architecture
 
