@@ -128,16 +128,11 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   double max_size_pct = 2.0;
   long long steps = 0;
   
-  // Reward tracking
+  // Reward tracking (used for hierarchical RL reward streams)
   double prev_realized_pnl = 0.0;
-  double prev_unrealized_pnl = 0.0;  // Actual unrealized PnL (mark-to-market)
-  double unrealized_delta_ema = 0.0; // EMA-smoothed unrealized P&L delta
-  double prev_fees = 0.0;  // Track fees for fee rebate reward
-  double prev_spread_capture = 0.0;  // LIFO spread capture tracking
-  double prev_leverage = 0.0;  // Track leverage for deviation improvement reward
-  
-  // EMA smoothing for unrealized P&L (reduces noise from price oscillations)
-  static constexpr double UNREALIZED_EMA_ALPHA = 0.2;  // ~5 step half-life
+  double prev_unrealized_pnl = 0.0;  // For inv_reward (unrealized P&L delta)
+  double prev_fees = 0.0;            // For mm_reward (fee rebates)
+  double prev_spread_capture = 0.0;  // For mm_reward (round-trip profits)
   double initial_balance_ = 0.0; // Store initial balance for consistent reward scaling
   
   // Terminal info cache (stores metrics before reset for episode logging)
@@ -236,10 +231,8 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     
     prev_realized_pnl = 0.0;
     prev_unrealized_pnl = 0.0;
-    unrealized_delta_ema = 0.0;
     prev_fees = 0.0;
     prev_spread_capture = 0.0;
-    prev_leverage = 0.0;
     initial_balance_ = balance;  // Store initial balance for consistent reward scaling
     steps = 0;
     had_fills_prev_step_ = false;  // Reset fill tracking
@@ -525,54 +518,36 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
         state["info:final_net_amount_btc"_] = 0.0;
     }
     
-    // === Reward Calculation ===
-    double mid_price = info["mid_price"];
-    // leverage already extracted above for deviation_from_target calculation
+    // === Reward Calculation for Hierarchical RL ===
+    // Two separate reward streams for two agents:
+    // - MM Agent: realized P&L + spread capture + fees (execution quality)
+    // - Inventory Agent: unrealized P&L delta (market direction)
+    //
+    // The combined "reward" = mm_reward + inv_reward for backwards compatibility
+    // with single-agent training. Hierarchical training uses the separate streams.
     
-    // 1. Realized PnL components: both accounting methods, weighted separately
-    // - realized_pnl_delta (1x): matches episode logs (balance - initialBalance, average price method)
-    // - spread_capture_delta (10x): cleaner for market making (LIFO, captures round-trip profits)
-    // Spread capture is boosted to incentivize completing round-trips instead of accumulating positions
+    constexpr double REWARD_SCALE = 10000.0;  // Scale for readability
+    
+    // 1. Realized P&L delta (for mm_reward)
     double current_realized_pnl = info["realized_pnl"];
     double realized_pnl_delta = current_realized_pnl - prev_realized_pnl;
     prev_realized_pnl = current_realized_pnl;
-    if (initial_balance_ > 1e-9) {  // Guard against division by zero/near-zero
+    if (initial_balance_ > 1e-9) {
         realized_pnl_delta /= initial_balance_;
     } else {
         realized_pnl_delta = 0.0;
     }
     
+    // 2. Spread capture delta (for mm_reward)
     double spread_capture_delta = info["spread_capture"] - prev_spread_capture;
     prev_spread_capture = info["spread_capture"];
-    if (initial_balance_ > 1e-9) {  // Guard against division by zero/near-zero
+    if (initial_balance_ > 1e-9) {
         spread_capture_delta /= initial_balance_;
     } else {
         spread_capture_delta = 0.0;
     }
     
-    // Realized component: realized_pnl (1x) + spread_capture (10x)
-    constexpr double REALIZED_WEIGHT = 1.0;
-    constexpr double SPREAD_CAPTURE_WEIGHT = 10.0;  // Boosted to match unrealized scale
-    double realized_component = REALIZED_WEIGHT * realized_pnl_delta + SPREAD_CAPTURE_WEIGHT * spread_capture_delta;
-    
-    // 2. Unrealized P&L - EMA-smoothed, symmetric low weight
-    // Market makers hold inventory by design, so price oscillations cause U.PnL fluctuations
-    // EMA smoothing reduces noise from short-term price spikes
-    double current_unrealized_pnl = info["unrealized_pnl"];
-    double raw_unrealized_delta = current_unrealized_pnl - prev_unrealized_pnl;
-    prev_unrealized_pnl = current_unrealized_pnl;
-    if (initial_balance_ > 1e-9) {
-        raw_unrealized_delta /= initial_balance_;
-    } else {
-        raw_unrealized_delta = 0.0;
-    }
-    // EMA smoothing: alpha=0.2 gives ~5 step half-life
-    unrealized_delta_ema = UNREALIZED_EMA_ALPHA * raw_unrealized_delta + 
-                           (1.0 - UNREALIZED_EMA_ALPHA) * unrealized_delta_ema;
-    constexpr double UNREALIZED_WEIGHT = 0.5;  // Symmetric, low weight
-    double unrealized_component = UNREALIZED_WEIGHT * unrealized_delta_ema;
-    
-    // 3. Fee reward only on round-trip completion (doubled for both legs)
+    // 3. Fee delta (for mm_reward)
     double current_fees = info["fees"];
     double fee_delta = -(current_fees - prev_fees);  // Positive when rebates earned
     prev_fees = current_fees;
@@ -581,42 +556,31 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     } else {
         fee_delta = 0.0;
     }
-    // Only give fee reward when position was closed (spread_capture changed)
-    constexpr double FEE_WEIGHT = 2.0;  // 2x to account for both legs
-    double fee_reward = (std::abs(spread_capture_delta) > 1e-12) ? FEE_WEIGHT * fee_delta : 0.0;
     
-    // 4. Requote penalty: small cost for voluntary requotes
-    constexpr double REQUOTE_PENALTY = -0.0001;
-    double requote_penalty = rl_chose_requote_ ? REQUOTE_PENALTY / initial_balance_ : 0.0;
+    // 4. Unrealized P&L delta (for inv_reward)
+    double current_unrealized_pnl = info["unrealized_pnl"];
+    double unrealized_pnl_delta = current_unrealized_pnl - prev_unrealized_pnl;
+    prev_unrealized_pnl = current_unrealized_pnl;
+    if (initial_balance_ > 1e-9) {
+        unrealized_pnl_delta /= initial_balance_;
+    } else {
+        unrealized_pnl_delta = 0.0;
+    }
     
-    // 5. Deviation improvement reward: incentivize moving TOWARD target inventory
-    double target_lev = strategy_ptr->getTargetInventory();
-    double prev_deviation = std::abs(prev_leverage - target_lev);
-    double curr_deviation = std::abs(leverage - target_lev);
-    double deviation_improvement = prev_deviation - curr_deviation;  // Positive when getting closer
-    prev_leverage = leverage;  // Update for next step
-    constexpr double DEVIATION_IMPROVEMENT_WEIGHT = 10.0;  // Strong incentive to move toward target
-    double deviation_reward = DEVIATION_IMPROVEMENT_WEIGHT * deviation_improvement;
-    
-    // Total reward = realized + spread_capture + unrealized + fee_on_close + requote + deviation_improvement
-    double reward = realized_component + unrealized_component + fee_reward + requote_penalty + deviation_reward;
-    
-    // Scale reward by 10000 to make it more readable (0.0001 → 1.0)
-    constexpr double REWARD_SCALE = 10000.0;
-    reward *= REWARD_SCALE;
-    
-    state["reward"_] = reward;
-    
-    // === Hierarchical RL: Separate reward streams for two agents ===
-    // MM Agent reward: realized P&L + spread capture + fees (execution quality)
-    // This is what the market making agent optimizes - pure execution
+    // === MM Agent Reward: execution quality ===
+    // Rewards closing positions profitably (realized + spread_capture + fees)
     double mm_reward = (realized_pnl_delta + spread_capture_delta + fee_delta) * REWARD_SCALE;
     state["info:mm_reward"_] = mm_reward;
     
-    // Inventory Agent reward: unrealized P&L delta (market direction)
-    // This is what the inventory agent optimizes - position timing
-    double inv_reward = raw_unrealized_delta * REWARD_SCALE;
+    // === Inventory Agent Reward: market direction ===
+    // Rewards holding inventory in the right direction (unrealized P&L)
+    double inv_reward = unrealized_pnl_delta * REWARD_SCALE;
     state["info:inv_reward"_] = inv_reward;
+    
+    // === Combined Reward: for backwards compatibility with single-agent ===
+    // Simple sum of both reward streams (total wealth change)
+    double reward = mm_reward + inv_reward;
+    state["reward"_] = reward;
     
     state["obs"_].Assign(data.begin(), data.size());
   }
