@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Live inference script for trained PPO model.
+Live inference script for trained Hierarchical PPO model.
 Runs on production environment with real exchange connection.
 """
 
@@ -15,7 +15,7 @@ import litepool
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
-from simple_actor_critic import SimpleActorCritic
+from hierarchical_policy import create_hierarchical_policy
 from metric_logger import MetricLogger
 
 # --------------------------------------------------------------------------- #
@@ -38,7 +38,7 @@ def extract_pnl(info):
         return float(v[0]) if isinstance(v, (list, np.ndarray)) else float(v)
 
     return {k: _get(k) for k in
-            ("realized_pnl", "unrealized_pnl", "fees", "leverage")}
+            ("realized_pnl", "unrealized_pnl", "fees", "leverage", "mm_reward", "inv_reward")}
 
 
 # --------------------------------------------------------------------------- #
@@ -61,115 +61,109 @@ def load_model_and_env():
         batch_size=NUM_ENVS,
         num_threads=1,
         is_prod=True,  # Production mode!
-        is_inverse_instr=True,
+        is_inverse_instr=False,
         api_key=api_key,
         api_secret=api_secret,
-        symbol="BTC-PERPETUAL",
-        hedge_symbol="BTC-18APR25",
+        symbol="BTC_USDC-PERPETUAL",
+        hedge_symbol="BTC_USDC-18APR25",
         tick_size=0.5,
-        min_amount=10,
-        maker_fee=-0.0001,
+        min_amount=0.0001,
+        maker_fee=-0.000025,
         taker_fee=0.0005,
         foldername="",  # Not used in prod
-        balance=1.0,  # Will be fetched from exchange
+        balance=20000.0,  # Will be fetched from exchange
         start=1,
-        max=MAX_STEPS,
+        max_episode_steps=MAX_STEPS,
     )
     env.spec.id = "RlTrader-v0"
 
-    # All observation signals are already bounded to [-1, 1]:
-    # - Market signals (13): all use tanh or are bounded by construction
-    # - AMM signals (3): all clamped or bounded to [-1, 1]
-    # No normalization needed!
-    results_dir = Path("results")
-
-    # Model
-    model = SimpleActorCritic(
-        obs_dim=32,
-        action_dim=4,  # 3 continuous (bid_spread, ask_spread, target_inventory) + 1 binary (requote)
-        hidden_dim=64,
+    # Create hierarchical policy
+    policy = create_hierarchical_policy(
+        inventory_update_freq=100,
+        device=str(device),
     )
-    model.eval()
+    policy.eval()
 
-    # Load best model for production
-    model_path = results_dir / "best_model.pth"
+    # Load trained model
+    results_dir = Path("results/hierarchical")
+    model_path = results_dir / "best_model.pt"
     if not model_path.exists():
-        model_path = results_dir / "final_model.pth"
+        model_path = results_dir / "final_model.pt"
     if not model_path.exists():
         raise FileNotFoundError(f"No model found in {results_dir}")
     
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    print(f"[Model] Loaded weights from {model_path}")
+    checkpoint = torch.load(model_path, map_location=device)
+    policy.inventory_agent.load_state_dict(checkpoint['inventory_agent'])
+    policy.mm_agent.load_state_dict(checkpoint['mm_agent'])
+    print(f"[Model] Loaded hierarchical policy from {model_path}")
 
-    return env, model
+    return env, policy
 
 
 # --------------------------------------------------------------------------- #
 # Main loop                                                                   #
 # --------------------------------------------------------------------------- #
 def main():
-    print("\n" + "=" * 70)
-    print("PPO Live Inference - PRODUCTION MODE")
-    print("=" * 70)
+    print("\n" + "=" * 90)
+    print("Hierarchical PPO Live Inference - PRODUCTION MODE")
+    print("=" * 90)
     print("WARNING: This will execute real trades on the exchange!")
-    print("=" * 70 + "\n")
+    print("=" * 90 + "\n")
     
-    env, model = load_model_and_env()
+    env, policy = load_model_and_env()
     logger = MetricLogger(print_interval=60)  # Log every minute
 
     obs, info = env.reset()
+    policy.reset(NUM_ENVS)
     print("[Env] Connected and reset")
     
     step = 0
-    cum_reward = 0.0
-    ep_rewards = []
-    ep_infos = []
+    cum_mm_reward = 0.0
+    cum_inv_reward = 0.0
     
     # Tracking
     total_realized_pnl = 0.0
     total_fees = 0.0
 
-    print(f"\n{'Step':>8} | {'Reward':>8} | {'R.PnL':>10} | {'U.PnL':>10} | {'Fees':>8} | {'Lev':>6}")
-    print("-" * 70)
+    print(f"\n{'Step':>8} | {'MM.Rew':>8} | {'Inv.Rew':>8} | {'R.PnL':>10} | {'U.PnL':>10} | {'Fees':>8} | {'Lev':>6}")
+    print("-" * 90)
 
     try:
         while step < MAX_STEPS:
-            # Get action from model (deterministic for production)
-            obs_tensor = torch.as_tensor(obs, dtype=torch.float32)
-            action, _, _ = model.get_action(obs_tensor, deterministic=True)
-            
-            # Ensure action is 2D for vectorized env
-            if action.ndim == 1:
-                action = action.reshape(1, -1)
+            # Get action from hierarchical policy (deterministic for production)
+            action, info_dict = policy.get_action(obs, deterministic=True)
 
             # Step environment (this sends orders to exchange!)
             next_obs, reward, terminated, truncated, info = env.step(action)
             done = np.logical_or(terminated, truncated)
 
-            r = float(reward[0] if isinstance(reward, np.ndarray) else reward)
-            cum_reward += r
-            ep_rewards.append(r)
-            ep_infos.append(info)
+            # Extract rewards
+            pnl = extract_pnl(info)
+            mm_r = pnl.get('mm_reward', 0.0)
+            inv_r = pnl.get('inv_reward', 0.0)
+            
+            cum_mm_reward += mm_r
+            cum_inv_reward += inv_r
             step += 1
 
-            # Extract PnL info
-            pnl = extract_pnl(info)
+            # Track metrics
             total_realized_pnl = pnl['realized_pnl']
             total_fees = pnl['fees']
 
-            # Print progress
-            print(f"{step:8d} | {r:+8.4f} | "
-                  f"{pnl['realized_pnl']:+10.6f} | {pnl['unrealized_pnl']:+10.6f} | "
-                  f"{pnl['fees']:8.6f} | {pnl['leverage']:6.2f}x", end="\r")
+            # Print progress (overwrite line)
+            print(f"{step:8d} | {mm_r:+8.2f} | {inv_r:+8.2f} | "
+                  f"{pnl['realized_pnl']:+10.4f} | {pnl['unrealized_pnl']:+10.4f} | "
+                  f"{pnl['fees']:8.4f} | {pnl['leverage']:6.2f}x", end="\r")
 
             if np.any(done):
-                print(f"\n[Session End] steps={step}  ΣR={sum(ep_rewards):.4f}  "
-                      f"R.PnL={total_realized_pnl:.6f}")
+                print(f"\n[Session End] steps={step}  MM.Rew={cum_mm_reward:.2f}  Inv.Rew={cum_inv_reward:.2f}  "
+                      f"R.PnL={total_realized_pnl:.4f}")
                 
                 # In production, we typically just continue
                 obs, info = env.reset()
-                ep_rewards = []
-                ep_infos = []
+                policy.reset(NUM_ENVS)
+                cum_mm_reward = 0.0
+                cum_inv_reward = 0.0
             else:
                 obs = next_obs
 
@@ -177,14 +171,15 @@ def main():
         print("\n\n[CTRL+C] Shutting down gracefully...")
 
     finally:
-        print("\n" + "=" * 70)
+        print("\n" + "=" * 90)
         print("Session Summary")
-        print("=" * 70)
+        print("=" * 90)
         print(f"Total steps:        {step}")
-        print(f"Cumulative reward:  {cum_reward:.4f}")
-        print(f"Realized PnL:       {total_realized_pnl:.6f}")
-        print(f"Total fees:         {total_fees:.6f}")
-        print("=" * 70)
+        print(f"MM reward:          {cum_mm_reward:.4f}")
+        print(f"Inv reward:         {cum_inv_reward:.4f}")
+        print(f"Realized PnL:       {total_realized_pnl:.4f}")
+        print(f"Total fees:         {total_fees:.4f}")
+        print("=" * 90)
         env.close()
         print("[Env] Closed. Goodbye!")
 

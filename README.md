@@ -30,14 +30,13 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 
 | Component | Description |
 |-----------|-------------|
-| `tianshou_ppo.py` | Single-agent training script with PPO |
-| `hierarchical_ppo.py` | **Two-agent hierarchical training** (recommended) |
+| `hierarchical_ppo.py` | Main training script (two-agent PPO) |
+| `hierarchical_policy.py` | Coordinates Inventory and MM agents |
 | `inventory_agent.py` | Inventory Agent: MLP [64, 32], learns target inventory |
 | `mm_agent.py` | MM Agent: MLP [128, 64] + LSTM, learns execution |
-| `hierarchical_policy.py` | Coordinates both agents, handles update frequencies |
-| `simple_actor_critic.py` | Single-agent LSTM Actor-Critic |
-| `simple_collector.py` | Experience collection from vectorized environments |
-| `simple_ppo_policy.py` | PPO policy with clipped surrogate objective |
+| `test_ppo.py` | Evaluation script for trained model |
+| `infer_ppo.py` | Live inference script for production |
+| `metric_logger.py` | Logging utilities |
 
 ## Action Space (4 dimensions)
 
@@ -209,18 +208,16 @@ cp lib/rltrader_litepool.so ../litepool/rltrader/
 
 ## Training
 
-### Hierarchical Two-Agent (Recommended)
-
 ```bash
 cd litepool/rltrader/python
 python hierarchical_ppo.py
 ```
 
-### Single-Agent (Original)
+### Evaluation
 
 ```bash
-cd litepool/rltrader/python
-python tianshou_ppo.py
+python test_ppo.py   # Run on test data
+python infer_ppo.py  # Run on live exchange (production)
 ```
 
 ### Key Hyperparameters
