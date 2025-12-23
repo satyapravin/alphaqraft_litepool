@@ -100,7 +100,7 @@ All deltas are normalized by initial balance to make rewards scale-independent. 
 | **Unrealized P&L Delta** | 0.1 | Minimal weight - forces agent to close positions for real rewards |
 | **Fee Rebate Delta** | 10.0 | Maker rebates earned (strongly incentivizes trading activity) |
 | **Requote Penalty** | -0.0001 | Per voluntary requote (normalized, encourages order persistence) |
-| **Deviation Penalty** | -1.0 | Per unit of \|leverage - target\| (incentivizes staying close to target inventory) |
+| **Deviation Penalty** | -0.0001 | Per unit of \|leverage - target\| (small weight to match normalized scale) |
 
 ### Design Notes
 

@@ -581,10 +581,12 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     // - Stay close to its chosen target inventory
     // - Correct deviations quickly (close positions that exceed target)
     // - Not accumulate positions beyond target
-    double leverage = info["leverage"];
+    // NOTE: Other reward components are normalized by initial_balance (~$1000),
+    // so deviation penalty needs a small weight to match scale.
+    // With 0.0001 weight: deviation of 0.1 → -0.1 per step (after 10000x scale)
     double target_lev = strategy_ptr->getTargetInventory();
     double deviation = std::abs(leverage - target_lev);
-    constexpr double DEVIATION_WEIGHT = 1.0;  // Penalty per unit of deviation
+    constexpr double DEVIATION_WEIGHT = 0.0001;  // Small weight to match normalized scale
     double deviation_penalty = -DEVIATION_WEIGHT * deviation;
     
     // Total reward = realized + unrealized + fees + requote + deviation penalty
