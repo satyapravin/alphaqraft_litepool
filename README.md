@@ -82,32 +82,30 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 ## Reward Function
 
 ```
-reward = 1.0 * realized_pnl_delta + 10.0 * spread_capture_delta
-       + 0.5 * unrealized_pnl_ema       # EMA-smoothed (α=0.2), symmetric
-       + fee_reward_on_close            # 2x, only when spread_capture changes
-       + 10.0 * deviation_improvement   # rewards moving toward target (buying OR selling)
-       + requote_penalty
+reward = ΔWealth - γ × position²
+
+Where:
+  ΔWealth = (realized_pnl + unrealized_pnl) - prev_wealth
+  γ = 1.0 (risk aversion coefficient)
+  position² = leverage² (quadratic penalty for position size)
 ```
 
 All deltas are normalized by initial balance to make rewards scale-independent. Final reward is scaled by 10,000 for readability.
 
-### Reward Components
+### Reward Components (CARA-Style)
 
 | Component | Weight | Description |
 |-----------|--------|-------------|
-| **Realized P&L Delta** | 1.0 | Profit/loss from completed trades (average price accounting) |
-| **Spread Capture Delta** | 10.0 | Profit from round-trips (LIFO, boosted to match unrealized P&L scale) |
-| **Unrealized P&L** | 0.5 | EMA-smoothed (α=0.2), symmetric - reduces noise from oscillations |
-| **Fee Rebates (on close)** | 2.0 | Only when round-trip completes (2x for both legs) |
-| **Deviation Improvement** | 10.0 | Rewards moving toward target (buying when under, SELLING when over) |
-| **Requote Penalty** | -0.0001 | Per voluntary requote (normalized, encourages order persistence) |
+| **Wealth Delta (ΔW)** | 1.0 | Change in total P&L (realized + unrealized) |
+| **Risk Penalty (-γ×pos²)** | -1.0 | Quadratic penalty for position size (γ=1.0) |
 
 ### Design Notes
 
-- **Spread capture boosted (10x)**: Spread capture is ~50x smaller scale than unrealized P&L, so needs higher weight to incentivize round-trips
-- **Zero unrealized P&L (0x)**: Agent must close positions to earn any reward (no credit for paper gains)
-- **Fee weight (10x)**: Strongly incentivizes trading activity (agent learned to not trade when weight was too low)
-- **Requote penalty**: Only penalizes *voluntary* requotes (agent choice), not forced requotes (first step, no orders, after fills)
+- **CARA utility**: Constant Absolute Risk Aversion - simple, economically principled
+- **Wealth delta**: Rewards making money (realized or unrealized, doesn't matter)
+- **Quadratic risk penalty**: Large positions are exponentially costly to hold
+- **Natural incentive to close**: Closing reduces position² → reduces penalty
+- **No gaming**: Can't exploit by only opening - accumulation is punished by risk penalty
 
 ## Model Architecture
 
