@@ -70,13 +70,14 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 - `sell_pressure`: EMA-based sell pressure indicator
 - `time_since_last_trade`: Normalized temporal signal for trade recency
 
-**Agent State (6):**
+**Agent State (7):**
 - `current_leverage`: Agent's current position leverage (critical for inventory management)
 - `normalized_position`: Position value normalized by initial balance (direct inventory signal)
 - `normalized_unrealized_pnl`: Unrealized P&L normalized by initial balance (mark-to-market performance)
 - `normalized_realized_pnl`: Realized P&L normalized by initial balance (locked-in performance)
 - `normalized_spread_capture`: Spread capture normalized by initial balance (direct reward signal)
 - `deviation_from_target`: Signed deviation of current leverage from target leverage (positive = over-leveraged, negative = under-leveraged)
+- `unrealized_pnl_pct`: Unrealized P&L as % of position value (±1% maps to ±0.76, helps agent learn to close at profit/loss thresholds)
 
 ## Reward Function
 
@@ -173,7 +174,7 @@ python tianshou_ppo.py
 | `BASE_SPREAD_BPS` | 1.0 | Base spread in basis points |
 | `MIN_SIZE_PCT` | 1.0% | Order size as % of balance (per level, 5 levels = 5% total per side) |
 | `Model Params` | ~84k | LSTM Actor-Critic parameters |
-| `OBS_DIM` | 31 | Observation space (13 market + 4 AMM + 8 trade + 6 agent state) |
+| `OBS_DIM` | 32 | Observation space (13 market + 4 AMM + 8 trade + 7 agent state) |
 
 ## Data Format
 
@@ -210,6 +211,11 @@ The environment exposes several info fields for monitoring and debugging:
   - Positive when leverage > target (over-leveraged)
   - Negative when leverage < target (under-leveraged)
   - Useful for tracking how well the agent maintains its target position
+
+- `unrealized_pnl_pct`: Unrealized P&L as percentage of position value
+  - Tells the agent "I'm up/down X% on my current position"
+  - ±1% P/L maps to ±0.76 (tanh scaling with 100x multiplier)
+  - Agent can learn to close positions at profit/loss thresholds (e.g., ±1%)
 
 ## License
 

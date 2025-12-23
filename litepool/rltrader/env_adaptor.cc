@@ -212,7 +212,7 @@ void EnvAdaptor::computeState(OrderBook& book)
         std::fill_n(state.begin() + 17, 8, 0.0);
     }
     
-    // [25-30] Agent state (6 signals): leverage, position, P&L, and deviation from target
+    // [25-31] Agent state (7 signals): leverage, position, P&L, deviation, and unrealized P/L %
     auto posInfo = strategy.getPosition().getPositionInfo(book.bid_prices[0], book.ask_prices[0]);
     double initialBalance = strategy.getPosition().getInitialBalance();
     
@@ -243,6 +243,16 @@ void EnvAdaptor::computeState(OrderBook& book)
         double target_leverage = strategy.getTargetInventory();
         double leverage_deviation = posInfo.leverage - target_leverage;
         state[30] = std::tanh(leverage_deviation * 10.0);  // Scale: ±0.1 deviation maps to ±tanh(1) ≈ ±0.76
+        
+        // [31] Unrealized P/L as % of position value
+        // Tells the agent "I'm up/down X% on my current position"
+        // Agent can learn to close at ±1% threshold
+        if (positionValue > 1e-9) {  // Guard against division by zero when no position
+            double unrealized_pnl_pct = posInfo.inventoryPnL / positionValue;
+            state[31] = std::tanh(unrealized_pnl_pct * 100.0);  // Scale: ±1% maps to ±tanh(1) ≈ ±0.76
+        } else {
+            state[31] = 0.0;  // No position, no % P/L
+        }
     } else {
         // Zero out agent state signals if initial balance is invalid
         state[26] = 0.0;
@@ -250,6 +260,7 @@ void EnvAdaptor::computeState(OrderBook& book)
         state[28] = 0.0;
         state[29] = 0.0;
         state[30] = 0.0;
+        state[31] = 0.0;
     }
     
     computeInfo(book);

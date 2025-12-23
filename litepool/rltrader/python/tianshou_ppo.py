@@ -96,7 +96,7 @@ np.random.seed(42)
 # - Binary head (Bernoulli): 1 requote decision
 # - 3 hidden layers with LayerNorm for stable training
 model = SimpleActorCritic(
-    obs_dim=31,  # 13 market + 4 AMM flow + 8 trade + 5 agent state + 1 deviation from target
+    obs_dim=32,  # 13 market + 4 AMM flow + 8 trade + 7 agent state
     action_dim=4,  # 3 quote params (bid_spread, ask_spread, target_inventory) + 1 requote decision
     hidden_dim=128,  # MLP hidden dimension
     lstm_hidden=64,  # LSTM hidden dimension for temporal patterns

@@ -31,7 +31,7 @@ import torch.nn as nn
 
 
 class SimpleActorCritic(nn.Module):
-    def __init__(self, obs_dim=31, action_dim=4, hidden_dim=128, lstm_hidden=64):
+    def __init__(self, obs_dim=32, action_dim=4, hidden_dim=128, lstm_hidden=64):
         super().__init__()
         assert action_dim == 4, "Expected 4 actions: 3 continuous (bid_spread, ask_spread, target_inventory) + 1 binary (requote)"
         
