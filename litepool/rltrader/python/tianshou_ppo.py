@@ -48,7 +48,7 @@ MINIBATCH_SIZE = 128   # Minibatch size for updates
 TOTAL_EPOCHS = 10000   # Total training epochs
 LEARNING_RATE = 1e-4   # Reduced from 1e-4 to prevent gradient explosion
 GAMMA = 0.995    
-GAE_LAMBDA = 0.95
+GAE_LAMBDA = 0.995
 BASE_SPREAD_BPS = 1.0  # Base spread in basis points (1 bps = $10 on $100k BTC - room for spread capture)
 MIN_SIZE_PCT = 1.0      # 1% per level × 5 levels = 5% total per side (ladder quoting)
 MAX_SIZE_PCT = 5.0     # Same as MIN - fixed size, no RL control
@@ -72,10 +72,9 @@ env = litepool.make(
     maker_fee=-0.000025,
     taker_fee=0.0005,
     foldername="/home/pravin/dev/alphaqraft_litepool/data/training/",
-    balance=100000.0,  # Starting capital: $100,000 USD
-                       # With BTC ~$100k, 2% of $100k = $2,000 = ~0.02 BTC per order
-    start=36000,
-    max_episode_steps=2048,  # 
+    balance=20000.0,  # Starting capital: $2,000 USD
+    start=360000,
+    max_episode_steps=4096,  # 
     base_spread_bps=BASE_SPREAD_BPS,  # Base spread in basis points
     min_size_pct=MIN_SIZE_PCT,        # Minimum order size as % of balance
     max_size_pct=MAX_SIZE_PCT,        # Maximum order size as % of balance

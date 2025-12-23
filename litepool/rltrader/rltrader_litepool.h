@@ -517,10 +517,10 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     double mid_price = info["mid_price"];
     // leverage already extracted above for deviation_from_target calculation
     
-    // 1. Realized PnL components: combine both accounting methods
-    // - realized_pnl_delta: matches episode logs (balance - initialBalance, average price method)
-    // - spread_capture_delta: cleaner for market making (LIFO, captures round-trip profits)
-    // Use 50/50 blend to balance accuracy with market-making signal quality
+    // 1. Realized PnL components: both accounting methods, weighted separately
+    // - realized_pnl_delta (1x): matches episode logs (balance - initialBalance, average price method)
+    // - spread_capture_delta (2x): cleaner for market making (LIFO, captures round-trip profits)
+    // Spread capture is boosted to incentivize completing round-trips instead of accumulating positions
     double current_realized_pnl = info["realized_pnl"];
     double realized_pnl_delta = current_realized_pnl - prev_realized_pnl;
     prev_realized_pnl = current_realized_pnl;
@@ -538,15 +538,14 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
         spread_capture_delta = 0.0;
     }
     
-    // Blend: 50% realized_pnl (matches accounting) + 50% spread_capture (cleaner signal)
+    // Realized component: realized_pnl (1x) + spread_capture (2x)
+    // Spread capture boosted to incentivize completing round-trips (agent was accumulating positions)
     constexpr double REALIZED_WEIGHT = 1.0;
-    constexpr double SPREAD_CAPTURE_WEIGHT = 1.0;
+    constexpr double SPREAD_CAPTURE_WEIGHT = 2.0;
     double realized_component = REALIZED_WEIGHT * realized_pnl_delta + SPREAD_CAPTURE_WEIGHT * spread_capture_delta;
     
-    // 2. Unrealized PnL delta (actual mark-to-market, reduced weight)
-    // Use actual unrealized PnL from position tracking (not approximation)
-    // This represents mark-to-market PnL from open positions
-    // Normalized by initial balance to make it scale-independent
+    // 2. Unrealized PnL delta - simple 1x weight, no decomposition
+    // Mark-to-market changes on open positions, directly aligned with actual P/L
     double current_unrealized_pnl = info["unrealized_pnl"];
     double unrealized_delta = current_unrealized_pnl - prev_unrealized_pnl;
     prev_unrealized_pnl = current_unrealized_pnl;
@@ -556,10 +555,9 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
         unrealized_delta = 0.0;
     }
     
-    // 3. Fee rebate reward: with maker_fee < 0, fees becomes more negative when trading
-    // We reward the agent for earning rebates (flip sign so rebates = positive reward)
-    // Normalized by initial balance to make it scale-independent
-    // Weight increased to encourage more fills (agent was quoting too wide and not trading)
+    // 3. Fee rebate reward (weight: 2x)
+    // With maker_fee < 0, fees become more negative when trading (rebates earned)
+    // Flip sign so rebates = positive reward, normalized by initial balance
     double current_fees = info["fees"];
     double fee_delta = -(current_fees - prev_fees);  // Positive when rebates earned
     prev_fees = current_fees;
@@ -569,21 +567,15 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
         fee_delta = 0.0;
     }
     
-    // 4. Requote penalty: discourage excessive voluntary requoting
-    // Only penalize when RL chose to requote without being forced
-    // Forced requotes (first step, no orders, after fills) are not penalized
-    // Small penalty to encourage letting orders sit and get filled
-    constexpr double REQUOTE_PENALTY = -0.001;  // Small penalty per voluntary requote (pre-scaling)
+    // 4. Requote penalty: small cost for voluntary requotes
+    // Only penalizes when RL chose to requote (not forced requotes after fills, first step, etc.)
+    constexpr double REQUOTE_PENALTY = -0.0001;
     double requote_penalty = rl_chose_requote_ ? REQUOTE_PENALTY / initial_balance_ : 0.0;
     
-    // Total reward: blended realized + unrealized + fees + penalties
-    // - Realized: 50% realized_pnl + 50% spread_capture (balances accounting with MM signal)
-    // - Unrealized: full weight to represent mark-to-market profits
-    // - Fees: boosted weight (2x) to encourage more fills (agent was quoting too wide)
-    // - Requote penalty: small cost for voluntary requotes to encourage order persistence
-    constexpr double UNREALIZED_WEIGHT = 1.0;
-    constexpr double FEE_WEIGHT = 2.0;  // Boosted to encourage fills
-    double reward = realized_component + UNREALIZED_WEIGHT * unrealized_delta + FEE_WEIGHT * fee_delta + requote_penalty;
+    // Total reward = realized_component + unrealized_delta + 2.0 * fee_delta + requote_penalty
+    // All deltas normalized by initial balance, final reward scaled by 10,000
+    constexpr double FEE_WEIGHT = 2.0;
+    double reward = realized_component + unrealized_delta + FEE_WEIGHT * fee_delta + requote_penalty;
     
     // Scale reward by 10000 to make it more readable (0.0001 → 1.0)
     // This is just a scaling factor, doesn't change the learning signal

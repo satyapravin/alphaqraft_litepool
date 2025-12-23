@@ -239,7 +239,6 @@ class SimpleCollector:
                 # DEBUG: Log which environments are ending and at what step
                 ending_envs = [i for i in range(self.n_envs) if episode_ended[i]]
                 ending_steps = [self.episode_steps[i] for i in ending_envs]
-                print(f"DEBUG: step_idx={step_idx}, episode_ended for envs {ending_envs} at steps {ending_steps}", flush=True)
                 self._log_episode_end(infos, episode_ended)
             
             # Mark environments that have completed their episode
@@ -266,7 +265,6 @@ class SimpleCollector:
             # Stop if all environments are truncated (completed at max_episode_steps) AND we have at least n_steps
             if all_truncated and step_idx >= n_steps:
                 # All environments completed at max_episode_steps - synchronized completion
-                print(f"DEBUG: All environments truncated at step {step_idx}. episode_completed={episode_completed}, episode_steps={self.episode_steps}, truncs={truncs}", flush=True)
                 break
             
             # Also stop if all have completed at least one episode AND we've collected enough steps

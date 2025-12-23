@@ -118,7 +118,7 @@ namespace RLTrader {
         
         // Model parameters
         static constexpr double TARGET_EMA_ALPHA = 0.01;     // Target inventory smoothing
-        static constexpr double VOL_EMA_ALPHA = 0.1;         // Volatility EMA (~10 sample half-life)
+        static constexpr double VOL_EMA_ALPHA = 0.01;        // Volatility EMA (~100 sample half-life)
         static constexpr double VOL_SPREAD_MULT = 50.0;      // How much volatility widens spread
         static constexpr double INVENTORY_SKEW_MULT = 50.0;  // Reduced: smoother quote shifts, agent spreads respected more
         // REMOVED: ACTION_SKEW_MULT - skew is now fully determined by inventory error

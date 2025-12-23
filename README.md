@@ -81,13 +81,11 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 ## Reward Function
 
 ```
-reward = realized_component 
-       + unrealized_pnl_delta 
+reward = (1.0 * realized_pnl_delta + 2.0 * spread_capture_delta)
+       + 1.0 * unrealized_pnl_delta 
        + 2.0 * fee_rebate_delta 
        + requote_penalty
 ```
-
-where `realized_component = 0.5 * realized_pnl_delta + 0.5 * spread_capture_delta`
 
 All deltas are normalized by initial balance to make rewards scale-independent. Final reward is scaled by 10,000 for readability.
 
@@ -95,25 +93,25 @@ All deltas are normalized by initial balance to make rewards scale-independent. 
 
 | Component | Weight | Description |
 |-----------|--------|-------------|
-| **Realized P&L Delta** | 0.5 | Profit/loss from completed trades (average price accounting) |
-| **Spread Capture Delta** | 0.5 | Profit from round-trips (LIFO accounting, cleaner MM signal) |
-| **Unrealized P&L Delta** | 1.0 | Mark-to-market changes on open positions |
-| **Fee Rebate Delta** | 2.0 | Maker rebates earned (boosted to encourage fills) |
+| **Realized P&L Delta** | 1.0 | Profit/loss from completed trades (average price accounting) |
+| **Spread Capture Delta** | 2.0 | Profit from round-trips (LIFO accounting, incentivizes completing trades) |
+| **Unrealized P&L Delta** | 1.0 | Mark-to-market changes on open positions (simple, no decomposition) |
+| **Fee Rebate Delta** | 2.0 | Maker rebates earned (encourages fills and tighter spreads) |
 | **Requote Penalty** | -0.0001 | Per voluntary requote (normalized, encourages order persistence) |
 
 ### Design Notes
 
-- **Fee weight boosted (2x)**: Encourages tighter spreads and more trading activity
+- **Spread capture boosted (2x)**: Incentivizes completing round-trips (the agent was accumulating positions without closing)
+- **Fee weight (2x)**: Encourages tighter spreads and more trading activity
 - **Requote penalty**: Only penalizes *voluntary* requotes (agent choice), not forced requotes (first step, no orders, after fills)
-- **Spread capture (LIFO)**: Provides cleaner signal than average price method for market making
-- **Exponential leverage penalty**: Smooth learning signal that prevents excessive leverage without hard cutoffs
+- **Simple unrealized P&L**: Uses 1x weight without decomposition - previous deviation penalties caused systematic negative bias even with profitable trades
 
 ## Model Architecture
 
 **LSTM Actor-Critic** with temporal pattern recognition:
 
 ```
-Observations [30] → MLP Feature Extractor [128] → LSTM [64] → Combined [192]
+Observations [31] → MLP Feature Extractor [128] → LSTM [64] → Combined [192]
                                                               ↓
                                                      ┌───────┴───────┐
                                                      ↓               ↓

@@ -212,8 +212,7 @@ void EnvAdaptor::computeState(OrderBook& book)
         std::fill_n(state.begin() + 17, 8, 0.0);
     }
     
-    // [25-29] Agent state: position, PnL, and performance metrics
-    // Critical for agent to know its own state for inventory management and performance tracking
+    // [25-30] Agent state (6 signals): leverage, position, P&L, and deviation from target
     auto posInfo = strategy.getPosition().getPositionInfo(book.bid_prices[0], book.ask_prices[0]);
     double initialBalance = strategy.getPosition().getInitialBalance();
     

@@ -53,17 +53,12 @@ void Strategy::reset() {
 }
 
 void Strategy::updateTargetInventory(double target_inventory_action) {
-    // RL action in [-1, 1] → scaled to [-0.1, +0.1] for target leverage
-    // This limits the target inventory to ±10% of balance
-    constexpr double TARGET_INVENTORY_SCALE = 0.1;
+    constexpr double TARGET_INVENTORY_SCALE = 1.0;
     double scaled_action = target_inventory_action * TARGET_INVENTORY_SCALE;
     
-    // EMA smoothing: target_inventory_ema = alpha * new_target + (1 - alpha) * old_target
-    // TARGET_EMA_ALPHA = 0.05 means ~20 step half-life (smooth updates)
     target_inventory_ema = TARGET_EMA_ALPHA * scaled_action + 
                           (1.0 - TARGET_EMA_ALPHA) * target_inventory_ema;
     
-    // Clamp to [-0.1, +0.1] - target inventory range
     target_inventory_ema = std::clamp(target_inventory_ema, -TARGET_INVENTORY_SCALE, TARGET_INVENTORY_SCALE);
 }
 
@@ -208,7 +203,7 @@ void Strategy::quote(const RLAction& action,
     // - More realistic market making
     // ============================================================================
     
-    constexpr int NUM_LEVELS = 5;
+    constexpr int NUM_LEVELS = 3;
     
     // Validate RL outputs are in expected range [-1, 1]
     assert(action.bid_spread >= -1.0001 && action.bid_spread <= 1.0001);
@@ -222,17 +217,6 @@ void Strategy::quote(const RLAction& action,
     auto posInfo = position.getPositionInfo(bid_prices[0], ask_prices[0]);
     auto leverage = posInfo.leverage;
     
-    // Stop quoting if leverage hits maximum (100% long or short)
-    // This prevents over-leveraging and allows agent to manage risk during extreme moves
-    if (leverage >= 1.0 || leverage <= -1.0) {
-        // Cancel any existing orders and exit
-        exchange.cancelOrders();
-        last_mid_price = (bid_prices[0] + ask_prices[0]) * 0.5;
-        last_bid_price = 0.0;
-        last_ask_price = 0.0;
-        hit_leverage_limit_ = true;  // Flag that leverage limit was hit
-        return;
-    }
     
     // Reset flag if leverage is back within limits
     hit_leverage_limit_ = false;
@@ -296,12 +280,16 @@ void Strategy::quote(const RLAction& action,
         // Place bid at this level
         if (can_place_bids && bid_price > 0) {
             this->exchange.quote(std::to_string(++order_id), OrderSide::BUY, bid_price, level_size);
-    }
+        }
         
         // Place ask at this level
         if (can_place_asks && ask_price > 0) {
             this->exchange.quote(std::to_string(++order_id), OrderSide::SELL, ask_price, level_size);
         }
+
+        if (leverage >= 1.0 || leverage <= -1.0) {
+            hit_leverage_limit_ = true;  // Flag that leverage limit was hit
+        }    
     }
 }
 
