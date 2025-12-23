@@ -83,9 +83,10 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 
 ```
 reward = (1.0 * realized_pnl_delta + 10.0 * spread_capture_delta)
-       + 1.0 * unrealized_pnl_delta
+       + 0.1 * unrealized_pnl_delta
        + 10.0 * fee_rebate_delta 
        + requote_penalty
+       - 1.0 * abs(leverage - target_leverage)  # deviation penalty
 ```
 
 All deltas are normalized by initial balance to make rewards scale-independent. Final reward is scaled by 10,000 for readability.
@@ -96,14 +97,15 @@ All deltas are normalized by initial balance to make rewards scale-independent. 
 |-----------|--------|-------------|
 | **Realized P&L Delta** | 1.0 | Profit/loss from completed trades (average price accounting) |
 | **Spread Capture Delta** | 10.0 | Profit from round-trips (LIFO, boosted to match unrealized P&L scale) |
-| **Unrealized P&L Delta** | 1.0 | Mark-to-market changes (aligns reward with actual P&L) |
+| **Unrealized P&L Delta** | 0.1 | Minimal weight - forces agent to close positions for real rewards |
 | **Fee Rebate Delta** | 10.0 | Maker rebates earned (strongly incentivizes trading activity) |
 | **Requote Penalty** | -0.0001 | Per voluntary requote (normalized, encourages order persistence) |
+| **Deviation Penalty** | -1.0 | Per unit of \|leverage - target\| (incentivizes staying close to target inventory) |
 
 ### Design Notes
 
 - **Spread capture boosted (10x)**: Spread capture is ~50x smaller scale than unrealized P&L, so needs higher weight to incentivize round-trips
-- **Symmetric unrealized P&L (1x)**: Aligns reward with actual P&L (asymmetric weighting caused systematic negative bias due to price oscillations)
+- **Minimal unrealized P&L (0.1x)**: Forces agent to close positions to earn meaningful rewards (agent was accumulating "paper gains" without booking profits)
 - **Fee weight (10x)**: Strongly incentivizes trading activity (agent learned to not trade when weight was too low)
 - **Requote penalty**: Only penalizes *voluntary* requotes (agent choice), not forced requotes (first step, no orders, after fills)
 

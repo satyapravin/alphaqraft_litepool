@@ -43,7 +43,7 @@ print(f"Using device: {device}")
 NUM_ENVS = 6           # Match number of training data files
 NUM_THREADS = 6        # Leave cores for main process (10 cores total)
 N_STEPS = 4096         # Steps per rollout
-UPDATE_EPOCHS = 3      # PPO epochs per update
+UPDATE_EPOCHS = 1      # PPO epochs per update
 MINIBATCH_SIZE = 128   # Minibatch size for updates
 TOTAL_EPOCHS = 10000   # Total training epochs
 LEARNING_RATE = 1e-4   # Reduced from 1e-4 to prevent gradient explosion

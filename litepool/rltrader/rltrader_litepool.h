@@ -545,12 +545,11 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     constexpr double SPREAD_CAPTURE_WEIGHT = 10.0;  // Boosted to match unrealized scale
     double realized_component = REALIZED_WEIGHT * realized_pnl_delta + SPREAD_CAPTURE_WEIGHT * spread_capture_delta;
     
-    // 2. Unrealized PnL delta - simple 1x weighting
-    // Previous asymmetric weighting (0.5x gains, 2x losses) was broken:
-    // - Price oscillations cause U.PnL to fluctuate even with net positive P&L
-    // - Asymmetric penalty on oscillations → systematic negative reward
-    // - Episode 76 had +$24.94 net profit but -366.99 reward!
-    // Now using simple 1x weight to align reward with actual P&L
+    // 2. Unrealized PnL delta - minimal 0.1x weighting
+    // Reduced to near-zero to discourage "paper gains" without closing
+    // Agent was accumulating positions (B:397/S:14) and getting rewarded for U.PnL
+    // without ever booking profits. With 0.1x weight, agent must close positions
+    // to get meaningful rewards (via realized P&L and spread capture)
     double current_unrealized_pnl = info["unrealized_pnl"];
     double unrealized_delta = current_unrealized_pnl - prev_unrealized_pnl;
     prev_unrealized_pnl = current_unrealized_pnl;
@@ -577,11 +576,22 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     constexpr double REQUOTE_PENALTY = -0.0001;
     double requote_penalty = rl_chose_requote_ ? REQUOTE_PENALTY / initial_balance_ : 0.0;
     
-    // Total reward = realized_component + 1.0 * unrealized_delta + 10.0 * fee_delta + requote_penalty
+    // 5. Deviation penalty: penalize when actual leverage differs from target
+    // This incentivizes the agent to:
+    // - Stay close to its chosen target inventory
+    // - Correct deviations quickly (close positions that exceed target)
+    // - Not accumulate positions beyond target
+    double leverage = info["leverage"];
+    double target_lev = strategy_ptr->getTargetInventory();
+    double deviation = std::abs(leverage - target_lev);
+    constexpr double DEVIATION_WEIGHT = 1.0;  // Penalty per unit of deviation
+    double deviation_penalty = -DEVIATION_WEIGHT * deviation;
+    
+    // Total reward = realized + unrealized + fees + requote + deviation penalty
     // All deltas normalized by initial balance, final reward scaled by 10,000
-    constexpr double UNREALIZED_WEIGHT = 1.0;  // Simple 1x to align with actual P&L
+    constexpr double UNREALIZED_WEIGHT = 0.1;  // Minimal - force agent to close for real rewards
     constexpr double FEE_WEIGHT = 10.0;  // Boosted to incentivize trading activity
-    double reward = realized_component + UNREALIZED_WEIGHT * unrealized_delta + FEE_WEIGHT * fee_delta + requote_penalty;
+    double reward = realized_component + UNREALIZED_WEIGHT * unrealized_delta + FEE_WEIGHT * fee_delta + requote_penalty + deviation_penalty;
     
     // Scale reward by 10000 to make it more readable (0.0001 → 1.0)
     // This is just a scaling factor, doesn't change the learning signal
