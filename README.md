@@ -86,7 +86,7 @@ reward = ΔWealth - γ × (leverage - target)²
 
 Where:
   ΔWealth = (realized_pnl + unrealized_pnl) - prev_wealth
-  γ = 0.001 (risk aversion coefficient, tuned to balance with wealth changes)
+  γ = 1.0 (risk aversion coefficient)
   deviation² = (leverage - target_inventory)² (quadratic penalty for deviation)
 ```
 
@@ -97,7 +97,7 @@ All deltas are normalized by initial balance to make rewards scale-independent. 
 | Component | Weight | Description |
 |-----------|--------|-------------|
 | **Wealth Delta (ΔW)** | 1.0 | Change in total P&L (realized + unrealized) |
-| **Deviation Penalty (-γ×dev²)** | -0.001 | Quadratic penalty for deviation from target (γ=0.001) |
+| **Deviation Penalty (-γ×dev²)** | -1.0 | Quadratic penalty for deviation from target (γ=1.0) |
 
 ### Design Notes
 
