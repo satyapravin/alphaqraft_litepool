@@ -30,8 +30,12 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 
 | Component | Description |
 |-----------|-------------|
-| `tianshou_ppo.py` | Main training script with PPO implementation |
-| `simple_actor_critic.py` | LSTM Actor-Critic with temporal pattern recognition |
+| `tianshou_ppo.py` | Single-agent training script with PPO |
+| `hierarchical_ppo.py` | **Two-agent hierarchical training** (recommended) |
+| `inventory_agent.py` | Inventory Agent: MLP [64, 32], learns target inventory |
+| `mm_agent.py` | MM Agent: MLP [128, 64] + LSTM, learns execution |
+| `hierarchical_policy.py` | Coordinates both agents, handles update frequencies |
+| `simple_actor_critic.py` | Single-agent LSTM Actor-Critic |
 | `simple_collector.py` | Experience collection from vectorized environments |
 | `simple_ppo_policy.py` | PPO policy with clipped surrogate objective |
 
@@ -46,7 +50,7 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 
 **Note**: The `skew` action was removed to avoid conflicts with `target_inventory`. Quote asymmetry (skew) is now computed automatically based on the difference between current position and target inventory.
 
-## Observation Space (31 signals)
+## Observation Space (32 signals)
 
 **Market Signals (13):**
 - Spread metrics: `market_spread`, `bid_depth`, `ask_depth`, `depth_imbalance`
@@ -111,10 +115,12 @@ All deltas are normalized by initial balance to make rewards scale-independent. 
 
 ## Model Architecture
 
+### Single-Agent (Original)
+
 **LSTM Actor-Critic** with temporal pattern recognition:
 
 ```
-Observations [31] → MLP Feature Extractor [128] → LSTM [64] → Combined [192]
+Observations [32] → MLP Feature Extractor [128] → LSTM [64] → Combined [192]
                                                               ↓
                                                      ┌───────┴───────┐
                                                      ↓               ↓
@@ -123,9 +129,50 @@ Observations [31] → MLP Feature Extractor [128] → LSTM [64] → Combined [19
                                               requote)
 ```
 
+### Hierarchical Two-Agent (New)
+
+Separates strategic and tactical decisions to prevent reward gaming:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      INVENTORY AGENT                             │
+│  Learns WHAT position to hold (strategic, slow decisions)       │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │ Input (12 dims): AMM signals, volatility, position state│    │
+│  │ Network: MLP [64, 32] with LayerNorm                     │    │
+│  │ Output: target_inventory ∈ [-0.1, 0.1]                   │    │
+│  │ Reward: Δ(unrealized_pnl) over 100 steps                 │    │
+│  │ Update freq: Every 100 steps (10 seconds)                │    │
+│  └─────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+                              │ target_inventory
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     MARKET MAKING AGENT                          │
+│  Learns HOW to execute toward target (tactical, fast decisions) │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │ Input (14 dims): Market signals (13) + target (1)        │    │
+│  │ Network: MLP [128, 64] + LSTM(64)                        │    │
+│  │ Output: bid_spread, ask_spread, requote (3 actions)      │    │
+│  │ Reward: realized_pnl + spread_capture + fees             │    │
+│  │ Update freq: Every step (100ms)                          │    │
+│  └─────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Why Two Agents?**
+- **Prevents gaming**: MM agent can't inflate rewards by only opening positions
+- **Clean separation**: Inventory agent learns market direction, MM agent learns execution
+- **Different time scales**: Strategic decisions (seconds) vs tactical decisions (milliseconds)
+- **Interpretable**: Can analyze each agent's learned behavior separately
+
+**Training**: Joint training with separate reward streams:
+- Inventory Agent: `info:inv_reward` (unrealized P&L delta)
+- MM Agent: `info:mm_reward` (realized + spread_capture + fees)
+
 Key features:
 - **MLP Feature Extractor**: 2-layer with LayerNorm for stable training
-- **LSTM**: Captures temporal patterns in market dynamics
+- **LSTM**: Captures temporal patterns in market dynamics (MM agent only)
 - **Exponential spread mapping**: More control at tighter spreads where profitability matters most
 - **Separate actor/critic heads**: Reduces interference in learning
 
@@ -160,6 +207,15 @@ cp lib/rltrader_litepool.so ../litepool/rltrader/
 ```
 
 ## Training
+
+### Hierarchical Two-Agent (Recommended)
+
+```bash
+cd litepool/rltrader/python
+python hierarchical_ppo.py
+```
+
+### Single-Agent (Original)
 
 ```bash
 cd litepool/rltrader/python

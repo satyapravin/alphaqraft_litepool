@@ -81,6 +81,10 @@ class RlTraderEnvFns {
                     "info:last_ask_price"_.Bind(Spec<double>({-1})),
                     "info:last_mid_price"_.Bind(Spec<double>({-1})),
                     "info:deviation_from_target"_.Bind(Spec<double>({-1})),
+                    "info:spread_capture"_.Bind(Spec<double>({-1})),
+                    // Hierarchical RL: separate reward streams for two agents
+                    "info:mm_reward"_.Bind(Spec<double>({-1})),   // MM agent: realized + spread_capture + fees
+                    "info:inv_reward"_.Bind(Spec<double>({-1})),  // Inventory agent: unrealized P&L delta
                     // Terminal info from completed episode (available after auto-reset)
                     "info:final_realized_pnl"_.Bind(Spec<double>({-1})),
                     "info:final_unrealized_pnl"_.Bind(Spec<double>({-1})),
@@ -500,6 +504,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     double target_leverage_info = strategy_ptr->getTargetInventory();
     double deviation_from_target = leverage - target_leverage_info;
     state["info:deviation_from_target"_] = deviation_from_target;
+    state["info:spread_capture"_] = info["spread_capture"];
     
     // Expose terminal info from completed episode (for episode logging)
     // This is populated when isDone becomes true, before auto-reset
@@ -601,6 +606,17 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     reward *= REWARD_SCALE;
     
     state["reward"_] = reward;
+    
+    // === Hierarchical RL: Separate reward streams for two agents ===
+    // MM Agent reward: realized P&L + spread capture + fees (execution quality)
+    // This is what the market making agent optimizes - pure execution
+    double mm_reward = (realized_pnl_delta + spread_capture_delta + fee_delta) * REWARD_SCALE;
+    state["info:mm_reward"_] = mm_reward;
+    
+    // Inventory Agent reward: unrealized P&L delta (market direction)
+    // This is what the inventory agent optimizes - position timing
+    double inv_reward = raw_unrealized_delta * REWARD_SCALE;
+    state["info:inv_reward"_] = inv_reward;
     
     state["obs"_].Assign(data.begin(), data.size());
   }
