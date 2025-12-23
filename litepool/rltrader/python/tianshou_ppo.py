@@ -42,7 +42,7 @@ print(f"Using device: {device}")
 # === Configuration ===
 NUM_ENVS = 6           # Match number of training data files
 NUM_THREADS = 6        # Leave cores for main process (10 cores total)
-N_STEPS = 2048         # Steps per rollout
+N_STEPS = 4096         # Steps per rollout
 UPDATE_EPOCHS = 3      # PPO epochs per update
 MINIBATCH_SIZE = 128   # Minibatch size for updates
 TOTAL_EPOCHS = 10000   # Total training epochs
@@ -74,7 +74,7 @@ env = litepool.make(
     foldername="/home/pravin/dev/alphaqraft_litepool/data/training/",
     balance=20000.0,  # Starting capital: $2,000 USD
     start=360000,
-    max_episode_steps=4096,  # 
+    max_episode_steps=N_STEPS,  # 
     base_spread_bps=BASE_SPREAD_BPS,  # Base spread in basis points
     min_size_pct=MIN_SIZE_PCT,        # Minimum order size as % of balance
     max_size_pct=MAX_SIZE_PCT,        # Maximum order size as % of balance

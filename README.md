@@ -81,8 +81,8 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 ## Reward Function
 
 ```
-reward = (1.0 * realized_pnl_delta + 2.0 * spread_capture_delta)
-       + 1.0 * unrealized_pnl_delta 
+reward = (1.0 * realized_pnl_delta + 10.0 * spread_capture_delta)
+       + 0.5 * unrealized_pnl_delta 
        + 2.0 * fee_rebate_delta 
        + requote_penalty
 ```
@@ -94,17 +94,17 @@ All deltas are normalized by initial balance to make rewards scale-independent. 
 | Component | Weight | Description |
 |-----------|--------|-------------|
 | **Realized P&L Delta** | 1.0 | Profit/loss from completed trades (average price accounting) |
-| **Spread Capture Delta** | 2.0 | Profit from round-trips (LIFO accounting, incentivizes completing trades) |
-| **Unrealized P&L Delta** | 1.0 | Mark-to-market changes on open positions (simple, no decomposition) |
+| **Spread Capture Delta** | 10.0 | Profit from round-trips (LIFO, boosted to match unrealized P&L scale) |
+| **Unrealized P&L Delta** | 0.5 | Mark-to-market changes (reduced to discourage position accumulation) |
 | **Fee Rebate Delta** | 2.0 | Maker rebates earned (encourages fills and tighter spreads) |
 | **Requote Penalty** | -0.0001 | Per voluntary requote (normalized, encourages order persistence) |
 
 ### Design Notes
 
-- **Spread capture boosted (2x)**: Incentivizes completing round-trips (the agent was accumulating positions without closing)
+- **Spread capture boosted (10x)**: Spread capture is ~50x smaller scale than unrealized P&L, so needs higher weight to incentivize round-trips
+- **Unrealized P&L reduced (0.5x)**: Prevents agent from becoming a directional trader (accumulating positions without closing)
 - **Fee weight (2x)**: Encourages tighter spreads and more trading activity
 - **Requote penalty**: Only penalizes *voluntary* requotes (agent choice), not forced requotes (first step, no orders, after fills)
-- **Simple unrealized P&L**: Uses 1x weight without decomposition - previous deviation penalties caused systematic negative bias even with profitable trades
 
 ## Model Architecture
 

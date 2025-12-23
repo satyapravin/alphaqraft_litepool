@@ -538,14 +538,15 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
         spread_capture_delta = 0.0;
     }
     
-    // Realized component: realized_pnl (1x) + spread_capture (2x)
-    // Spread capture boosted to incentivize completing round-trips (agent was accumulating positions)
+    // Realized component: realized_pnl (1x) + spread_capture (10x)
+    // Spread capture needs high weight because it's ~50x smaller scale than unrealized P&L
+    // (0.002 BTC round-trip at 1bps = $0.02 vs 0.2 BTC position with $10 move = $2)
     constexpr double REALIZED_WEIGHT = 1.0;
-    constexpr double SPREAD_CAPTURE_WEIGHT = 2.0;
+    constexpr double SPREAD_CAPTURE_WEIGHT = 10.0;  // Boosted to match unrealized scale
     double realized_component = REALIZED_WEIGHT * realized_pnl_delta + SPREAD_CAPTURE_WEIGHT * spread_capture_delta;
     
-    // 2. Unrealized PnL delta - simple 1x weight, no decomposition
-    // Mark-to-market changes on open positions, directly aligned with actual P/L
+    // 2. Unrealized PnL delta - reduced to 0.5x to discourage pure directional betting
+    // Agent was accumulating positions without closing - need to make holding less attractive
     double current_unrealized_pnl = info["unrealized_pnl"];
     double unrealized_delta = current_unrealized_pnl - prev_unrealized_pnl;
     prev_unrealized_pnl = current_unrealized_pnl;
@@ -572,10 +573,11 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     constexpr double REQUOTE_PENALTY = -0.0001;
     double requote_penalty = rl_chose_requote_ ? REQUOTE_PENALTY / initial_balance_ : 0.0;
     
-    // Total reward = realized_component + unrealized_delta + 2.0 * fee_delta + requote_penalty
+    // Total reward = realized_component + 0.5 * unrealized_delta + 2.0 * fee_delta + requote_penalty
     // All deltas normalized by initial balance, final reward scaled by 10,000
+    constexpr double UNREALIZED_WEIGHT = 0.5;  // Reduced to discourage position accumulation
     constexpr double FEE_WEIGHT = 2.0;
-    double reward = realized_component + unrealized_delta + FEE_WEIGHT * fee_delta + requote_penalty;
+    double reward = realized_component + UNREALIZED_WEIGHT * unrealized_delta + FEE_WEIGHT * fee_delta + requote_penalty;
     
     // Scale reward by 10000 to make it more readable (0.0001 → 1.0)
     // This is just a scaling factor, doesn't change the learning signal
