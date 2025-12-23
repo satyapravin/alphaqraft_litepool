@@ -183,7 +183,7 @@ class HierarchicalPPOTrainer:
         )
         
         # Metrics
-        self.logger = MetricLogger(log_dir="logs/hierarchical")
+        self.logger = MetricLogger(print_interval=1024)
         self.episode_rewards = deque(maxlen=100)
         self.episode_mm_rewards = deque(maxlen=100)
         self.episode_inv_rewards = deque(maxlen=100)

@@ -11,8 +11,8 @@ import torch.nn as nn
 import numpy as np
 from typing import Tuple, Optional, Dict, Any
 
-from .inventory_agent import InventoryAgent, INVENTORY_OBS_INDICES, INVENTORY_OBS_DIM
-from .mm_agent import MMAgent, MARKET_OBS_DIM
+from inventory_agent import InventoryAgent, INVENTORY_OBS_INDICES, INVENTORY_OBS_DIM
+from mm_agent import MMAgent, MARKET_OBS_DIM
 
 
 class HierarchicalPolicy(nn.Module):
