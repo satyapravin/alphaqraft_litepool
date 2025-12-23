@@ -129,10 +129,9 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   long long steps = 0;
   
   // Reward tracking (used for hierarchical RL reward streams)
-  double prev_realized_pnl = 0.0;
-  double prev_unrealized_pnl = 0.0;  // For inv_reward (unrealized P&L delta)
+  double prev_realized_pnl = 0.0;    // For mm_reward
+  double prev_unrealized_pnl = 0.0;  // For inv_reward
   double prev_fees = 0.0;            // For mm_reward (fee rebates)
-  double prev_spread_capture = 0.0;  // For mm_reward (round-trip profits)
   double initial_balance_ = 0.0; // Store initial balance for consistent reward scaling
   
   // Terminal info cache (stores metrics before reset for episode logging)
@@ -232,7 +231,6 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     prev_realized_pnl = 0.0;
     prev_unrealized_pnl = 0.0;
     prev_fees = 0.0;
-    prev_spread_capture = 0.0;
     initial_balance_ = balance;  // Store initial balance for consistent reward scaling
     steps = 0;
     had_fills_prev_step_ = false;  // Reset fill tracking
@@ -520,11 +518,11 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     
     // === Reward Calculation for Hierarchical RL ===
     // Two separate reward streams for two agents:
-    // - MM Agent: realized P&L + spread capture + fees (execution quality)
+    // - MM Agent: realized P&L + fees (execution quality)
     // - Inventory Agent: unrealized P&L delta (market direction)
     //
-    // The combined "reward" = mm_reward + inv_reward for backwards compatibility
-    // with single-agent training. Hierarchical training uses the separate streams.
+    // The combined "reward" = mm_reward + inv_reward = total wealth change
+    // This matches the episode logs: Net = R.PnL + U.PnL + Fees
     
     constexpr double REWARD_SCALE = 10000.0;  // Scale for readability
     
@@ -538,18 +536,9 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
         realized_pnl_delta = 0.0;
     }
     
-    // 2. Spread capture delta (for mm_reward)
-    double spread_capture_delta = info["spread_capture"] - prev_spread_capture;
-    prev_spread_capture = info["spread_capture"];
-    if (initial_balance_ > 1e-9) {
-        spread_capture_delta /= initial_balance_;
-    } else {
-        spread_capture_delta = 0.0;
-    }
-    
-    // 3. Fee delta (for mm_reward)
+    // 2. Fee delta (for mm_reward) - positive when rebates earned
     double current_fees = info["fees"];
-    double fee_delta = -(current_fees - prev_fees);  // Positive when rebates earned
+    double fee_delta = -(current_fees - prev_fees);
     prev_fees = current_fees;
     if (initial_balance_ > 1e-9) {
         fee_delta /= initial_balance_;
@@ -557,7 +546,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
         fee_delta = 0.0;
     }
     
-    // 4. Unrealized P&L delta (for inv_reward)
+    // 3. Unrealized P&L delta (for inv_reward)
     double current_unrealized_pnl = info["unrealized_pnl"];
     double unrealized_pnl_delta = current_unrealized_pnl - prev_unrealized_pnl;
     prev_unrealized_pnl = current_unrealized_pnl;
@@ -568,17 +557,19 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     }
     
     // === MM Agent Reward: execution quality ===
-    // Rewards closing positions profitably (realized + spread_capture + fees)
-    double mm_reward = (realized_pnl_delta + spread_capture_delta + fee_delta) * REWARD_SCALE;
+    // Rewards closing positions profitably: realized P&L + fee rebates
+    // Matches episode log: R.PnL + Fees
+    double mm_reward = (realized_pnl_delta + fee_delta) * REWARD_SCALE;
     state["info:mm_reward"_] = mm_reward;
     
     // === Inventory Agent Reward: market direction ===
     // Rewards holding inventory in the right direction (unrealized P&L)
+    // Matches episode log: U.PnL
     double inv_reward = unrealized_pnl_delta * REWARD_SCALE;
     state["info:inv_reward"_] = inv_reward;
     
-    // === Combined Reward: for backwards compatibility with single-agent ===
-    // Simple sum of both reward streams (total wealth change)
+    // === Combined Reward: total wealth change ===
+    // mm_reward + inv_reward = R.PnL + Fees + U.PnL = Net
     double reward = mm_reward + inv_reward;
     state["reward"_] = reward;
     
