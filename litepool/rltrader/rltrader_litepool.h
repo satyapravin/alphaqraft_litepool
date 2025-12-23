@@ -545,9 +545,12 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     constexpr double SPREAD_CAPTURE_WEIGHT = 10.0;  // Boosted to match unrealized scale
     double realized_component = REALIZED_WEIGHT * realized_pnl_delta + SPREAD_CAPTURE_WEIGHT * spread_capture_delta;
     
-    // 2. Unrealized PnL delta - asymmetric weighting to penalize losses more
-    // Positive unrealized: 0.5x (discourage holding for gains)
-    // Negative unrealized: 2.0x (strongly penalize accumulating losing positions)
+    // 2. Unrealized PnL delta - simple 1x weighting
+    // Previous asymmetric weighting (0.5x gains, 2x losses) was broken:
+    // - Price oscillations cause U.PnL to fluctuate even with net positive P&L
+    // - Asymmetric penalty on oscillations → systematic negative reward
+    // - Episode 76 had +$24.94 net profit but -366.99 reward!
+    // Now using simple 1x weight to align reward with actual P&L
     double current_unrealized_pnl = info["unrealized_pnl"];
     double unrealized_delta = current_unrealized_pnl - prev_unrealized_pnl;
     prev_unrealized_pnl = current_unrealized_pnl;
@@ -556,13 +559,6 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     } else {
         unrealized_delta = 0.0;
     }
-    
-    // Asymmetric weighting: losses hurt 4x more than gains help (2.0 / 0.5 = 4x)
-    constexpr double UNREALIZED_GAIN_WEIGHT = 0.5;
-    constexpr double UNREALIZED_LOSS_WEIGHT = 2.0;
-    double unrealized_weighted = (unrealized_delta >= 0) 
-        ? UNREALIZED_GAIN_WEIGHT * unrealized_delta 
-        : UNREALIZED_LOSS_WEIGHT * unrealized_delta;
     
     // 3. Fee rebate reward (weight: 2x)
     // With maker_fee < 0, fees become more negative when trading (rebates earned)
@@ -581,11 +577,11 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     constexpr double REQUOTE_PENALTY = -0.0001;
     double requote_penalty = rl_chose_requote_ ? REQUOTE_PENALTY / initial_balance_ : 0.0;
     
-    // Total reward = realized_component + unrealized_weighted + 10.0 * fee_delta + requote_penalty
+    // Total reward = realized_component + 1.0 * unrealized_delta + 10.0 * fee_delta + requote_penalty
     // All deltas normalized by initial balance, final reward scaled by 10,000
-    // Unrealized uses asymmetric weighting (0.5x gains, 2x losses) - see above
+    constexpr double UNREALIZED_WEIGHT = 1.0;  // Simple 1x to align with actual P&L
     constexpr double FEE_WEIGHT = 10.0;  // Boosted to incentivize trading activity
-    double reward = realized_component + unrealized_weighted + FEE_WEIGHT * fee_delta + requote_penalty;
+    double reward = realized_component + UNREALIZED_WEIGHT * unrealized_delta + FEE_WEIGHT * fee_delta + requote_penalty;
     
     // Scale reward by 10000 to make it more readable (0.0001 → 1.0)
     // This is just a scaling factor, doesn't change the learning signal
