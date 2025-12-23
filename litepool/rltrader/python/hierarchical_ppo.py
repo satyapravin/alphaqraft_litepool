@@ -369,7 +369,9 @@ class HierarchicalPPOTrainer:
         
         # Convert to tensors
         obs_t = torch.as_tensor(obs_flat, dtype=torch.float32, device=device)
-        actions_t = torch.as_tensor(actions_flat[:, :3], dtype=torch.float32, device=device)  # MM actions only
+        # MM actions: [bid_spread, ask_spread, requote] = indices [0, 1, 3]
+        mm_actions = np.concatenate([actions_flat[:, 0:2], actions_flat[:, 3:4]], axis=1)
+        actions_t = torch.as_tensor(mm_actions, dtype=torch.float32, device=device)
         inv_actions_t = torch.as_tensor(inv_actions_flat, dtype=torch.float32, device=device)
         old_log_probs_mm_t = torch.as_tensor(old_log_probs_mm, dtype=torch.float32, device=device)
         old_log_probs_inv_t = torch.as_tensor(old_log_probs_inv, dtype=torch.float32, device=device)
