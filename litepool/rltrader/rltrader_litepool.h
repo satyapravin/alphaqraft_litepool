@@ -128,8 +128,10 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   double prev_wealth = 0.0;  // Previous total wealth (realized + unrealized P&L)
   
   // Risk aversion coefficient for CARA utility
-  // Higher = more penalty for large positions = stronger incentive to close
-  static constexpr double RISK_AVERSION = 1.0;
+  // Lower values = less penalty for deviation from target
+  // Tuned so deviation penalty is comparable to wealth changes over an episode
+  // With γ=0.001: 10% deviation over 4096 steps = -0.01 * 0.001 * 100 * 4096 = -4.1
+  static constexpr double RISK_AVERSION = 0.001;
   double initial_balance_ = 0.0; // Store initial balance for consistent reward scaling
   
   // Terminal info cache (stores metrics before reset for episode logging)
