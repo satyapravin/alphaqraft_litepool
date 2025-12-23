@@ -545,8 +545,10 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     constexpr double SPREAD_CAPTURE_WEIGHT = 10.0;  // Boosted to match unrealized scale
     double realized_component = REALIZED_WEIGHT * realized_pnl_delta + SPREAD_CAPTURE_WEIGHT * spread_capture_delta;
     
-    // 2. Unrealized loss penalty (losses only, no reward for gains)
-    // Penalize holding losing positions to encourage cutting losses
+    // 2. Unrealized P&L - symmetric low weight
+    // Market makers hold inventory by design, so price oscillations cause U.PnL fluctuations
+    // Using symmetric weight so gains and losses mostly cancel, only net trend matters
+    // Low weight (0.5x) to prevent U.PnL from dominating realized P&L
     double current_unrealized_pnl = info["unrealized_pnl"];
     double unrealized_delta = current_unrealized_pnl - prev_unrealized_pnl;
     prev_unrealized_pnl = current_unrealized_pnl;
@@ -555,9 +557,8 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     } else {
         unrealized_delta = 0.0;
     }
-    // Only penalize losses (negative delta), gains get 0 reward
-    constexpr double UNREALIZED_LOSS_WEIGHT = 1.0;  // Penalize losses at 1x
-    double unrealized_loss_penalty = (unrealized_delta < 0) ? UNREALIZED_LOSS_WEIGHT * unrealized_delta : 0.0;
+    constexpr double UNREALIZED_WEIGHT = 0.5;  // Symmetric, low weight
+    double unrealized_component = UNREALIZED_WEIGHT * unrealized_delta;
     
     // 3. Fee reward only on round-trip completion (doubled for both legs)
     // When spread_capture changes, a position was closed
@@ -579,12 +580,12 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     constexpr double REQUOTE_PENALTY = -0.0001;
     double requote_penalty = rl_chose_requote_ ? REQUOTE_PENALTY / initial_balance_ : 0.0;
     
-    // Total reward = realized + spread_capture + unrealized_loss_penalty + fee_on_close + requote
+    // Total reward = realized + spread_capture + unrealized + fee_on_close + requote
     // - Realized P&L: 1x (locked-in profits/losses)
     // - Spread capture: 10x (round-trip profit)
-    // - Unrealized losses: 1x penalty (encourage cutting losses, no reward for gains)
+    // - Unrealized P&L: 0.5x symmetric (gains and losses, oscillations cancel out)
     // - Fee rebates: 2x but ONLY when closing (prevents gaming by only opening)
-    double reward = realized_component + unrealized_loss_penalty + fee_reward + requote_penalty;
+    double reward = realized_component + unrealized_component + fee_reward + requote_penalty;
     
     // Scale reward by 10000 to make it more readable (0.0001 → 1.0)
     // This is just a scaling factor, doesn't change the learning signal
