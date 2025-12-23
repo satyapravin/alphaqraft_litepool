@@ -573,10 +573,10 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     constexpr double REQUOTE_PENALTY = -0.0001;
     double requote_penalty = rl_chose_requote_ ? REQUOTE_PENALTY / initial_balance_ : 0.0;
     
-    // Total reward = realized_component + 0.5 * unrealized_delta + 2.0 * fee_delta + requote_penalty
+    // Total reward = realized_component + 0.5 * unrealized_delta + 10.0 * fee_delta + requote_penalty
     // All deltas normalized by initial balance, final reward scaled by 10,000
     constexpr double UNREALIZED_WEIGHT = 0.5;  // Reduced to discourage position accumulation
-    constexpr double FEE_WEIGHT = 2.0;
+    constexpr double FEE_WEIGHT = 10.0;  // Boosted to incentivize trading activity (agent was not trading)
     double reward = realized_component + UNREALIZED_WEIGHT * unrealized_delta + FEE_WEIGHT * fee_delta + requote_penalty;
     
     // Scale reward by 10000 to make it more readable (0.0001 → 1.0)

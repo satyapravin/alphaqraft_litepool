@@ -83,7 +83,7 @@ This project implements an **RL-based market maker** that learns to quote bid/as
 ```
 reward = (1.0 * realized_pnl_delta + 10.0 * spread_capture_delta)
        + 0.5 * unrealized_pnl_delta 
-       + 2.0 * fee_rebate_delta 
+       + 10.0 * fee_rebate_delta 
        + requote_penalty
 ```
 
@@ -96,14 +96,14 @@ All deltas are normalized by initial balance to make rewards scale-independent. 
 | **Realized P&L Delta** | 1.0 | Profit/loss from completed trades (average price accounting) |
 | **Spread Capture Delta** | 10.0 | Profit from round-trips (LIFO, boosted to match unrealized P&L scale) |
 | **Unrealized P&L Delta** | 0.5 | Mark-to-market changes (reduced to discourage position accumulation) |
-| **Fee Rebate Delta** | 2.0 | Maker rebates earned (encourages fills and tighter spreads) |
+| **Fee Rebate Delta** | 10.0 | Maker rebates earned (strongly incentivizes trading activity) |
 | **Requote Penalty** | -0.0001 | Per voluntary requote (normalized, encourages order persistence) |
 
 ### Design Notes
 
 - **Spread capture boosted (10x)**: Spread capture is ~50x smaller scale than unrealized P&L, so needs higher weight to incentivize round-trips
 - **Unrealized P&L reduced (0.5x)**: Prevents agent from becoming a directional trader (accumulating positions without closing)
-- **Fee weight (2x)**: Encourages tighter spreads and more trading activity
+- **Fee weight (10x)**: Strongly incentivizes trading activity (agent learned to not trade when weight was too low)
 - **Requote penalty**: Only penalizes *voluntary* requotes (agent choice), not forced requotes (first step, no orders, after fills)
 
 ## Model Architecture
