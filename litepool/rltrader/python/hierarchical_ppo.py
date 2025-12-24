@@ -191,7 +191,7 @@ class HierarchicalPPOTrainer:
         self.completed_episodes: List[EpisodeInfo] = []
         
         # Rollout buffer
-        obs_dim = 32
+        obs_dim = 36  # 13 market + 4 AMM + 8 trade + 11 agent state
         action_dim = 4
         self.buffer = RolloutBuffer.create(
             config.n_steps, config.num_envs, obs_dim, action_dim
