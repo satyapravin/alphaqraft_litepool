@@ -303,12 +303,8 @@ class HierarchicalPPOTrainer:
             self.buffer.inv_rewards[step] = inv_reward
             self.buffer.dones[step] = done
             
-            # Accumulate per-env rewards
-            self.episode_mm_total += mm_reward
-            self.episode_inv_total += inv_reward
-            self.episode_steps += 1
-            
-            # Handle episode ends
+            # Handle episode ends FIRST (before accumulating rewards)
+            # This is critical because on done=True, rewards are from the NEW episode after auto-reset
             for env_id in range(self.config.num_envs):
                 if done[env_id]:
                     # Extract terminal info from final_* fields
@@ -337,6 +333,13 @@ class HierarchicalPPOTrainer:
                     self.episode_mm_total[env_id] = 0
                     self.episode_inv_total[env_id] = 0
                     self.policy.reset_env(env_id)
+            
+            # Accumulate per-env rewards AFTER handling episode ends
+            # On done=True steps, rewards are from the NEW episode (after auto-reset)
+            # So we accumulate them for the new episode, not the old one
+            self.episode_mm_total += mm_reward
+            self.episode_inv_total += inv_reward
+            self.episode_steps += 1
             
             obs = next_obs
             self.global_step += self.config.num_envs
