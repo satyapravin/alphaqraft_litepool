@@ -129,9 +129,10 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   long long steps = 0;
   
   // Reward tracking (used for hierarchical RL reward streams)
-  double prev_realized_pnl = 0.0;    // For mm_reward
+  double prev_realized_pnl = 0.0;    // For logging only
   double prev_unrealized_pnl = 0.0;  // For inv_reward
   double prev_fees = 0.0;            // For mm_reward (fee rebates)
+  double prev_spread_capture = 0.0;  // For mm_reward (LIFO round-trip profit)
   double initial_balance_ = 0.0; // Store initial balance for consistent reward scaling
   
   // Terminal info cache (stores metrics before reset for episode logging)
@@ -231,6 +232,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     prev_realized_pnl = 0.0;
     prev_unrealized_pnl = 0.0;
     prev_fees = 0.0;
+    prev_spread_capture = 0.0;
     initial_balance_ = balance;  // Store initial balance for consistent reward scaling
     steps = 0;
     had_fills_prev_step_ = false;  // Reset fill tracking
@@ -518,25 +520,25 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     
     // === Reward Calculation for Hierarchical RL ===
     // Two separate reward streams for two agents:
-    // - MM Agent: realized P&L + fees (execution quality)
+    // - MM Agent: spread capture (LIFO) + fee rebates (execution quality)
     // - Inventory Agent: unrealized P&L delta (market direction)
     //
-    // The combined "reward" = mm_reward + inv_reward = total wealth change
-    // This matches the episode logs: Net = R.PnL + U.PnL + Fees
+    // MM agent optimizes for completing profitable round-trips + earning rebates
+    // Inv agent optimizes for holding inventory in the right direction
     
     constexpr double REWARD_SCALE = 10000.0;  // Scale for readability
     
-    // 1. Realized P&L delta (for mm_reward)
-    double current_realized_pnl = info["realized_pnl"];
-    double realized_pnl_delta = current_realized_pnl - prev_realized_pnl;
-    prev_realized_pnl = current_realized_pnl;
+    // 1. Spread capture delta (LIFO profit from round-trips)
+    double current_spread_capture = info["spread_capture"];
+    double spread_capture_delta = current_spread_capture - prev_spread_capture;
+    prev_spread_capture = current_spread_capture;
     if (initial_balance_ > 1e-9) {
-        realized_pnl_delta /= initial_balance_;
+        spread_capture_delta /= initial_balance_;
     } else {
-        realized_pnl_delta = 0.0;
+        spread_capture_delta = 0.0;
     }
     
-    // 2. Fee delta (for mm_reward) - positive when rebates earned
+    // 2. Fee delta - positive when rebates earned (maker fees are negative)
     double current_fees = info["fees"];
     double fee_delta = -(current_fees - prev_fees);
     prev_fees = current_fees;
@@ -556,20 +558,23 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
         unrealized_pnl_delta = 0.0;
     }
     
+    // Track realized P&L for logging only (not used in reward)
+    double current_realized_pnl = info["realized_pnl"];
+    prev_realized_pnl = current_realized_pnl;
+    
     // === MM Agent Reward: execution quality ===
-    // Rewards closing positions profitably: realized P&L + fee rebates
-    // Note: Scale doesn't need to match Inv reward - advantages are normalized independently
-    double mm_reward = (realized_pnl_delta + fee_delta) * REWARD_SCALE;
+    // spread_capture: LIFO profit from completing round-trips
+    // fee_delta: maker rebates earned from providing liquidity
+    // Both are directly controllable by the agent's quoting behavior
+    double mm_reward = (spread_capture_delta + fee_delta) * REWARD_SCALE;
     state["info:mm_reward"_] = mm_reward;
     
     // === Inventory Agent Reward: market direction ===
     // Rewards holding inventory in the right direction (unrealized P&L)
-    // Matches episode log: U.PnL
     double inv_reward = unrealized_pnl_delta * REWARD_SCALE;
     state["info:inv_reward"_] = inv_reward;
     
-    // === Combined Reward: total wealth change ===
-    // mm_reward + inv_reward = R.PnL + Fees + U.PnL = Net
+    // === Combined Reward: for backwards compatibility ===
     double reward = mm_reward + inv_reward;
     state["reward"_] = reward;
     
