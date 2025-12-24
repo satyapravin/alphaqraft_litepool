@@ -64,7 +64,7 @@ class HierarchicalConfig:
     entropy_coef: float = 0.01
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
-    update_epochs: int = 1
+    update_epochs: int = 4
     minibatch_size: int = 128
     
     # Trading parameters

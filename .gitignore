@@ -154,5 +154,7 @@ build
 
 # Model checkpoints and results
 results/
+runs/
 *.pth
 litepool/rltrader/python/results/
+litepool/rltrader/python/runs/

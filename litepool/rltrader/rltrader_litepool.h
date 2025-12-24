@@ -571,18 +571,6 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     // Both are directly controllable by the agent's quoting behavior
     double mm_reward = (spread_capture_delta + fee_delta) * REWARD_SCALE;
     
-    // DEBUG: Print reward components every 1000 steps
-    if (steps % 1000 == 0 && steps > 0) {
-        std::cerr << "[DEBUG] Step " << steps 
-                  << " spread_cap=" << current_spread_capture
-                  << " prev=" << (current_spread_capture - spread_capture_delta * initial_balance_)
-                  << " delta=" << spread_capture_delta
-                  << " fee_delta=" << fee_delta
-                  << " mm_rew=" << mm_reward
-                  << " init_bal=" << initial_balance_
-                  << std::endl;
-    }
-    
     // Inactivity cost: small penalty for steps without fills
     // This prevents the agent from learning "don't trade = safe"
     // 0.001 per step = 4.096 per episode if no trades (comparable to spread capture rewards)
