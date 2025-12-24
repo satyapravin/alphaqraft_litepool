@@ -22,12 +22,11 @@ class InventoryAgent(nn.Module):
     
     Architecture: Small MLP [64, 32] - runs infrequently
     
-    Input observations (12 dims):
+    Input observations (14 dims):
         - AMM signals: net_flow, flow_imbalance, inventory_delta, cumulative_flow (4)
-        - Volatility: realized_vol (1)
-        - Position state: current_leverage, deviation_from_target (2)
-        - Price momentum: mid_diff, spread (2)
-        - Trade signals: volume_imbalance, trade_intensity, buy_pressure (3)
+        - Position state: leverage, deviation_from_target, target_ema, entry_distance (4)
+        - Price: spread, mid_diff (2)
+        - Trade signals: volume_imbalance, trade_intensity, buy_pressure, sell_pressure (4)
     
     Output:
         - target_inventory: [-0.1, 0.1] (single continuous action)
@@ -35,7 +34,7 @@ class InventoryAgent(nn.Module):
     
     def __init__(
         self,
-        obs_dim: int = 12,
+        obs_dim: int = 14,
         hidden_dims: Tuple[int, ...] = (64, 32),
         target_range: float = 0.1,  # Max leverage target
     ):
@@ -161,25 +160,26 @@ class InventoryAgent(nn.Module):
         """
         Extract inventory-relevant observations from full observation.
         
-        Full observation (32 dims):
-            [0-12]: Market signals
-            [13-16]: AMM flow signals  
-            [17-24]: Trade signals
-            [25-31]: Agent state
+        Full observation (36 dims):
+            [0-12]: Market signals (13)
+            [13-16]: AMM flow signals (4)
+            [17-24]: Trade signals (8)
+            [25-35]: Agent state (11)
             
-        Inventory obs (12 dims):
+        Inventory obs (14 dims):
             - AMM: net_flow[13], flow_imbalance[14], inventory_delta[15], cumulative_flow[16]
-            - Vol: We need to add this or use a proxy
-            - Position: leverage[25], deviation[30]
-            - Price: mid_diff from market signals
-            - Trade: volume_imbalance[19], trade_intensity[20], buy_pressure[22]
+            - Position: leverage[25], deviation[30], target_ema[32], entry_distance[33]
+            - Price: spread[0], mid_change[1]
+            - Trade: volume_imbalance[19], intensity[20], buy_pressure[22], sell_pressure[23]
         """
         # Select relevant indices
         indices = [
             13, 14, 15, 16,  # AMM signals (4)
             25,              # current_leverage (1)
             30,              # deviation_from_target (1)
-            0,               # spread (proxy for vol) (1)
+            32,              # target_inventory_ema (1)
+            33,              # entry_price_distance (1)
+            0,               # spread (1)
             1,               # mid_price change (1)
             19, 20, 22, 23,  # trade signals (4)
         ]
@@ -190,14 +190,16 @@ class InventoryAgent(nn.Module):
             return full_obs[:, indices]
 
 
-# Observation indices for inventory agent (from full 32-dim obs)
+# Observation indices for inventory agent (from full 36-dim obs)
 INVENTORY_OBS_INDICES = [
     13, 14, 15, 16,  # AMM: net_flow, flow_imbalance, inventory_delta, cumulative_flow
     25,              # current_leverage
     30,              # deviation_from_target
-    0,               # spread (vol proxy)
+    32,              # target_inventory_ema (what agent asked for)
+    33,              # entry_price_distance (how far from entry)
+    0,               # spread
     1,               # mid change
     19, 20, 22, 23,  # trade: volume_imbalance, intensity, buy_pressure, sell_pressure
 ]
-INVENTORY_OBS_DIM = len(INVENTORY_OBS_INDICES)  # 12
+INVENTORY_OBS_DIM = len(INVENTORY_OBS_INDICES)  # 14
 

@@ -25,8 +25,8 @@
 
 namespace RLTrader {
 
-// Observation space: 13 market + 4 AMM flow + 8 trade + 7 agent state = 32 signals
-constexpr int OBS_DIM = 32;
+// Observation space: 13 market + 4 AMM flow + 8 trade + 11 agent state = 36 signals
+constexpr int OBS_DIM = 36;
 
 class EnvAdaptor { 
 public:
@@ -54,7 +54,7 @@ private:
     AmmV3Simulator amm_simulator;  // AMM flow signal generator
     std::unique_ptr<TradeReader> trade_reader;  // Optional trade reader
     std::unique_ptr<TradeSignalBuilder> trade_signal_builder;  // Trade signal generator
-    std::array<double, OBS_DIM> state;  // 13 market + 4 AMM flow + 8 trade + 7 agent state
+    std::array<double, OBS_DIM> state;  // 13 market + 4 AMM flow + 8 trade + 11 agent state
     std::unordered_map<std::string, double> info;
     FixedVector<double, 20> bid_prices;
     FixedVector<double, 20> ask_prices;

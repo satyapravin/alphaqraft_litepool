@@ -22,8 +22,10 @@ class MMAgent(nn.Module):
     
     Architecture: MLP [128, 64] + LSTM(64) - runs every step
     
-    Input observations (14 dims):
+    Input observations (16 dims):
         - Market microstructure signals (13)
+        - Time since last fill [34] (1)
+        - Quote mid distance [35] (1)
         - target_inventory from Inventory Agent (1)
     
     Output (3 actions):
@@ -34,7 +36,7 @@ class MMAgent(nn.Module):
     
     def __init__(
         self,
-        market_obs_dim: int = 13,  # Market signals only
+        market_obs_dim: int = 15,  # Market signals (13) + time_since_fill (1) + quote_distance (1)
         target_dim: int = 1,       # Target from inventory agent
         hidden_dim: int = 128,
         lstm_hidden: int = 64,
@@ -251,14 +253,27 @@ class MMAgent(nn.Module):
     @staticmethod
     def extract_market_obs(full_obs: np.ndarray) -> np.ndarray:
         """
-        Extract market observations (first 13 dims of full obs).
+        Extract market observations for MM agent.
+        
+        Full observation (36 dims):
+            [0-12]: Market signals (13)
+            [13-16]: AMM flow signals (4)
+            [17-24]: Trade signals (8)
+            [25-35]: Agent state (11)
+            
+        MM obs (15 dims):
+            - Market signals [0-12] (13)
+            - time_since_last_fill [34] (1)
+            - quote_mid_distance [35] (1)
         """
+        indices = list(range(13)) + [34, 35]
         if full_obs.ndim == 1:
-            return full_obs[:13]
+            return full_obs[indices]
         else:
-            return full_obs[:, :13]
+            return full_obs[:, indices]
 
 
-# Market observation indices (first 13 dims)
-MARKET_OBS_DIM = 13
+# MM observation indices (market + execution signals)
+MM_OBS_INDICES = list(range(13)) + [34, 35]  # 13 market + time_since_fill + quote_distance
+MARKET_OBS_DIM = len(MM_OBS_INDICES)  # 15
 

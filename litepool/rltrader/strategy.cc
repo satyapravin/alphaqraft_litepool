@@ -47,6 +47,8 @@ void Strategy::reset() {
     this->last_ask_price = 0;
     this->last_mid_price = 0;
     this->hit_leverage_limit_ = false;  // Reset leverage limit flag
+    this->steps_since_last_fill_ = 0;   // Reset fill tracking
+    this->prev_trade_count_ = 0;
     this->exchange.fetchPosition(initQty, avgPrice, false);
     this->position.reset(initQty, avgPrice);
     this->order_id = 0;
@@ -297,5 +299,16 @@ void Strategy::next() {
     auto fills = exchange.getFills();
     for(const auto& order: fills) {
         position.onFill(order);
+    }
+    
+    // Track steps since last fill (for observations)
+    long current_trades = position.getNumberOfTrades();
+    if (current_trades > prev_trade_count_) {
+        // Fill happened - reset counter
+        steps_since_last_fill_ = 0;
+        prev_trade_count_ = current_trades;
+    } else {
+        // No fill - increment counter
+        steps_since_last_fill_++;
     }
 }

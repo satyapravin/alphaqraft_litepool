@@ -12,7 +12,7 @@ import numpy as np
 from typing import Tuple, Optional, Dict, Any
 
 from inventory_agent import InventoryAgent, INVENTORY_OBS_INDICES, INVENTORY_OBS_DIM
-from mm_agent import MMAgent, MARKET_OBS_DIM
+from mm_agent import MMAgent, MM_OBS_INDICES, MARKET_OBS_DIM
 
 
 class HierarchicalPolicy(nn.Module):
@@ -232,7 +232,7 @@ class HierarchicalPolicy(nn.Module):
     
     def _extract_market_obs(self, obs: torch.Tensor) -> torch.Tensor:
         """Extract market observations (first 13 dims)."""
-        return obs[:, :MARKET_OBS_DIM]
+        return obs[:, MM_OBS_INDICES]
     
     def get_inventory_reward(
         self,

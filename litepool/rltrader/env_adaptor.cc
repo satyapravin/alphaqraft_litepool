@@ -212,7 +212,8 @@ void EnvAdaptor::computeState(OrderBook& book)
         std::fill_n(state.begin() + 17, 8, 0.0);
     }
     
-    // [25-31] Agent state (7 signals): leverage, position, P&L, deviation, and unrealized P/L %
+    // [25-35] Agent state (11 signals): leverage, position, P&L, deviation, unrealized P/L %, 
+    //         target inventory, entry price distance, time since fill, quote distance
     auto posInfo = strategy.getPosition().getPositionInfo(book.bid_prices[0], book.ask_prices[0]);
     double initialBalance = strategy.getPosition().getInitialBalance();
     
@@ -253,6 +254,43 @@ void EnvAdaptor::computeState(OrderBook& book)
         } else {
             state[31] = 0.0;  // No position, no % P/L
         }
+        
+        // [32] Target inventory EMA - agent's smoothed target inventory
+        // Inv agent can see what target it asked for vs current leverage
+        state[32] = std::tanh(strategy.getTargetInventory() * 10.0);  // Scale: ±0.1 maps to ±tanh(1)
+        
+        // [33] Entry price distance - how far avg entry is from current mid (in %)
+        // Positive = underwater (bought above current price), Negative = in profit
+        if (posInfo.averagePrice > 1e-9 && mid > 1e-9) {
+            double entry_distance_pct = (posInfo.averagePrice - mid) / mid;
+            // Adjust sign based on position direction
+            double netAmount = strategy.getPosition().getNetAmount();
+            if (netAmount < 0) {
+                // Short position: higher entry = profit, so flip sign
+                entry_distance_pct = -entry_distance_pct;
+            }
+            state[33] = std::tanh(entry_distance_pct * 100.0);  // Scale: ±1% maps to ±tanh(1)
+        } else {
+            state[33] = 0.0;  // No position or invalid price
+        }
+        
+        // [34] Time since last fill - normalized steps since last trade
+        // Helps MM agent understand fill rate
+        int steps_since_fill = strategy.getStepsSinceLastFill();
+        state[34] = std::tanh(steps_since_fill / 100.0);  // Scale: 100 steps maps to tanh(1) ≈ 0.76
+        
+        // [35] Quote mid distance - how far our quotes are from mid (avg of bid/ask spread in bps)
+        // Helps MM agent understand quote positioning
+        double last_bid = strategy.getLastBidPrice();
+        double last_ask = strategy.getLastAskPrice();
+        if (mid > 1e-9 && last_bid > 0 && last_ask > 0) {
+            double bid_distance_bps = (mid - last_bid) / mid * 10000.0;
+            double ask_distance_bps = (last_ask - mid) / mid * 10000.0;
+            double avg_distance_bps = (bid_distance_bps + ask_distance_bps) / 2.0;
+            state[35] = std::tanh(avg_distance_bps / 10.0);  // Scale: 10 bps maps to tanh(1) ≈ 0.76
+        } else {
+            state[35] = 0.0;  // No quotes yet
+        }
     } else {
         // Zero out agent state signals if initial balance is invalid
         state[26] = 0.0;
@@ -261,6 +299,10 @@ void EnvAdaptor::computeState(OrderBook& book)
         state[29] = 0.0;
         state[30] = 0.0;
         state[31] = 0.0;
+        state[32] = 0.0;
+        state[33] = 0.0;
+        state[34] = 0.0;
+        state[35] = 0.0;
     }
     
     computeInfo(book);

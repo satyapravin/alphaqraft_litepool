@@ -570,7 +570,7 @@ class HierarchicalPPOTrainer:
         print(f"MM Agent: updates every step (100ms)")
         print(f"Steps per epoch: {self.config.n_steps}")
         print(f"Total epochs: {self.config.total_epochs}")
-        print(f"Observations: 32 signals (13 market + 4 AMM + 8 trade + 7 agent state)")
+        print(f"Observations: 36 signals (13 market + 4 AMM + 8 trade + 11 agent state)")
         print(f"Actions: 4 (bid_spread, ask_spread, target_inventory, requote)")
         print("="*80 + "\n")
         

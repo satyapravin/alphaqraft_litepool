@@ -70,6 +70,7 @@ namespace RLTrader {
         double getVolatility() const { return realized_vol; }
         double getTargetInventory() const { return target_inventory_ema; }
         bool hitLeverageLimit() const { return hit_leverage_limit_; }
+        int getStepsSinceLastFill() const { return steps_since_last_fill_; }
         
         // Update smoothed target inventory (EMA smoothing to prevent flickering)
         void updateTargetInventory(double target_inventory_action);
@@ -115,6 +116,10 @@ namespace RLTrader {
         
         // Leverage limit tracking
         bool hit_leverage_limit_ = false;     // True if leverage hit ±1.0 and quoting stopped
+        
+        // Fill tracking for observations
+        int steps_since_last_fill_ = 0;       // Steps since last fill (for time_since_last_fill signal)
+        long prev_trade_count_ = 0;           // Trade count at last step (to detect new fills)
         
         // Model parameters
         static constexpr double TARGET_EMA_ALPHA = 0.001;     // Target inventory smoothing (~600 step half-life = 5 min)

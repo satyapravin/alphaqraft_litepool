@@ -73,7 +73,7 @@ TEST(RlTraderLitePoolTest, SplitZeroAction) {
   for (int i = 0; i < num_envs; ++i) {
     EXPECT_EQ(static_cast<int>(state["info:env_id"_][i]), i);
     auto obs = state["obs"_](i);
-    EXPECT_EQ(obs.size, 32);  // OBS_DIM = 32 (13 market + 4 AMM + 8 trade + 7 agent state)
+    EXPECT_EQ(obs.size, 36);  // OBS_DIM = 36 (13 market + 4 AMM + 8 trade + 11 agent state)
   }
 }
 
