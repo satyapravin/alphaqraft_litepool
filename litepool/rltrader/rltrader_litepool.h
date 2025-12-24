@@ -582,7 +582,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     // 0.001 per step = 4.096 per episode if no trades (comparable to spread capture rewards)
     // With 200 trades: penalty ≈ 3.9, spread capture reward ≈ 5 → net positive
     if (!had_fills_prev_step_ && steps > 0) {
-        mm_reward -= 0.001;
+        mm_reward -= 0.0001;
     }
     state["info:mm_reward"_] = mm_reward;
     

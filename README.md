@@ -33,8 +33,8 @@ Traditional market makers face an impossible choice:
 │  "How do I efficiently reach that target while capturing spread?"         │
 │                                                                           │
 │  • Observes: Microstructure signals + target from Inventory Agent         │
-│  • Decides: Bid/ask spreads, requote timing                               │
-│  • Reward: Spread capture + fee rebates (learns execution)                │
+│  • Decides: Bid/ask spreads (smart requote handles timing)                │
+│  • Reward: Spread capture + fee rebates - inactivity penalty              │
 │  • Updates: Every step (500ms) - tactical time scale                      │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
@@ -44,6 +44,7 @@ Traditional market makers face an impossible choice:
 | Benefit | Explanation |
 |---------|-------------|
 | **No Reward Gaming** | MM agent can't inflate rewards by only opening positions - it's paid for round-trips |
+| **Smart Requoting** | Can't avoid fills by never requoting - requotes triggered automatically by market moves |
 | **Clean Separation** | Inventory agent learns *when* to be long/short; MM agent learns *how* to get there |
 | **Different Time Scales** | Strategic decisions (seconds) don't interfere with tactical execution (milliseconds) |
 | **Interpretable** | Can analyze each agent's learned behavior independently |
@@ -63,6 +64,7 @@ The key insight: **each agent optimizes what it can control**.
 ```cpp
 // MM Agent: optimizes spread capture (LIFO) + fee rebates
 mm_reward = (spread_capture_delta + fee_delta) × 10,000
+mm_reward -= 0.001 if no fills this step  // inactivity penalty
 
 // Inventory Agent: optimizes unrealized P&L (market direction)
 inv_reward = unrealized_pnl_delta × 10,000
@@ -70,6 +72,8 @@ inv_reward = unrealized_pnl_delta × 10,000
 // Combined reward = total wealth change
 total_reward = mm_reward + inv_reward
 ```
+
+**Inactivity Penalty**: The MM agent receives a small penalty (-0.001) for each step without fills, preventing it from learning to avoid trading entirely.
 
 **Spread Capture vs Realized P&L**: We use LIFO-matched spread capture rather than average-cost realized P&L because:
 - Directly measures round-trip profitability
@@ -123,10 +127,11 @@ Real trade data: buy/sell volume, intensity, price impact, pressure indicators
 
 | Component | Description |
 |-----------|-------------|
-| `inventory_agent.py` | MLP [64, 32] - learns target inventory |
-| `mm_agent.py` | MLP [128, 64] + LSTM - learns execution |
-| `hierarchical_policy.py` | Coordinates both agents |
-| `hierarchical_ppo.py` | Joint training with separate rewards |
+| `inventory_agent.py` | MLP [64, 32] - learns target inventory (1 action) |
+| `mm_agent.py` | MLP [128, 64] + LSTM - learns bid/ask spreads (2 actions) |
+| `hierarchical_policy.py` | Coordinates both agents, combines 3 actions |
+| `hierarchical_ppo.py` | Joint training with separate reward streams |
+| `metric_logger.py` | TensorBoard logging for training analysis |
 
 ---
 
@@ -155,6 +160,13 @@ python test_ppo.py   # Test data
 python infer_ppo.py  # Production
 ```
 
+### Monitor Training
+
+```bash
+tensorboard --logdir=runs/ --port=6006
+# Open http://localhost:6006 in browser
+```
+
 ---
 
 ## 📈 Training Output
@@ -167,7 +179,8 @@ Inventory Agent: updates every 100 steps (50 sec)
 MM Agent: updates every step (500ms)
 Steps per epoch: 4096
 Observations: 36 signals (13 market + 4 AMM + 8 trade + 11 agent state)
-Actions: 4 (bid_spread, ask_spread, target_inventory, requote)
+Actions: 3 (bid_spread, ask_spread, target_inventory)
+Smart Requote: automatic when prices change >2 ticks
 ================================================================================
 
 Epoch    10 | Step   40960 | MM.Rew  0.45 | Inv.Rew  2.31 | SprdCap $ 0.42 | ...
@@ -184,16 +197,27 @@ Epoch    10 | Step   40960 | MM.Rew  0.45 | Inv.Rew  2.31 | SprdCap $ 0.42 | ...
 
 ---
 
-## 🎯 Action Space (4 dimensions)
+## 🎯 Action Space (3 dimensions)
 
 | Action | Range | Description |
 |--------|-------|-------------|
 | `bid_spread` | [-1, 1] | Bid quote width (0.5x - 50x base spread) |
 | `ask_spread` | [-1, 1] | Ask quote width (0.5x - 50x base spread) |
 | `target_inventory` | [-1, 1] | Target leverage (±10%) |
-| `requote` | {0, 1} | Cancel and requote decision |
 
 Quote skew is automatically computed from `(current_leverage - target_inventory)` to push the position toward target.
+
+### Smart Requote Logic
+
+Instead of giving the agent a `requote` action (which it learned to game), requotes are triggered automatically:
+
+| Condition | Behavior |
+|-----------|----------|
+| **Price change > 2 ticks** | Requote to track the market |
+| **First step / No active orders** | Always requote |
+| **After a fill** | Requote to replenish liquidity |
+
+This prevents the agent from avoiding fills by never requoting, while reducing unnecessary order churn.
 
 ---
 
@@ -222,6 +246,9 @@ exchange,symbol,timestamp,local_timestamp,id,side,price,amount
 | `ticks_per_step` | 5 | Ticks per RL step (500ms) |
 | `inventory_update_freq` | 100 | Steps between inventory updates |
 | `OBS_DIM` | 36 | Observation dimensions |
+| `ACTION_DIM` | 3 | Action dimensions |
+| `REQUOTE_TICK_THRESHOLD` | 2.0 | Ticks before auto-requote |
+| `INACTIVITY_PENALTY` | 0.001 | MM penalty per step without fills |
 
 ---
 
