@@ -312,3 +312,35 @@ void Strategy::next() {
         steps_since_last_fill_++;
     }
 }
+
+bool Strategy::shouldRequote(const RLAction& action,
+                             FixedVector<double, 20>& bid_prices,
+                             FixedVector<double, 20>& ask_prices,
+                             double tick_threshold) {
+    // If no valid prices, always requote
+    if (bid_prices[0] < 0.0001 || ask_prices[0] < 0.0001) {
+        return true;
+    }
+    
+    // If no quotes placed yet, must requote
+    if (last_bid_price < 0.0001 || last_ask_price < 0.0001) {
+        return true;
+    }
+    
+    auto tick_size = instrument.getTickSize();
+    auto posInfo = position.getPositionInfo(bid_prices[0], ask_prices[0]);
+    auto leverage = posInfo.leverage;
+    auto mid_price = (bid_prices[0] + ask_prices[0]) * 0.5;
+    
+    // Compute what new quotes would be
+    auto [proposed_bid, proposed_ask] = computeQuotePrices(action, mid_price, leverage, tick_size);
+    
+    // Check if proposed quotes differ from current quotes by more than threshold
+    double bid_diff = std::abs(proposed_bid - last_bid_price);
+    double ask_diff = std::abs(proposed_ask - last_ask_price);
+    
+    double threshold_price = tick_size * tick_threshold;
+    
+    // Requote if either side differs by more than threshold
+    return (bid_diff > threshold_price) || (ask_diff > threshold_price);
+}

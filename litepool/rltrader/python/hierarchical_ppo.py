@@ -200,7 +200,7 @@ class HierarchicalPPOTrainer:
         
         # Rollout buffer
         obs_dim = 36  # 13 market + 4 AMM + 8 trade + 11 agent state
-        action_dim = 4
+        action_dim = 3  # bid_spread, ask_spread, target_inventory (requote removed)
         self.buffer = RolloutBuffer.create(
             config.n_steps, config.num_envs, obs_dim, action_dim
         )
@@ -388,8 +388,8 @@ class HierarchicalPPOTrainer:
         
         # Convert to tensors
         obs_t = torch.as_tensor(obs_flat, dtype=torch.float32, device=device)
-        # MM actions: [bid_spread, ask_spread, requote] = indices [0, 1, 3]
-        mm_actions = np.concatenate([actions_flat[:, 0:2], actions_flat[:, 3:4]], axis=1)
+        # MM actions: [bid_spread, ask_spread] = indices [0, 1]
+        mm_actions = actions_flat[:, 0:2]
         actions_t = torch.as_tensor(mm_actions, dtype=torch.float32, device=device)
         inv_actions_t = torch.as_tensor(inv_actions_flat, dtype=torch.float32, device=device)
         old_log_probs_mm_t = torch.as_tensor(old_log_probs_mm, dtype=torch.float32, device=device)
@@ -508,22 +508,11 @@ class HierarchicalPPOTrainer:
             avg_unrealized_pnl = 0
             total_trades = 0
         
-        # Compute action statistics
-        actions = self.buffer.actions.reshape(-1, 4)
-        requote_actions = actions[:, 3]
-        requote_rate = (requote_actions > 0).mean()
-        
-        # Spread actions when requoting
-        requote_mask = requote_actions > 0
-        if requote_mask.sum() > 0:
-            quote_actions = actions[requote_mask]
-            avg_bid_spread = quote_actions[:, 0].mean()
-            avg_ask_spread = quote_actions[:, 1].mean()
-            avg_target = quote_actions[:, 2].mean()
-        else:
-            avg_bid_spread = 0
-            avg_ask_spread = 0
-            avg_target = 0
+        # Compute action statistics (3-action space: bid_spread, ask_spread, target)
+        actions = self.buffer.actions.reshape(-1, 3)
+        avg_bid_spread = actions[:, 0].mean()
+        avg_ask_spread = actions[:, 1].mean()
+        avg_target = actions[:, 2].mean()
         
         # Buy/sell breakdown from last info
         buy_trades = 0
@@ -554,7 +543,6 @@ class HierarchicalPPOTrainer:
               f"Inv.Rew {avg_inv_reward:8.2f} | "
               f"R.PnL ${avg_realized_pnl:7.2f} | "
               f"U.PnL ${avg_unrealized_pnl:7.2f} | "
-              f"ReqRate {requote_rate:.1%} | "
               f"Trades {total_trades:4d} (B:{buy_trades}/S:{sell_trades})")
         print(f"         Loss: PL_mm {losses['policy_loss_mm']:.4f} VL_mm {losses['value_loss_mm']:.4f} | "
               f"PL_inv {losses['policy_loss_inv']:.4f} VL_inv {losses['value_loss_inv']:.4f} | "
@@ -603,7 +591,6 @@ class HierarchicalPPOTrainer:
         # Action Statistics
         self.tb_writer.add_scalar('Actions/MM_Spread_Std', mm_spread_std, step)
         self.tb_writer.add_scalar('Actions/Inv_Target_Std', inv_std, step)
-        self.tb_writer.add_scalar('Actions/Requote_Rate', requote_rate, step)
         self.tb_writer.add_scalar('Actions/Avg_Bid_Spread', avg_bid_spread, step)
         self.tb_writer.add_scalar('Actions/Avg_Ask_Spread', avg_ask_spread, step)
         self.tb_writer.add_scalar('Actions/Avg_Target_Inventory', avg_target, step)
@@ -645,7 +632,8 @@ class HierarchicalPPOTrainer:
         print(f"Steps per epoch: {self.config.n_steps}")
         print(f"Total epochs: {self.config.total_epochs}")
         print(f"Observations: 36 signals (13 market + 4 AMM + 8 trade + 11 agent state)")
-        print(f"Actions: 4 (bid_spread, ask_spread, target_inventory, requote)")
+        print(f"Actions: 3 (bid_spread, ask_spread, target_inventory)")
+        print(f"Smart requote: only when prices change by >2 ticks")
         print("="*80 + "\n")
         
         for epoch in range(self.config.total_epochs):

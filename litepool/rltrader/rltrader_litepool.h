@@ -96,10 +96,10 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) ActionSpec(const Config& conf) {
-    // 4-action space: bid_spread, ask_spread, target_inventory, should_requote
-    // Note: skew removed - automatically computed from inventory error toward target
-    return MakeDict("action"_.Bind(Spec<float>({4}, {{ -1., -1., -1., -1. },
-                                                     {  1.,  1.,  1.,  1. }})));
+    // 3-action space: bid_spread, ask_spread, target_inventory
+    // Note: requote removed - we use smart requote (only when prices change by >5 ticks)
+    return MakeDict("action"_.Bind(Spec<float>({3}, {{ -1., -1., -1. },
+                                                     {  1.,  1.,  1. }})));
   }
 };
 
@@ -143,9 +143,12 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   // Track fills from previous step to force requote if orders were filled
   bool had_fills_prev_step_ = false;
   
-  // Track if RL chose to requote voluntarily (not forced by auto-requote logic)
-  // Used to penalize excessive voluntary requoting
-  bool rl_chose_requote_ = false;
+  // Track last quoted prices - only requote if prices change significantly
+  double prev_quoted_bid_ = 0.0;
+  double prev_quoted_ask_ = 0.0;
+  // Price change threshold: 2 ticks minimum to trigger requote
+  // Lower threshold = quotes track market better, more fills
+  static constexpr double REQUOTE_TICK_THRESHOLD = 2.0;
 
   std::unique_ptr<RLTrader::BaseInstrument> instr_ptr;
   std::unique_ptr<RLTrader::BaseExchange> exchange_ptr;
@@ -237,7 +240,8 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     initial_balance_ = balance;  // Store initial balance for consistent reward scaling
     steps = 0;
     had_fills_prev_step_ = false;  // Reset fill tracking
-    rl_chose_requote_ = false;    // Reset requote tracking
+    prev_quoted_bid_ = 0.0;       // Reset quote tracking
+    prev_quoted_ask_ = 0.0;
     
     // Track if any reset step fails - we still need to call WriteState!
     bool reset_failed = false;
@@ -321,39 +325,41 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
       
       ++step_count;  // Keep counter for potential future use 
       RLTrader::RLAction action;
-      // 4-action space: bid_spread, ask_spread, target_inventory, should_requote
-      // Note: skew removed - automatically computed from inventory error
+      // 3-action space: bid_spread, ask_spread, target_inventory
+      // Requote is handled automatically (only when prices change by >5 ticks)
       action.bid_spread       = static_cast<double>(action_dict["action"_][0]);
       action.ask_spread       = static_cast<double>(action_dict["action"_][1]);
       action.target_inventory = static_cast<double>(action_dict["action"_][2]);
-      action.should_requote   = static_cast<double>(action_dict["action"_][3]);
+      action.should_requote   = 0.0;  // Not used - smart requote logic handles this
       
       // Update smoothed target inventory (EMA smoothing to prevent flickering)
       strategy_ptr->updateTargetInventory(action.target_inventory);
       
-      // Force requote on first step (steps == 0) to place initial orders
-      // After reset, there are no orders, so we must requote to place them
-      if (steps == 0) {
-          action.should_requote = 1.0;  // Force requote on first step
-      }
+      // === SMART REQUOTE LOGIC ===
+      // Requote is handled automatically (no agent action) to prevent gaming.
+      // We only requote when:
+      // 1. First step (no orders exist after reset)
+      // 2. No active orders in the market
+      // 3. Previous step had fills (need to replace filled orders)
+      // 4. Proposed quote prices differ from current quotes by more than 5 ticks
+      //
+      // This reduces order churn while still allowing price adjustments.
       
-      // Auto-requote if:
-      // 1. No active orders in the market (orders were cancelled or never placed)
-      // 2. Previous step had fills (orders were executed, need to replace them)
       bool has_active_orders = !exchange_ptr->getBidOrders().empty() || 
                                !exchange_ptr->getAskOrders().empty();
       bool forced_requote = (steps == 0) || !has_active_orders || had_fills_prev_step_;
-      if (forced_requote) {
-          action.should_requote = 1.0;  // Force requote
-      }
       
-      // Track if RL voluntarily chose to requote (for penalty)
-      // Voluntary = agent chose requote AND it wasn't forced
-      rl_chose_requote_ = (action.should_requote > 0.0) && !forced_requote;
+      // Check if prices changed enough to warrant requote (2 tick threshold)
+      bool prices_changed = adaptor_ptr->shouldRequote(action, REQUOTE_TICK_THRESHOLD);
       
-      // Only requote if should_requote > 0, otherwise continue with existing quotes
-      if (action.should_requote > 0.0) {
-      adaptor_ptr->quote(action);
+      // Requote if forced OR prices changed significantly
+      bool should_requote = forced_requote || prices_changed;
+      
+      if (should_requote) {
+          adaptor_ptr->quote(action);
+          // Update tracked quote prices
+          prev_quoted_bid_ = strategy_ptr->getLastBidPrice();
+          prev_quoted_ask_ = strategy_ptr->getLastAskPrice();
       }
       
       // Get trade count before advancing time to detect new fills

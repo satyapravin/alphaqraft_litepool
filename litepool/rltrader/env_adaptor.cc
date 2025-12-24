@@ -84,6 +84,10 @@ void EnvAdaptor::quote(const RLAction& action) {
     this->strategy.quote(action, bid_prices, ask_prices);
 }
 
+bool EnvAdaptor::shouldRequote(const RLAction& action, double tick_threshold) {
+    return this->strategy.shouldRequote(action, bid_prices, ask_prices, tick_threshold);
+}
+
 void EnvAdaptor::reset() {
     max_realized_pnl = 0;
     max_unrealized_pnl = 0;

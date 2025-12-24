@@ -44,10 +44,10 @@ TEST(RlTraderLitePoolTest, SplitZeroAction) {
   std::vector<Array> raw_action;
   raw_action.reserve(3);
 
-  // Create arrays with proper dimensions (4 actions: bid_spread, ask_spread, target_inventory, should_requote)
+  // Create arrays with proper dimensions (3 actions: bid_spread, ask_spread, target_inventory)
   raw_action.push_back(Array(Spec<int>({num_envs})));         // env_id
   raw_action.push_back(Array(Spec<int>({num_envs, 1})));      // players.env_id
-  raw_action.push_back(Array(Spec<double>({num_envs, 4})));   // action
+  raw_action.push_back(Array(Spec<double>({num_envs, 3})));   // action
 
   // Initialize players.env_id array
   for (int i = 0; i < num_envs; ++i) {
@@ -60,11 +60,10 @@ TEST(RlTraderLitePoolTest, SplitZeroAction) {
     // Set env_id
     action["env_id"_][i] = i;
     
-    // Set action values: bid_spread, ask_spread, target_inventory, should_requote
+    // Set action values: bid_spread, ask_spread, target_inventory
     action["action"_](i, 0) = 0.0f;  // bid_spread
     action["action"_](i, 1) = 0.0f;  // ask_spread
     action["action"_](i, 2) = 0.0f;  // target_inventory
-    action["action"_](i, 3) = 1.0f;  // should_requote
   }
 
   litepool.Send(std::move(action));
@@ -104,7 +103,7 @@ void Runner(int num_envs, int batch, int seed, int total_iter, int num_threads) 
     raw_action.clear();
     raw_action.push_back(Array(Spec<int>({num_envs})));         // env_id
     raw_action.push_back(Array(Spec<int>({num_envs, 1})));      // players.env_id
-    raw_action.push_back(Array(Spec<double>({num_envs, 4})));   // action (4 actions)
+    raw_action.push_back(Array(Spec<double>({num_envs, 3})));   // action (3 actions)
 
     // Initialize players.env_id array
     for (int i = 0; i < num_envs; ++i) {
@@ -116,11 +115,10 @@ void Runner(int num_envs, int batch, int seed, int total_iter, int num_threads) 
     for (int i = 0; i < num_envs; ++i) {
       action["env_id"_][i] = i;
       
-      // Set action values: bid_spread, ask_spread, target_inventory, should_requote
+      // Set action values: bid_spread, ask_spread, target_inventory
       action["action"_](i, 0) = 0.0f;  // bid_spread
       action["action"_](i, 1) = 0.0f;  // ask_spread
       action["action"_](i, 2) = 0.0f;  // target_inventory
-      action["action"_](i, 3) = 1.0f;  // should_requote
     }
 
     litepool.Send(std::move(action));

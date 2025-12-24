@@ -26,10 +26,12 @@ class HierarchicalPolicy(nn.Module):
         
     MM Agent:
         - Updates every step
-        - Learns from realized P&L + spread capture
-        - Outputs: bid_spread, ask_spread, requote
+        - Learns from spread capture + fee rebates
+        - Outputs: bid_spread, ask_spread
+        
+    Combined action sent to environment: [bid_spread, ask_spread, target_inventory]
     
-    Combined action sent to environment: [bid_spread, ask_spread, target_inventory, requote]
+    Note: Requote is handled automatically by the environment (smart requote).
     """
     
     def __init__(
@@ -92,11 +94,11 @@ class HierarchicalPolicy(nn.Module):
         Forward pass for both agents.
         
         Args:
-            obs: Full observations [batch, 32]
+            obs: Full observations [batch, 36]
             deterministic: If True, use mean actions (no exploration)
             
         Returns:
-            action: Combined action [batch, 4] for environment
+            action: Combined action [batch, 3] for environment
             log_probs: Dict with 'inventory' and 'mm' log probs
             values: Dict with 'inventory' and 'mm' values
         """
@@ -132,12 +134,11 @@ class HierarchicalPolicy(nn.Module):
             deterministic=deterministic,
         )
         
-        # Combine into environment action format: [bid_spread, ask_spread, target, requote]
+        # Combine into environment action format: [bid_spread, ask_spread, target_inventory]
         action = torch.cat([
             mm_action[:, 0:1],  # bid_spread
             mm_action[:, 1:2],  # ask_spread
             self.current_targets,  # target_inventory
-            mm_action[:, 2:3],  # requote
         ], dim=-1)
         
         log_probs = {
@@ -166,11 +167,11 @@ class HierarchicalPolicy(nn.Module):
         Get action for environment (numpy interface).
         
         Args:
-            obs: Full observations [batch, 32]
+            obs: Full observations [batch, 36]
             deterministic: If True, use mean actions
             
         Returns:
-            action: Combined action [batch, 4]
+            action: Combined action [batch, 3]
             info: Additional info (log_probs, values, etc.)
         """
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
@@ -197,8 +198,8 @@ class HierarchicalPolicy(nn.Module):
         Evaluate log probabilities for PPO update.
         
         Args:
-            obs: Full observations [batch, 32]
-            actions: MM actions [batch, 3] (bid_spread, ask_spread, requote)
+            obs: Full observations [batch, 36]
+            actions: MM actions [batch, 2] (bid_spread, ask_spread)
             inventory_actions: Inventory actions [batch, 1]
             
         Returns:
@@ -299,4 +300,3 @@ def create_hierarchical_policy(
         target_range=0.1,
         device=device,
     )
-

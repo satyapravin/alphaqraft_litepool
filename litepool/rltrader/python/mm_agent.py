@@ -4,7 +4,7 @@
 # 
 # This agent learns HOW to execute toward a target (tactical, fast decisions)
 # Takes target_inventory from Inventory Agent as input
-# Reward: Realized P&L + Spread Capture (learns execution)
+# Reward: Spread Capture + Fee Rebates (learns execution)
 
 import torch
 import torch.nn as nn
@@ -18,7 +18,7 @@ class MMAgent(nn.Module):
     
     Executes toward the target_inventory set by Inventory Agent.
     Updates every step (100ms).
-    Learns from realized P&L and spread capture (execution quality).
+    Learns from spread capture and fee rebates (execution quality).
     
     Architecture: MLP [128, 64] + LSTM(64) - runs every step
     
@@ -28,10 +28,11 @@ class MMAgent(nn.Module):
         - Quote mid distance [35] (1)
         - target_inventory from Inventory Agent (1)
     
-    Output (3 actions):
+    Output (2 actions):
         - bid_spread: [-1, 1] → controls bid quote aggressiveness
-        - ask_spread: [-1, 1] → controls ask quote aggressiveness  
-        - requote: probability of requoting orders
+        - ask_spread: [-1, 1] → controls ask quote aggressiveness
+        
+    Note: Requote is handled automatically by the environment (smart requote).
     """
     
     def __init__(
@@ -67,13 +68,9 @@ class MMAgent(nn.Module):
             batch_first=True,
         )
         
-        # Actor heads
-        # Spread actions: continuous [-1, 1]
+        # Actor head: spread actions (continuous [-1, 1])
         self.spread_mean = nn.Linear(lstm_hidden, 2)  # bid_spread, ask_spread
         self.spread_log_std = nn.Parameter(torch.zeros(2))
-        
-        # Requote action: Bernoulli probability
-        self.requote_logit = nn.Linear(lstm_hidden, 1)
         
         # Critic head
         self.critic = nn.Linear(lstm_hidden, 1)
@@ -99,7 +96,7 @@ class MMAgent(nn.Module):
         market_obs: torch.Tensor,
         target: torch.Tensor,
         hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple]:
         """
         Forward pass.
         
@@ -110,7 +107,6 @@ class MMAgent(nn.Module):
             
         Returns:
             spread_mean: Mean of spread actions [batch, 2]
-            requote_logit: Logit for requote probability [batch, 1]
             value: State value [batch, 1]
             hidden: Updated LSTM hidden state
         """
@@ -137,14 +133,13 @@ class MMAgent(nn.Module):
         # Take last timestep
         last_out = lstm_out[:, -1, :]  # [batch, lstm_hidden]
         
-        # Actor outputs
+        # Actor output: spread actions
         spread_mean = torch.tanh(self.spread_mean(last_out))  # [-1, 1]
-        requote_logit = self.requote_logit(last_out)
         
         # Critic
         value = self.critic(last_out)
         
-        return spread_mean, requote_logit, value, hidden
+        return spread_mean, value, hidden
     
     def _init_hidden(self, batch_size: int, device: torch.device):
         """Initialize LSTM hidden state."""
@@ -169,39 +164,25 @@ class MMAgent(nn.Module):
             deterministic: If True, return mean (no exploration)
             
         Returns:
-            action: Combined action [batch, 3] (bid_spread, ask_spread, requote)
+            action: Spread actions [batch, 2] (bid_spread, ask_spread)
             log_prob: Log probability [batch, 1]
             value: State value [batch, 1]
             hidden: Updated hidden state
         """
-        spread_mean, requote_logit, value, hidden = self.forward(
-            market_obs, target, hidden
-        )
+        spread_mean, value, hidden = self.forward(market_obs, target, hidden)
         
         if deterministic:
             # Use means
-            spread_action = spread_mean
-            requote_action = (torch.sigmoid(requote_logit) > 0.5).float()
-            action = torch.cat([spread_action, requote_action], dim=-1)
+            action = spread_mean
             log_prob = torch.zeros(spread_mean.shape[0], 1, device=spread_mean.device)
             return action, log_prob, value, hidden
         
         # Sample spreads from Gaussian
         spread_std = torch.exp(self.spread_log_std).expand_as(spread_mean)
         spread_dist = torch.distributions.Normal(spread_mean, spread_std)
-        spread_action = spread_dist.sample()
-        spread_action = torch.clamp(spread_action, -1, 1)
-        spread_log_prob = spread_dist.log_prob(spread_action).sum(dim=-1, keepdim=True)
-        
-        # Sample requote from Bernoulli
-        requote_prob = torch.sigmoid(requote_logit)
-        requote_dist = torch.distributions.Bernoulli(requote_prob)
-        requote_action = requote_dist.sample()
-        requote_log_prob = requote_dist.log_prob(requote_action)
-        
-        # Combine
-        action = torch.cat([spread_action, requote_action], dim=-1)
-        log_prob = spread_log_prob + requote_log_prob
+        action = spread_dist.sample()
+        action = torch.clamp(action, -1, 1)
+        log_prob = spread_dist.log_prob(action).sum(dim=-1, keepdim=True)
         
         return action, log_prob, value, hidden
     
@@ -218,7 +199,7 @@ class MMAgent(nn.Module):
         Args:
             market_obs: Market observations [batch, market_obs_dim]
             target: Target inventory [batch, 1]
-            actions: Actions taken [batch, 3]
+            actions: Spread actions taken [batch, 2]
             hidden: LSTM hidden state
             
         Returns:
@@ -226,27 +207,13 @@ class MMAgent(nn.Module):
             entropy: Action entropy [batch, 1]
             value: State value [batch, 1]
         """
-        spread_mean, requote_logit, value, _ = self.forward(
-            market_obs, target, hidden
-        )
+        spread_mean, value, _ = self.forward(market_obs, target, hidden)
         
         # Evaluate spreads
         spread_std = torch.exp(self.spread_log_std).expand_as(spread_mean)
         spread_dist = torch.distributions.Normal(spread_mean, spread_std)
-        spread_actions = actions[:, :2]
-        spread_log_prob = spread_dist.log_prob(spread_actions).sum(dim=-1, keepdim=True)
-        spread_entropy = spread_dist.entropy().sum(dim=-1, keepdim=True)
-        
-        # Evaluate requote
-        requote_prob = torch.sigmoid(requote_logit)
-        requote_dist = torch.distributions.Bernoulli(requote_prob)
-        requote_action = actions[:, 2:3]
-        requote_log_prob = requote_dist.log_prob(requote_action)
-        requote_entropy = requote_dist.entropy()
-        
-        # Combine
-        log_prob = spread_log_prob + requote_log_prob
-        entropy = spread_entropy + requote_entropy
+        log_prob = spread_dist.log_prob(actions).sum(dim=-1, keepdim=True)
+        entropy = spread_dist.entropy().sum(dim=-1, keepdim=True)
         
         return log_prob, entropy, value
     
@@ -276,4 +243,3 @@ class MMAgent(nn.Module):
 # MM observation indices (market + execution signals)
 MM_OBS_INDICES = list(range(13)) + [34, 35]  # 13 market + time_since_fill + quote_distance
 MARKET_OBS_DIM = len(MM_OBS_INDICES)  # 15
-

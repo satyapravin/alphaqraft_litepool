@@ -77,6 +77,13 @@ namespace RLTrader {
         
         // Process fills from exchange
         void next();
+        
+        // Check if proposed quotes differ significantly from current quotes
+        // Returns true if we should requote (prices differ by more than tick_threshold ticks)
+        bool shouldRequote(const RLAction& action,
+                          FixedVector<double, 20>& bid_prices,
+                          FixedVector<double, 20>& ask_prices,
+                          double tick_threshold = 2.0);
 
     protected:
         // Avellaneda-Stoikov inspired quoting model

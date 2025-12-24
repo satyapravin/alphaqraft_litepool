@@ -34,6 +34,9 @@ public:
     ~EnvAdaptor()  = default;
     
     void quote(const RLAction& action);
+    
+    // Check if proposed quotes differ significantly from current quotes
+    bool shouldRequote(const RLAction& action, double tick_threshold = 2.0);
 
     void reset() ;
     void syncTradeReader(long long book_start_timestamp);  // Sync trade reader to book's starting timestamp
