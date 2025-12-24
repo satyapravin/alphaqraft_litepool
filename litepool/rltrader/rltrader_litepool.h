@@ -60,7 +60,7 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) StateSpec(const Config& conf) {
-    return MakeDict("obs"_.Bind(Spec<double>({32})),  // 13 market + 4 AMM flow + 8 trade + 7 agent state
+    return MakeDict("obs"_.Bind(Spec<double>({RLTrader::OBS_DIM})),  // 13 market + 4 AMM + 8 trade + 11 agent state = 36
                     "info:mid_price"_.Bind(Spec<double>({-1})),
                     "info:balance"_.Bind(Spec<double>({-1})),
                     "info:unrealized_pnl"_.Bind(Spec<double>({-1})),
