@@ -23,8 +23,10 @@ from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from collections import deque
 import time
+from datetime import datetime
 
 import litepool
+from torch.utils.tensorboard import SummaryWriter
 from hierarchical_policy import HierarchicalPolicy, create_hierarchical_policy
 from inventory_agent import INVENTORY_OBS_INDICES
 from mm_agent import MARKET_OBS_DIM
@@ -210,6 +212,12 @@ class HierarchicalPPOTrainer:
         # Results directory
         self.results_dir = Path("results/hierarchical")
         self.results_dir.mkdir(parents=True, exist_ok=True)
+        
+        # TensorBoard logging
+        run_name = f"hierarchical_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.tb_writer = SummaryWriter(log_dir=f"runs/{run_name}")
+        print(f"TensorBoard logging to: runs/{run_name}")
+        print("View with: tensorboard --logdir=runs/")
     
     def _create_env(self):
         """Create the litepool environment."""
@@ -560,6 +568,63 @@ class HierarchicalPPOTrainer:
                       f"Trades {ep.trade_count:4d} | "
                       f"Pos {ep.net_amount_btc:+.5f} BTC")
             print()
+        
+        # === TensorBoard Logging ===
+        step = self.global_step
+        
+        # Rewards
+        self.tb_writer.add_scalar('Reward/MM_Agent', avg_mm_reward, step)
+        self.tb_writer.add_scalar('Reward/Inventory_Agent', avg_inv_reward, step)
+        self.tb_writer.add_scalar('Reward/Total', avg_mm_reward + avg_inv_reward, step)
+        
+        # P&L Metrics
+        self.tb_writer.add_scalar('PnL/Realized', avg_realized_pnl, step)
+        self.tb_writer.add_scalar('PnL/Unrealized', avg_unrealized_pnl, step)
+        
+        # Losses - MM Agent
+        self.tb_writer.add_scalar('Loss/MM_Policy', losses['policy_loss_mm'], step)
+        self.tb_writer.add_scalar('Loss/MM_Value', losses['value_loss_mm'], step)
+        self.tb_writer.add_scalar('Loss/MM_Entropy', losses['entropy_mm'], step)
+        
+        # Losses - Inventory Agent
+        self.tb_writer.add_scalar('Loss/Inv_Policy', losses['policy_loss_inv'], step)
+        self.tb_writer.add_scalar('Loss/Inv_Value', losses['value_loss_inv'], step)
+        self.tb_writer.add_scalar('Loss/Inv_Entropy', losses['entropy_inv'], step)
+        
+        # Action Statistics
+        self.tb_writer.add_scalar('Actions/MM_Spread_Std', mm_spread_std, step)
+        self.tb_writer.add_scalar('Actions/Inv_Target_Std', inv_std, step)
+        self.tb_writer.add_scalar('Actions/Requote_Rate', requote_rate, step)
+        self.tb_writer.add_scalar('Actions/Avg_Bid_Spread', avg_bid_spread, step)
+        self.tb_writer.add_scalar('Actions/Avg_Ask_Spread', avg_ask_spread, step)
+        self.tb_writer.add_scalar('Actions/Avg_Target_Inventory', avg_target, step)
+        
+        # Trading Statistics
+        self.tb_writer.add_scalar('Trading/Total_Trades', total_trades, step)
+        self.tb_writer.add_scalar('Trading/Buy_Trades', buy_trades, step)
+        self.tb_writer.add_scalar('Trading/Sell_Trades', sell_trades, step)
+        if total_trades > 0:
+            self.tb_writer.add_scalar('Trading/Buy_Sell_Ratio', 
+                                      buy_trades / max(sell_trades, 1), step)
+        
+        # Episode Statistics (if episodes completed)
+        if self.completed_episodes:
+            avg_episode_mm_rew = np.mean([ep.mm_reward for ep in self.completed_episodes])
+            avg_episode_inv_rew = np.mean([ep.inv_reward for ep in self.completed_episodes])
+            avg_spread_capture = np.mean([ep.spread_capture for ep in self.completed_episodes])
+            avg_unrealized = np.mean([ep.unrealized_pnl for ep in self.completed_episodes])
+            avg_fees = np.mean([ep.fees for ep in self.completed_episodes])
+            avg_trades = np.mean([ep.trade_count for ep in self.completed_episodes])
+            avg_net = np.mean([ep.realized_pnl + ep.unrealized_pnl + ep.fees 
+                              for ep in self.completed_episodes])
+            
+            self.tb_writer.add_scalar('Episode/MM_Reward', avg_episode_mm_rew, step)
+            self.tb_writer.add_scalar('Episode/Inv_Reward', avg_episode_inv_rew, step)
+            self.tb_writer.add_scalar('Episode/Spread_Capture', avg_spread_capture, step)
+            self.tb_writer.add_scalar('Episode/Unrealized_PnL', avg_unrealized, step)
+            self.tb_writer.add_scalar('Episode/Fees', avg_fees, step)
+            self.tb_writer.add_scalar('Episode/Net_PnL', avg_net, step)
+            self.tb_writer.add_scalar('Episode/Trades', avg_trades, step)
     
     def train(self):
         """Main training loop."""
@@ -609,6 +674,10 @@ class HierarchicalPPOTrainer:
         print("\nTraining complete!")
         print(f"Best reward: {self.best_reward:.4f}")
         self.save_checkpoint(str(self.results_dir / "final_model.pt"))
+        
+        # Close TensorBoard writer
+        self.tb_writer.close()
+        print("TensorBoard logs saved.")
     
     def save_checkpoint(self, path: str):
         """Save training checkpoint."""
