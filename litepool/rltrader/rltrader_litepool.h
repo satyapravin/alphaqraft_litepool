@@ -558,8 +558,9 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     
     // === MM Agent Reward: execution quality ===
     // Rewards closing positions profitably: realized P&L + fee rebates
-    // Matches episode log: R.PnL + Fees
-    double mm_reward = (realized_pnl_delta + fee_delta) * REWARD_SCALE;
+    // Boosted 10x to match scale of Inv reward (realized P&L is much smaller than unrealized)
+    constexpr double MM_BOOST = 10.0;  // Boost MM reward to match Inv scale
+    double mm_reward = (realized_pnl_delta + fee_delta) * REWARD_SCALE * MM_BOOST;
     state["info:mm_reward"_] = mm_reward;
     
     // === Inventory Agent Reward: market direction ===
