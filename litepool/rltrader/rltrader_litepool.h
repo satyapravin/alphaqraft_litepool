@@ -573,9 +573,10 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     
     // Inactivity cost: small penalty for steps without fills
     // This prevents the agent from learning "don't trade = safe"
-    // 0.01 per step = 40.96 per episode if no trades (significant but not overwhelming)
+    // 0.001 per step = 4.096 per episode if no trades (comparable to spread capture rewards)
+    // With 200 trades: penalty ≈ 3.9, spread capture reward ≈ 5 → net positive
     if (!had_fills_prev_step_ && steps > 0) {
-        mm_reward -= 0.01;
+        mm_reward -= 0.001;
     }
     state["info:mm_reward"_] = mm_reward;
     
