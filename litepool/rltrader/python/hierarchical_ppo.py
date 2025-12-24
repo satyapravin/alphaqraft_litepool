@@ -4,12 +4,12 @@
 #
 # Architecture:
 # - Inventory Agent (slow, strategic): learns WHAT position to hold
-#   - Updates every 100 steps (10 seconds)
+#   - Updates every 100 steps (50 seconds)
 #   - Reward: unrealized P&L delta (market direction)
 #   - Observations: AMM flow, volatility, position state
 #
 # - MM Agent (fast, tactical): learns HOW to execute toward target
-#   - Updates every step (100ms)
+#   - Updates every step (500ms)
 #   - Reward: realized P&L + spread capture + fees (execution quality)
 #   - Observations: market microstructure + target from Inventory Agent
 
@@ -46,7 +46,7 @@ class HierarchicalConfig:
     max_episode_steps: int = 4096
     
     # Hierarchical
-    inventory_update_freq: int = 100  # Every 100 steps = 10 seconds
+    inventory_update_freq: int = 100  # Every 100 steps = 50 seconds (5 ticks/step × 100ms/tick)
     
     # PPO hyperparameters
     learning_rate: float = 1e-4
@@ -566,8 +566,8 @@ class HierarchicalPPOTrainer:
         print("\n" + "="*80)
         print("Hierarchical PPO Training - Two-Agent Market Making")
         print("="*80)
-        print(f"Inventory Agent: updates every {self.config.inventory_update_freq} steps (10 sec)")
-        print(f"MM Agent: updates every step (100ms)")
+        print(f"Inventory Agent: updates every {self.config.inventory_update_freq} steps (50 sec)")
+        print(f"MM Agent: updates every step (500ms)")
         print(f"Steps per epoch: {self.config.n_steps}")
         print(f"Total epochs: {self.config.total_epochs}")
         print(f"Observations: 36 signals (13 market + 4 AMM + 8 trade + 11 agent state)")
