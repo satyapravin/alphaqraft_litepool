@@ -16,6 +16,10 @@
 # Ensure we use the local litepool, not system-installed version
 import sys
 from pathlib import Path
+_project_root = Path(__file__).resolve().parents[3]  # Go up 3 levels to project root
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+
 import numpy as np
 import torch
 import torch.nn as nn
