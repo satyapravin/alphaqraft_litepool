@@ -570,6 +570,13 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     // fee_delta: maker rebates earned from providing liquidity
     // Both are directly controllable by the agent's quoting behavior
     double mm_reward = (spread_capture_delta + fee_delta) * REWARD_SCALE;
+    
+    // Inactivity cost: small penalty for steps without fills
+    // This prevents the agent from learning "don't trade = safe"
+    // 0.01 per step = 40.96 per episode if no trades (significant but not overwhelming)
+    if (!had_fills_prev_step_ && steps > 0) {
+        mm_reward -= 0.01;
+    }
     state["info:mm_reward"_] = mm_reward;
     
     // === Inventory Agent Reward: market direction ===
