@@ -214,6 +214,7 @@ class HierarchicalPPOTrainer:
         self.episode_steps = np.zeros(config.num_envs, dtype=np.int32)
         self.episode_mm_total = np.zeros(config.num_envs)
         self.episode_inv_total = np.zeros(config.num_envs)
+        self.current_obs = None  # Track current observation across epochs
         
         # Results directory
         self.results_dir = Path("results/hierarchical")
@@ -261,13 +262,19 @@ class HierarchicalPPOTrainer:
     
     def collect_rollout(self) -> Tuple[np.ndarray, np.ndarray]:
         """Collect one rollout of experience."""
-        obs, _ = self.env.reset()
-        self.policy.reset(self.config.num_envs)
+        # DON'T call env.reset() every epoch! Episodes run continuously with auto-reset.
+        # Only reset on first epoch when self.current_obs is None
+        if self.current_obs is None:
+            obs, _ = self.env.reset()
+            self.policy.reset(self.config.num_envs)
+            # Reset accumulators at training start
+            self.episode_steps.fill(0)
+            self.episode_mm_total.fill(0)
+            self.episode_inv_total.fill(0)
+        else:
+            obs = self.current_obs
         
-        # Reset per-env tracking
-        self.episode_steps.fill(0)
-        self.episode_mm_total.fill(0)
-        self.episode_inv_total.fill(0)
+        # Clear completed episodes from previous epoch
         self.completed_episodes.clear()
         self.buffer.infos = []
         
@@ -309,8 +316,14 @@ class HierarchicalPPOTrainer:
             self.buffer.inv_rewards[step] = inv_reward
             self.buffer.dones[step] = done
             
-            # Handle episode ends FIRST (before accumulating rewards)
-            # This is critical because on done=True, rewards are from the NEW episode after auto-reset
+            # Accumulate this step's reward FIRST (before handling episode ends)
+            # IMPORTANT: Rewards on done=True are from the ENDING episode, not the new one!
+            # The C++ env calculates rewards BEFORE reset, so they belong to the current episode.
+            self.episode_mm_total += mm_reward
+            self.episode_inv_total += inv_reward
+            self.episode_steps += 1
+            
+            # Handle episode ends AFTER accumulating rewards
             for env_id in range(self.config.num_envs):
                 if done[env_id]:
                     # Extract terminal info from final_* fields
@@ -334,21 +347,17 @@ class HierarchicalPPOTrainer:
                     self.episode_inv_rewards.append(episode_info.inv_reward)
                     self.episode_rewards.append(episode_info.total_reward)
                     
-                    # Reset per-env tracking
+                    # Reset per-env tracking for the NEW episode
                     self.episode_steps[env_id] = 0
                     self.episode_mm_total[env_id] = 0
                     self.episode_inv_total[env_id] = 0
                     self.policy.reset_env(env_id)
             
-            # Accumulate per-env rewards AFTER handling episode ends
-            # On done=True steps, rewards are from the NEW episode (after auto-reset)
-            # So we accumulate them for the new episode, not the old one
-            self.episode_mm_total += mm_reward
-            self.episode_inv_total += inv_reward
-            self.episode_steps += 1
-            
             obs = next_obs
             self.global_step += self.config.num_envs
+        
+        # Store current observation for next epoch
+        self.current_obs = obs
         
         # Get last values for GAE
         with torch.no_grad():
