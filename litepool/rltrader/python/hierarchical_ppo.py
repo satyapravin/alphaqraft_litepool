@@ -152,6 +152,7 @@ class EpisodeInfo:
     total_reward: float
     realized_pnl: float
     unrealized_pnl: float
+    spread_capture: float  # LIFO round-trip profit
     fees: float
     trade_count: int
     net_amount_btc: float
@@ -311,6 +312,7 @@ class HierarchicalPPOTrainer:
                         total_reward=float(self.episode_mm_total[env_id] + self.episode_inv_total[env_id]),
                         realized_pnl=self._extract_info_value(env_info, 'final_realized_pnl', env_id),
                         unrealized_pnl=self._extract_info_value(env_info, 'final_unrealized_pnl', env_id),
+                        spread_capture=self._extract_info_value(env_info, 'final_spread_capture', env_id),
                         fees=self._extract_info_value(env_info, 'final_fees', env_id),
                         trade_count=int(self._extract_info_value(env_info, 'final_trade_count', env_id)),
                         net_amount_btc=self._extract_info_value(env_info, 'final_net_amount_btc', env_id),
@@ -551,9 +553,9 @@ class HierarchicalPPOTrainer:
                       f"Steps {ep.steps:5d} | "
                       f"MM.Rew {ep.mm_reward:7.2f} | "
                       f"Inv.Rew {ep.inv_reward:7.2f} | "
-                      f"R.PnL ${ep.realized_pnl:7.2f} | "
+                      f"SprdCap ${ep.spread_capture:6.2f} | "
                       f"U.PnL ${ep.unrealized_pnl:7.2f} | "
-                      f"Fees ${ep.fees:6.2f} | "
+                      f"Fees ${ep.fees:5.2f} | "
                       f"Net ${net_pnl:7.2f} | "
                       f"Trades {ep.trade_count:4d} | "
                       f"Pos {ep.net_amount_btc:+.5f} BTC")

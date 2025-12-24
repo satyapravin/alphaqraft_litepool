@@ -90,7 +90,8 @@ class RlTraderEnvFns {
                     "info:final_unrealized_pnl"_.Bind(Spec<double>({-1})),
                     "info:final_trade_count"_.Bind(Spec<double>({-1})),
                     "info:final_fees"_.Bind(Spec<double>({-1})),
-                    "info:final_net_amount_btc"_.Bind(Spec<double>({-1})));
+                    "info:final_net_amount_btc"_.Bind(Spec<double>({-1})),
+                    "info:final_spread_capture"_.Bind(Spec<double>({-1})));
   }
 
   template <typename Config>
@@ -507,6 +508,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
         state["info:final_trade_count"_] = terminal_info_["trade_count"];
         state["info:final_fees"_] = terminal_info_["fees"];
         state["info:final_net_amount_btc"_] = terminal_info_["net_amount_btc"];
+        state["info:final_spread_capture"_] = terminal_info_["spread_capture"];
         // Clear after use (will be repopulated when next episode ends)
         has_terminal_info_ = false;
         terminal_info_.clear();
@@ -516,6 +518,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
         state["info:final_trade_count"_] = 0.0;
         state["info:final_fees"_] = 0.0;
         state["info:final_net_amount_btc"_] = 0.0;
+        state["info:final_spread_capture"_] = 0.0;
     }
     
     // === Reward Calculation for Hierarchical RL ===
