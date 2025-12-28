@@ -162,13 +162,20 @@ std::vector<Order> SimExchange::getFills() {
 }
 
 void SimExchange::cancel(std::map<std::string, Order>& quotes) {
+	// CRITICAL FIX: Don't mark orders as CANCELLED in quotes map immediately
+	// This prevents execute() from skipping orders that can fill
+	// Instead, create a cancellation order and add it to timed_buffer
+	// The cancellation will be processed after the delay period, respecting latency
 	for (auto &[fst, snd] : quotes) {
 		if(snd.state != OrderState::FILLED
 		   && snd.state != OrderState::CANCELLED
 		   && snd.state != OrderState::CANCELLED_ACK) {
-			snd.state = OrderState::CANCELLED;
-			snd.microSecond = current_timestamp;  // Use cached timestamp instead of getTimeStamp()
-			this->addToBuffer(snd);
+			// Create a cancellation order (don't modify the original order in quotes)
+			// This allows the order to still fill in execute() until cancellation is processed
+			Order cancel_order = snd;  // Copy the order
+			cancel_order.state = OrderState::CANCELLED;
+			cancel_order.microSecond = current_timestamp;  // Use cached timestamp
+			this->addToBuffer(cancel_order);
 		   }
 	}
 }
@@ -221,6 +228,11 @@ void SimExchange::processPending(const DataRow& obs) {
 					auto& quotes = (order.side == OrderSide::BUY) ? this->bid_quotes : this->ask_quotes;
 					auto it = quotes.find(order.orderId);
 					if (it != quotes.end()) {
+						// Process cancellation: remove order from quotes
+						// Note: We respect the cancellation request even if market has crossed
+						// The cancellation was requested earlier (with latency), so it takes precedence
+						// If the order could have filled, it should have filled in execute() before
+						// the cancellation was processed (after its delay period)
 						it->second.state = OrderState::CANCELLED_ACK;
 						quotes.erase(it);
 					}
@@ -302,9 +314,9 @@ void SimExchange::execute() {
 			continue;
 		}
 		
-		// Taker: fill immediately at best bid
-		// Maker: fill when best_bid >= our_ask (someone willing to buy at our price)
-		if (order.is_taker || best_bid >= order.price) {
+		bool should_fill = order.is_taker || best_bid >= order.price;
+		if (should_fill && order.state != OrderState::FILLED) {
+			// Order should fill - mark it as filled
 			order.state = OrderState::FILLED;
 			order.price = order.is_taker ? best_bid : order.price;  // Taker at bid, maker at limit
 			asks_filled.push_back(order_id);

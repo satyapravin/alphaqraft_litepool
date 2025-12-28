@@ -56,11 +56,10 @@ void AmmV3Simulator::reset(double initial_price) {
 }
 
 void AmmV3Simulator::updateRollingRange(double market_price) {
-    // Update center price EMA (smooth tracking of market)
-    center_price_ema_ = RANGE_EMA_ALPHA * market_price + 
-                        (1.0 - RANGE_EMA_ALPHA) * center_price_ema_;
+    // Always center the range on the current market price (no EMA lag)
+    center_price_ema_ = market_price;
     
-    // Recompute range bounds around the smoothed center
+    // Recompute range bounds around the current price
     price_lower_ = center_price_ema_ * (1.0 - RANGE_WIDTH / 2.0);
     price_upper_ = center_price_ema_ * (1.0 + RANGE_WIDTH / 2.0);
     sqrt_pa_ = std::sqrt(price_lower_);
@@ -97,7 +96,7 @@ void AmmV3Simulator::computeReserves(double price) {
     }
 }
 
-double AmmV3Simulator::computeRangePosition(double price) {
+double AmmV3Simulator::computeRangePosition(double price) const {
     // Returns position within range: -1 (at lower, all base) to +1 (at upper, all quote)
     // 0 means price is at center of range
     if (price <= price_lower_) return -1.0;
@@ -110,12 +109,6 @@ double AmmV3Simulator::computeRangePosition(double price) {
 
 double AmmV3Simulator::simulateArbitrage(double target_price) {
     if (!initialized_ || target_price <= 0) return 0.0;
-    
-    // If price hasn't changed significantly, no arbitrage
-    double price_diff = target_price - current_price_;
-    if (std::abs(price_diff) < current_price_ * 0.0001) {
-        return 0.0;
-    }
     
     // Store old reserves (computed with CURRENT liquidity, not old liquidity)
     double old_y = reserve_y_;
@@ -157,16 +150,14 @@ void AmmV3Simulator::updateFlowTracking(double trade_size) {
     }
     
     // Update EMA-based net flow signal
-    // This approach:
-    // 1. Computes a normalized trade direction for this step
-    // 2. Uses EMA to smooth it over time
-    // 3. Avoids the issues with cumulative normalization
+    // Uses exponential decay for 70-second half-life (mean-reverting momentum)
     
     double trade_magnitude = std::abs(trade_size);
     
-    // Update magnitude EMA (for normalization)
-    net_flow_magnitude_ema_ = NET_FLOW_EMA_ALPHA * trade_magnitude + 
-                               (1.0 - NET_FLOW_EMA_ALPHA) * net_flow_magnitude_ema_;
+    // Update magnitude EMA (for normalization) - fixed alpha for responsiveness
+    constexpr double MAGNITUDE_EMA_ALPHA = 0.05;
+    net_flow_magnitude_ema_ = MAGNITUDE_EMA_ALPHA * trade_magnitude + 
+                               (1.0 - MAGNITUDE_EMA_ALPHA) * net_flow_magnitude_ema_;
     
     // Ensure minimum magnitude to prevent division issues
     double magnitude_for_norm = std::max(net_flow_magnitude_ema_, current_price_ * 0.0001);
@@ -178,14 +169,9 @@ void AmmV3Simulator::updateFlowTracking(double trade_size) {
         normalized_trade = std::clamp(normalized_trade, -1.0, 1.0);
     }
     
-    // EMA update for net flow signal
-    // This creates a momentum indicator that responds to recent flow direction
-    net_flow_ema_ = NET_FLOW_EMA_ALPHA * normalized_trade + 
-                    (1.0 - NET_FLOW_EMA_ALPHA) * net_flow_ema_;
-    
-    // Decay toward zero when no trades (mean-reverting)
-    // This prevents the signal from getting stuck at extremes
-    net_flow_ema_ *= 0.995;  // Slow decay
+    // Decay existing signal + add new trade contribution
+    // NET_FLOW_DECAY = 0.99505 gives 70 sec half-life (140 steps at 500ms)
+    net_flow_ema_ = net_flow_ema_ * NET_FLOW_DECAY + normalized_trade * (1.0 - NET_FLOW_DECAY);
 }
 
 AmmFlowSignals AmmV3Simulator::step(double market_price) {
@@ -200,9 +186,11 @@ AmmFlowSignals AmmV3Simulator::step(double market_price) {
     // This ensures trade size reflects actual price movement with consistent liquidity
     double trade_size = simulateArbitrage(market_price);
     
-    // === Track raw cumulative flow ===
+    // === Track cumulative flow with decay (mean-reverting inventory) ===
     // Positive = net buying, Negative = net selling (in USD)
-    cumulative_flow_ += trade_size;
+    // Decay simulates LP hedging/rebalancing their inventory over time
+    // CUMULATIVE_FLOW_DECAY = 0.99885 gives 300 sec half-life (600 steps at 500ms)
+    cumulative_flow_ = cumulative_flow_ * CUMULATIVE_FLOW_DECAY + trade_size;
     
     // === Now update the rolling range for next step ===
     // The new liquidity will be used for the next step's reserve calculations
@@ -235,6 +223,31 @@ AmmFlowSignals AmmV3Simulator::step(double market_price) {
     signals.inventory_delta = computeRangePosition(market_price);
     
     // 4. Raw cumulative flow (to be normalized by balance in env_adaptor)
+    signals.cumulative_flow = cumulative_flow_;
+    
+    return signals;
+}
+
+AmmFlowSignals AmmV3Simulator::getSignals() const {
+    AmmFlowSignals signals{0.0, 0.0, 0.0, 0.0};
+    
+    if (!initialized_) {
+        return signals;
+    }
+    
+    // 1. Net flow: EMA-based momentum signal
+    signals.net_flow = std::clamp(net_flow_ema_, -1.0, 1.0);
+    
+    // 2. Flow imbalance: (buy - sell) / (buy + sell) over recent window
+    double total_vol = window_buy_vol_ + window_sell_vol_;
+    if (total_vol > 0) {
+        signals.flow_imbalance = (window_buy_vol_ - window_sell_vol_) / total_vol;
+    }
+    
+    // 3. Inventory delta: position within rolling range
+    signals.inventory_delta = computeRangePosition(current_price_);
+    
+    // 4. Cumulative flow
     signals.cumulative_flow = cumulative_flow_;
     
     return signals;

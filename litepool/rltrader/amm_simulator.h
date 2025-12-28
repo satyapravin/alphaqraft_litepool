@@ -35,7 +35,7 @@ struct AmmFlowSignals {
     double net_flow;           // EMA-based net flow signal (momentum indicator)
     double flow_imbalance;     // buy_vol / total_vol over window [-1, 1] centered
     double inventory_delta;    // Position in range: -1 (all base) to +1 (all quote)
-    double cumulative_flow;    // Raw cumulative (buys - sells) in USD - to be normalized by balance
+    double cumulative_flow;    // Decaying cumulative flow (LP inventory with hedging) - normalized by balance
 };
 
 class AmmV3Simulator {
@@ -43,10 +43,14 @@ public:
     // Configuration
     static constexpr double RANGE_WIDTH = 0.40;      // 40% total range (±20%)
     static constexpr double FEE_RATE = 0.0005;       // 5 bps (0.05% pool)
-    static constexpr int FLOW_WINDOW = 100;          // Steps for imbalance calc
     static constexpr double LIQUIDITY_USD = 100000;  // Virtual liquidity
-    static constexpr double RANGE_EMA_ALPHA = 0.02;  // Rolling range smoothing (slower = smoother)
-    static constexpr double NET_FLOW_EMA_ALPHA = 0.05;  // EMA for net flow signal
+    static constexpr double RANGE_EMA_ALPHA = 0.02;  // Rolling range smoothing
+    
+    // Signal decay parameters (at 500ms/step)
+    // Half-life formula: decay = 0.5^(1/steps), where steps = seconds * 2
+    static constexpr int FLOW_WINDOW = 240;              // 120 sec window for flow_imbalance
+    static constexpr double NET_FLOW_DECAY = 0.99505;    // 70 sec half-life (140 steps)
+    static constexpr double CUMULATIVE_FLOW_DECAY = 0.99885;  // 300 sec half-life (600 steps)
     
     AmmV3Simulator() : initialized_(false) {}
     
@@ -85,6 +89,12 @@ public:
     double getReserveY() const { return reserve_y_; }
     double getCurrentPrice() const { return current_price_; }
     bool isInitialized() const { return initialized_; }
+    
+    /**
+     * Get current signals without stepping.
+     * Use this after calling step() multiple times to read final state.
+     */
+    AmmFlowSignals getSignals() const;
     
 private:
     bool initialized_;
@@ -146,7 +156,7 @@ private:
     /**
      * Compute position within range: -1 (all base) to +1 (all quote).
      */
-    double computeRangePosition(double price);
+    double computeRangePosition(double price) const;
 };
 
 } // namespace RLTrader

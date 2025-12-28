@@ -62,10 +62,9 @@ std::vector<double> MarketSignalBuilder::add_book(OrderBook& book) {
         double ofi = compute_ofi(current, snapshot_buffer_[prev_idx]);
         
         // EMA update for OFI (replaces cumulative to prevent saturation)
+        // OFI_EMA_ALPHA = 0.2 gives ~5 sample half-life, which naturally decays old information
+        // No additional decay needed - EMA already provides mean-reversion
         ofi_ema_ = OFI_EMA_ALPHA * ofi + (1.0 - OFI_EMA_ALPHA) * ofi_ema_;
-        
-        // Decay toward zero to prevent drift
-        ofi_ema_ *= 0.99;
     }
     
     // Store snapshot in circular buffer

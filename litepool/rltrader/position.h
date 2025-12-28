@@ -22,11 +22,12 @@ namespace RLTrader {
         double netPosition = 0;
         double balance = 0;
         double averagePrice = 0;
-        double realizedPnL = 0;  // Gross realized PnL (before fees)
-        double inventoryPnL = 0;
+        double realizedPnL = 0;  // LIFO-based realized PnL from closed positions (same as spreadCapture)
+        double inventoryPnL = 0;      // Average cost unrealized P&L
+        double lifoUnrealizedPnL = 0; // LIFO-based unrealized P&L (from remaining stack entries)
         double leverage = 0;
 	double fees = 0;
-        double spreadCapture = 0;  // Cumulative spread captured from closed round-trips
+        double spreadCapture = 0;  // Cumulative spread captured from closed round-trips (LIFO)
     };
 
     struct TradeInfo {
@@ -59,7 +60,8 @@ namespace RLTrader {
         // LIFO stacks for spread capture tracking
         std::deque<OpenEntry> long_stack;   // BUY entries waiting to close
         std::deque<OpenEntry> short_stack;  // SELL entries waiting to close
-        double spreadCapture = 0.0;         // Cumulative spread captured
+        double spreadCapture = 0.0;         // Cumulative spread captured (LIFO, for rewards)
+        double realizedPnL = 0.0;           // Cumulative realized PnL (weighted-average, for logging/cash flow)
 
     public:
         Position(BaseInstrument& instr, const double& aBalance, const double& initialQty, const double& initialAvgprice);
@@ -67,6 +69,7 @@ namespace RLTrader {
         [[nodiscard]] PositionInfo getPositionInfo(const double& bidPrice, const double& askPrice) const;
         void onFill(const Order& order);
         [[nodiscard]] double inventoryPnL(const double& price) const;
+        [[nodiscard]] double lifoUnrealizedPnL(const double& price) const;  // LIFO-based unrealized from remaining stack entries
         [[nodiscard]] double getNetAmount() const { return netAmount; }
         [[nodiscard]] double getInitialBalance() const { return initialBalance; }
         [[nodiscard]] long getNumberOfTrades() const { return numOfTrades; }

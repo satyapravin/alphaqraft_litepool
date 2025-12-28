@@ -58,7 +58,6 @@ class HierarchicalPolicy(nn.Module):
         
         self.mm_agent = MMAgent(
             market_obs_dim=MARKET_OBS_DIM,
-            target_dim=1,
             hidden_dim=mm_hidden,
             lstm_hidden=mm_lstm,
         )
@@ -83,12 +82,21 @@ class HierarchicalPolicy(nn.Module):
             self.current_targets[env_id] = 0.0
         if self.step_counters is not None:
             self.step_counters[env_id] = 0
-        # Note: LSTM hidden is shared, reset handled by batch dimension
+        # Reset LSTM hidden state for this specific environment
+        # LSTM hidden state shape: (1, batch_size, lstm_hidden) for both h and c
+        if self.mm_hidden is not None:
+            h, c = self.mm_hidden
+            # Safety check: ensure batch size matches
+            if env_id < h.shape[1] and env_id < c.shape[1]:
+                # Zero out hidden state for this environment in the batch
+                h[:, env_id, :] = 0.0
+                c[:, env_id, :] = 0.0
     
     def forward(
         self,
         obs: torch.Tensor,
         deterministic: bool = False,
+        temperature: float = 1.0,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, Any]]:
         """
         Forward pass for both agents.
@@ -96,6 +104,7 @@ class HierarchicalPolicy(nn.Module):
         Args:
             obs: Full observations [batch, 36]
             deterministic: If True, use mean actions (no exploration)
+            temperature: Scale exploration noise (0.0 = deterministic, 1.0 = full exploration)
             
         Returns:
             action: Combined action [batch, 3] for environment
@@ -116,7 +125,7 @@ class HierarchicalPolicy(nn.Module):
         update_inventory = self._should_update_inventory()
         
         inv_action, inv_log_prob, inv_value = self.inventory_agent.get_action(
-            inv_obs, deterministic=deterministic
+            inv_obs, deterministic=deterministic, temperature=temperature
         )
         
         # Update targets for envs that need updating
@@ -126,12 +135,13 @@ class HierarchicalPolicy(nn.Module):
         # Increment step counters
         self.step_counters += 1
         
-        # MM agent: act every step using current target
+        # MM agent: act every step based on market microstructure only
+        # (inventory skew comes from Inventory Agent, not MM Agent's input)
         mm_action, mm_log_prob, mm_value, self.mm_hidden = self.mm_agent.get_action(
-            market_obs, 
-            self.current_targets,
+            market_obs,
             self.mm_hidden,
             deterministic=deterministic,
+            temperature=temperature,
         )
         
         # Combine into environment action format: [bid_spread, ask_spread, target_inventory]
@@ -162,13 +172,15 @@ class HierarchicalPolicy(nn.Module):
         self,
         obs: np.ndarray,
         deterministic: bool = False,
+        temperature: float = 1.0,
     ) -> Tuple[np.ndarray, Dict]:
         """
         Get action for environment (numpy interface).
         
         Args:
             obs: Full observations [batch, 36]
-            deterministic: If True, use mean actions
+            deterministic: If True, use mean actions (temperature=0.0 for fully deterministic)
+            temperature: Scale exploration noise (0.0 = deterministic, 1.0 = full exploration)
             
         Returns:
             action: Combined action [batch, 3]
@@ -177,7 +189,7 @@ class HierarchicalPolicy(nn.Module):
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
         
         with torch.no_grad():
-            action, log_probs, values, info = self.forward(obs_tensor, deterministic)
+            action, log_probs, values, info = self.forward(obs_tensor, deterministic, temperature)
         
         return action.cpu().numpy(), {
             'log_prob_inv': log_probs['inventory'].cpu().numpy(),
@@ -213,9 +225,9 @@ class HierarchicalPolicy(nn.Module):
             inv_obs, inventory_actions
         )
         
-        # Evaluate MM agent (use inventory actions as target)
+        # Evaluate MM agent (no target input - learns from microstructure only)
         mm_log_prob, mm_entropy, mm_value = self.mm_agent.evaluate_actions(
-            market_obs, inventory_actions, actions
+            market_obs, actions
         )
         
         return {
@@ -235,39 +247,9 @@ class HierarchicalPolicy(nn.Module):
         """Extract market observations (first 13 dims)."""
         return obs[:, MM_OBS_INDICES]
     
-    def get_inventory_reward(
-        self,
-        prev_unrealized: np.ndarray,
-        curr_unrealized: np.ndarray,
-        initial_balance: float,
-    ) -> np.ndarray:
-        """
-        Compute inventory agent reward from unrealized P&L change.
-        
-        Only computed when inventory is updated (every N steps).
-        """
-        delta = (curr_unrealized - prev_unrealized) / initial_balance
-        return delta
-    
-    def get_mm_reward(
-        self,
-        realized_pnl_delta: np.ndarray,
-        spread_capture_delta: np.ndarray,
-        fee_delta: np.ndarray,
-        initial_balance: float,
-    ) -> np.ndarray:
-        """
-        Compute MM agent reward from execution quality.
-        
-        Computed every step.
-        """
-        # Normalize
-        realized = realized_pnl_delta / initial_balance
-        spread_capture = spread_capture_delta / initial_balance
-        fees = fee_delta / initial_balance
-        
-        # Simple sum (equal weights, can tune later)
-        return realized + spread_capture + fees
+    # NOTE: Reward calculation methods removed - rewards come directly from environment
+    # The environment (rltrader_litepool.h) computes mm_reward and inv_reward in the info dict
+    # These are extracted in hierarchical_ppo.py collect_rollout() method
     
     def save(self, path: str):
         """Save both agents."""
@@ -290,6 +272,7 @@ class HierarchicalPolicy(nn.Module):
 def create_hierarchical_policy(
     inventory_update_freq: int = 100,
     device: str = 'cpu',
+    target_range: float = 0.2,  # Increased from 0.1 for more aggressive positioning
 ) -> HierarchicalPolicy:
     """Factory function to create hierarchical policy with defaults."""
     return HierarchicalPolicy(
@@ -297,6 +280,6 @@ def create_hierarchical_policy(
         inventory_hidden=(64, 32),
         mm_hidden=128,
         mm_lstm=64,
-        target_range=0.1,
+        target_range=target_range,
         device=device,
     )

@@ -25,7 +25,7 @@ namespace RLTrader {
 
     // Static configuration - limits and constraints (not learned)
     struct StrategyConfig {
-        double max_leverage = 5.0;            // Maximum leverage limit (hard stop)
+        double max_leverage = 2;            // Maximum leverage limit (hard stop)
         double min_size_pct = 0.2;            // Minimum size as % of balance
         double max_size_pct = 2.2;            // Maximum size as % of balance
         double base_spread_bps = 5.0;         // Base spread in basis points (5 bps = 0.05%)
@@ -121,6 +121,11 @@ namespace RLTrader {
         double prev_mid_price = 0.0;
         double realized_vol = 0.0;            // EMA volatility estimate
         
+        // Inventory skew urgency tracking (time-based)
+        double prev_inventory_error_ = 0.0;   // Previous inventory error for tracking persistence
+        int steps_away_from_target_ = 0;      // Steps since we've been away from target (urgency)
+        static constexpr double URGENCY_TIME_THRESHOLD = 0.01;  // Error threshold to consider "away from target"
+        
         // Leverage limit tracking
         bool hit_leverage_limit_ = false;     // True if leverage hit ±1.0 and quoting stopped
         
@@ -128,13 +133,16 @@ namespace RLTrader {
         int steps_since_last_fill_ = 0;       // Steps since last fill (for time_since_last_fill signal)
         long prev_trade_count_ = 0;           // Trade count at last step (to detect new fills)
         
+        // Tracking for netAmount change detection (per-instance, not static)
+        double last_netAmount_ = 0.0;         // Last netAmount value (for detecting changes without fills)
+        long last_trades_ = 0;                // Last trade count (for detecting changes without fills)
+        bool first_call_ = true;               // First call flag (for detecting changes without fills)
+        
         // Model parameters
-        static constexpr double TARGET_EMA_ALPHA = 0.001;     // Target inventory smoothing (~600 step half-life = 5 min)
+        static constexpr double TARGET_EMA_ALPHA = 0.0058;   // Target inventory smoothing (120 step half-life = 60 sec) 
         static constexpr double VOL_EMA_ALPHA = 0.01;        // Volatility EMA (~100 sample half-life)
         static constexpr double VOL_SPREAD_MULT = 50.0;      // How much volatility widens spread
-        static constexpr double INVENTORY_SKEW_MULT = 50.0;  // Reduced: smoother quote shifts, agent spreads respected more
-        // REMOVED: ACTION_SKEW_MULT - skew is now fully determined by inventory error
-        // Agent controls inventory via target_inventory action only (no conflicting skew action)
+        static constexpr double INVENTORY_SKEW_MULT = 50000.0;  // Reduced: smoother quote shifts, agent spreads respected more
         static constexpr double MAX_SPREAD_MULT = 50.0;      // Maximum spread multiplier from action (allows huge spreads for liquidity crunches)
         static constexpr double MIN_SPREAD_MULT = 0.5;       // Minimum spread multiplier (0.5x base = 1.5bps floor)
     };

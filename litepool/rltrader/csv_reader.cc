@@ -210,13 +210,7 @@ bool CsvReader::readNextLine() {
         return readNextLine();
     }
     
-    long long id;
-    try {
-        id = std::stoll(cell);
-    } catch (...) {
-        // Invalid timestamp - skip this line
-        return readNextLine();
-    }
+    long long id = std::stoll(cell);
     
     // Parse remaining columns as doubles
     std::vector<double> values = parseLineToDoubles(line);
@@ -263,7 +257,6 @@ std::vector<double> CsvReader::parseLineToDoubles(const std::string& line) {
     // Parse remaining columns as doubles
     int col_index = 4;  // Track column index for diagnostics
     while (std::getline(stream, cell, ',')) {
-        try {
             // Trim whitespace
             cell.erase(0, cell.find_first_not_of(" \t\n\r"));
             if (!cell.empty()) {
@@ -278,10 +271,6 @@ std::vector<double> CsvReader::parseLineToDoubles(const std::string& line) {
             }
             
         results.push_back(std::stod(cell));
-        } catch (const std::exception& e) {
-            // Re-throw to be caught by outer handler
-            throw;
-        }
         col_index++;
     }
     return results;

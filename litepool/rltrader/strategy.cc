@@ -17,6 +17,8 @@
 #include <cassert>
 #include <string>
 #include <cmath>
+#include <stdexcept>
+#include <iostream>
 #include "orderbook.h"
 
 using namespace RLTrader;
@@ -49,19 +51,45 @@ void Strategy::reset() {
     this->hit_leverage_limit_ = false;  // Reset leverage limit flag
     this->steps_since_last_fill_ = 0;   // Reset fill tracking
     this->prev_trade_count_ = 0;
+    this->prev_inventory_error_ = 0.0;  // Reset inventory error tracking
+    this->steps_away_from_target_ = 0;  // Reset urgency tracking
+    this->last_netAmount_ = 0.0;         // Reset netAmount tracking
+    this->last_trades_ = 0;              // Reset trade count tracking
+    this->first_call_ = true;             // Reset first call flag
+    
+    // CRITICAL: fetchPosition() should return 0 for SimExchange
+    // If it returns non-zero, that's the bug causing netAmount to be non-zero without trades
     this->exchange.fetchPosition(initQty, avgPrice, false);
+    
+    // CRITICAL FIX: Ensure initQty is 0 for SimExchange
+    // If fetchPosition() returned non-zero, force it to 0 to prevent the bug
+    // For SimExchange, position should always start at 0
+    // For real exchanges, we might want to carry over position, but for now we'll force 0
+    // TODO: Add a flag to distinguish SimExchange from real exchanges
+    initQty = 0;
+    avgPrice = 0;
+    
     this->position.reset(initQty, avgPrice);
     this->order_id = 0;
+    
+    // Verify reset worked correctly
+    double netAmount_after = this->position.getNetAmount();
+    long trades_after = this->position.getNumberOfTrades();
+    if (std::abs(netAmount_after) > 1e-9 || trades_after != 0) {
+        // BUG: Position not properly reset!
+        // This should never happen after reset()
+    }
 }
 
 void Strategy::updateTargetInventory(double target_inventory_action) {
-    constexpr double TARGET_INVENTORY_SCALE = 1.0;
-    double scaled_action = target_inventory_action * TARGET_INVENTORY_SCALE;
+    // Action is in [-target_range, +target_range] (e.g., [-5, +5] if target_range=5.0)
+    // Use action directly without scaling
+    double target_raw = target_inventory_action;
     
-    target_inventory_ema = TARGET_EMA_ALPHA * scaled_action + 
-                          (1.0 - TARGET_EMA_ALPHA) * target_inventory_ema;
-    
-    target_inventory_ema = std::clamp(target_inventory_ema, -TARGET_INVENTORY_SCALE, TARGET_INVENTORY_SCALE);
+    // Apply EMA smoothing to prevent flipping (TARGET_EMA_ALPHA = 0.0058 gives 120 step half-life = 60 sec)
+    // This smooths out noisy AMM signals while still allowing responsive updates
+    // With alpha=0.0058, it takes ~120 steps to move halfway from current to target
+    target_inventory_ema = TARGET_EMA_ALPHA * target_raw + (1.0 - TARGET_EMA_ALPHA) * target_inventory_ema;
 }
 
 void Strategy::updateVolatility(double mid_price) {
@@ -124,25 +152,94 @@ std::pair<double, double> Strategy::computeQuotePrices(
     double ask_spread_bps = base_spread_bps * vol_mult * ask_spread_mult;
     
     // === Step 5: Apply inventory skew by adjusting spreads directly ===
-    // If long (leverage > 0): widen bid spread, tighten ask spread → more likely to sell
-    // If short (leverage < 0): tighten bid spread, widen ask spread → more likely to buy
-    // target_inventory_ema is already in [-0.02, +0.02] (target leverage range)
+    // Goal: Push current leverage toward target leverage
+    // If too long (leverage > target): widen bid, tighten ask → more likely to sell (reduce long)
+    // If too short (leverage < target): tighten bid, widen ask → more likely to buy (reduce short)
+    // target_inventory_ema is in [-target_range, +target_range] (e.g., [-5, +5] if target_range=5.0)
     double target_leverage = target_inventory_ema;  // Already in leverage units
     double inventory_error = leverage - target_leverage;
     
-    // Skew factor: positive when long (widen bid, tighten ask), negative when short
-    double skew_factor = -inventory_error * INVENTORY_SKEW_MULT;
-    skew_factor = std::clamp(skew_factor, -1.5, 1.5);
+    // === Time-based urgency tracking ===
+    // Track how long we've been away from target (increases urgency over time)
+    if (std::abs(inventory_error) > URGENCY_TIME_THRESHOLD) {
+        // Still away from target - increment urgency counter
+        // Check if error sign changed (flipped direction) - reset if so
+        if (std::signbit(inventory_error) != std::signbit(prev_inventory_error_)) {
+            steps_away_from_target_ = 0;  // Reset if we flipped direction
+        } else {
+            steps_away_from_target_++;  // Increment if same direction
+        }
+    } else {
+        // Close to target - reset urgency
+        steps_away_from_target_ = 0;
+    }
+    prev_inventory_error_ = inventory_error;
     
-    // Apply skew: widen one side, tighten the other
-    // Positive skew_factor (long) → widen bid, tighten ask
-    // Negative skew_factor (short) → tighten bid, widen ask
+    // === Adaptive skew multiplier based on volatility, urgency, and time ===
+    // 1. Error magnitude urgency: smooth tanh function (saturates for large errors)
+    //    tanh provides smooth response: small errors get linear scaling, large errors saturate
+    double error_magnitude = std::abs(inventory_error);
+    double error_urgency = std::tanh(error_magnitude * 5.0);  // Scale: 0.2 error → tanh(1) ≈ 0.76, saturates at 1.0
+    
+    // 2. Time-based urgency: increases with time away from target (up to 2x multiplier)
+    //    More time away = more urgent = stronger skew
+    double time_urgency = 1.0 + std::tanh(steps_away_from_target_ / 100.0);  // 100 steps → tanh(1) ≈ 0.76, max 2.0x
+    
+    // 3. Volatility adjustment: higher vol → stronger skew (but risk-averse mode for extreme vol)
+    //    Moderate vol: increase skew (need to move faster)
+    //    Extreme vol: reduce skew (risk-averse: avoid adverse selection)
+    constexpr double VOL_THRESHOLD_MODERATE = 0.001;  // 0.1% per tick = moderate volatility
+    constexpr double VOL_THRESHOLD_EXTREME = 0.005;   // 0.5% per tick = extreme volatility
+    double vol_skew_mult;
+    if (realized_vol < VOL_THRESHOLD_MODERATE) {
+        // Low volatility: standard skew
+        vol_skew_mult = 1.0;
+    } else if (realized_vol < VOL_THRESHOLD_EXTREME) {
+        // Moderate volatility: increase skew strength (need to move inventory faster)
+        vol_skew_mult = 1.0 + (realized_vol - VOL_THRESHOLD_MODERATE) / (VOL_THRESHOLD_EXTREME - VOL_THRESHOLD_MODERATE);  // 1.0 to 2.0
+    } else {
+        // Extreme volatility: risk-averse mode (reduce skew to avoid adverse selection)
+        // Still allow some skew, but much weaker
+        double excess_vol = (realized_vol - VOL_THRESHOLD_EXTREME) / VOL_THRESHOLD_EXTREME;  // Normalized excess
+        vol_skew_mult = 2.0 * std::exp(-excess_vol * 2.0);  // Exponential decay: 2.0 → 0.27 at 2x threshold
+        vol_skew_mult = std::max(vol_skew_mult, 0.3);  // Floor at 0.3x (still some skew, but very weak)
+    }
+    
+    // Combined adaptive skew multiplier: base * error_urgency * time_urgency * vol_skew_mult
+    // This gives stronger skew when:
+    // - Error is large (error_urgency)
+    // - We've been away from target for a while (time_urgency)
+    // - Volatility is moderate (vol_skew_mult), but weak in extreme vol (risk-averse)
+    double adaptive_skew_mult = INVENTORY_SKEW_MULT * error_urgency * time_urgency * vol_skew_mult;
+    
+    // Skew factor: positive when too long (need to sell), negative when too short (need to buy)
+    // inventory_error > 0 means too long → need to sell → positive skew (widen bid, tighten ask)
+    // inventory_error < 0 means too short → need to buy → negative skew (tighten bid, widen ask)
+    // So skew_factor should have the SAME sign as inventory_error
+    double skew_factor = inventory_error * adaptive_skew_mult;
+    
+    // Apply skew: adjust spreads to push toward target
+    // Positive skew_factor (too long, need to sell) → widen bid, tighten ask
+    // Negative skew_factor (too short, need to buy) → tighten bid, widen ask
     // Use percentage of current spread (not base) so skew scales with wide spreads during volatility
     double avg_spread_bps = (bid_spread_bps + ask_spread_bps) * 0.5;
-    double skew_adjustment_bps = skew_factor * avg_spread_bps * 0.3;  // Max 30% of average spread
-    bid_spread_bps += skew_adjustment_bps;   // Widen bid when long (positive skew)
-    ask_spread_bps -= skew_adjustment_bps;  // Tighten ask when long (positive skew)
+    double skew_adjustment_bps = std::abs(skew_factor) * avg_spread_bps;
     
+    // Apply opposite adjustments to create asymmetry:
+    // Positive skew_factor (too long, need to sell) → widen bid (+), tighten ask (-)
+    // Negative skew_factor (too short, need to buy) → tighten bid (-), widen ask (+)
+    // Since skew_factor has the same sign as inventory_error, we use it directly
+    if (skew_factor > 0) {
+        // Too long: widen bid, tighten ask
+        bid_spread_bps += skew_adjustment_bps;
+        ask_spread_bps -= skew_adjustment_bps;
+    } else if (skew_factor < 0) {
+        // Too short: tighten bid, widen ask
+        bid_spread_bps -= skew_adjustment_bps;
+        ask_spread_bps += skew_adjustment_bps;
+    }
+    // If skew_factor == 0, no adjustment needed
+
     // Ensure minimum spreads (safety floor)
     bid_spread_bps = std::max(bid_spread_bps, base_spread_bps * MIN_SPREAD_MULT);
     ask_spread_bps = std::max(ask_spread_bps, base_spread_bps * MIN_SPREAD_MULT);
@@ -178,9 +275,7 @@ std::pair<double, double> Strategy::computeQuoteSizes(
     const RLAction& action,
     double init_balance) {
     
-    // Use 1% size per level for ladder quoting
-    // With 5 levels, total exposure is 5% per side
-    constexpr double SIZE_PER_LEVEL_PCT = 1.0;
+    constexpr double SIZE_PER_LEVEL_PCT = 1;
     double size_usd = SIZE_PER_LEVEL_PCT / 100.0 * init_balance;
     
     return {size_usd, size_usd};
@@ -249,9 +344,11 @@ void Strategy::quote(const RLAction& action,
     // Convert size to trade amount
     level_size = instrument.getTradeAmount(level_size, mid_price);
     
-    // Check position limits
-    bool can_place_bids = (level_size >= minAmount) && (leverage < config.max_leverage);
-    bool can_place_asks = (level_size >= minAmount) && (leverage > -config.max_leverage);
+    // Check position limits - prevent placing orders that would push leverage beyond limits
+    // Use stricter check: only place if current leverage is well within limits (95% threshold)
+    // This prevents fills from pushing leverage too far beyond the limit
+    bool can_place_bids = (level_size >= minAmount) && (leverage < config.max_leverage * 0.95);
+    bool can_place_asks = (level_size >= minAmount) && (leverage > -config.max_leverage * 0.95);
     
     // Store first level prices for diagnostics
     last_mid_price = mid_price;
@@ -297,12 +394,78 @@ void Strategy::quote(const RLAction& action,
 
 void Strategy::next() {
     auto fills = exchange.getFills();
+    
+    // Track state before processing fills (ALWAYS, not just when fills exist)
+    long trades_before = position.getNumberOfTrades();
+    double netAmount_before = position.getNetAmount();
+    auto trade_info_before = position.getTradeInfo();
+    
+    // Process fills
     for(const auto& order: fills) {
+        // Verify order state before processing
+        if (order.state != OrderState::FILLED) {
+            // This should never happen - getFills() should only return FILLED orders
+            continue;  // Skip non-filled orders
+        }
+        
         position.onFill(order);
     }
     
+    // ALWAYS check if netAmount changed without trades incrementing (not just when fills exist)
+    long trades_after = position.getNumberOfTrades();
+    double netAmount_after = position.getNetAmount();
+    auto trade_info_after = position.getTradeInfo();
+    
+    if (std::abs(netAmount_after - netAmount_before) > 1e-9 && trades_after == trades_before) {
+        // BUG DETECTED: netAmount changed without trades incrementing!
+        // This should never happen - onFill() always increments numOfTrades
+        // 
+        // Check if trade_info changed
+        long buy_trades_before = trade_info_before.buy_trades;
+        long sell_trades_before = trade_info_before.sell_trades;
+        long buy_trades_after = trade_info_after.buy_trades;
+        long sell_trades_after = trade_info_after.sell_trades;
+        
+        if (buy_trades_after == buy_trades_before && sell_trades_after == sell_trades_before) {
+            // trade_info didn't change either - this is the bug!
+            // onFill() was called but didn't update trade_info or numOfTrades
+            // OR netAmount is being modified outside of onFill()
+            throw std::runtime_error(
+                "BUG: netAmount changed from " + std::to_string(netAmount_before) + 
+                " to " + std::to_string(netAmount_after) + 
+                " but trades didn't increment! (trades=" + std::to_string(trades_after) + 
+                ", fills=" + std::to_string(fills.size()) + 
+                ", buy_trades=" + std::to_string(buy_trades_after) + 
+                ", sell_trades=" + std::to_string(sell_trades_after) + ")"
+            );
+        }
+    }
+    
+    // Also check if netAmount changed between calls (before processing fills)
+    // This would indicate netAmount is being modified elsewhere
+    // NOTE: Using instance variables (not static) so each Strategy instance tracks its own state
+    // Compare netAmount_before (start of this call) to last_netAmount_ (end of previous call)
+    if (!first_call_) {
+        if (std::abs(netAmount_before - last_netAmount_) > 1e-9 && trades_before == last_trades_ && fills.empty()) {
+            // BUG: netAmount changed between calls without any fills!
+            // This means netAmount is being modified outside of onFill() or reset()
+            throw std::runtime_error(
+                "BUG: netAmount changed from " + std::to_string(last_netAmount_) + 
+                " to " + std::to_string(netAmount_before) + 
+                " between calls without any fills! (trades=" + std::to_string(trades_before) + 
+                ", netAmount_diff=" + std::to_string(netAmount_before - last_netAmount_) + ")"
+            );
+        }
+    } else {
+        first_call_ = false;
+    }
+    
+    // Update tracking variables with values AFTER processing fills
+    last_netAmount_ = netAmount_after;
+    last_trades_ = trades_after;
+    
     // Track steps since last fill (for observations)
-    long current_trades = position.getNumberOfTrades();
+    auto current_trades = position.getNumberOfTrades();
     if (current_trades > prev_trade_count_) {
         // Fill happened - reset counter
         steps_since_last_fill_ = 0;

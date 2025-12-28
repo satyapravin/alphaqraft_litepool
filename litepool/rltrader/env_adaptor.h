@@ -25,8 +25,8 @@
 
 namespace RLTrader {
 
-// Observation space: 13 market + 4 AMM flow + 8 trade + 11 agent state = 36 signals
-constexpr int OBS_DIM = 36;
+// Observation space: 13 market + 4 AMM flow + 8 trade + 11 agent state + 1 previous spread + 2 bid/ask distances + 1 mid_change = 40 signals
+constexpr int OBS_DIM = 40;
 
 class EnvAdaptor { 
 public:
@@ -52,12 +52,22 @@ private:
     double max_unrealized_pnl = 0;
     double max_realized_pnl = 0;
     double drawdown = 0;
+    double prev_mid_price_ = 0;
     std::deque<double> mid_price_deque;
     std::unique_ptr<MarketSignalBuilder> market_builder;
     AmmV3Simulator amm_simulator;  // AMM flow signal generator
     std::unique_ptr<TradeReader> trade_reader;  // Optional trade reader
     std::unique_ptr<TradeSignalBuilder> trade_signal_builder;  // Trade signal generator
-    std::array<double, OBS_DIM> state;  // 13 market + 4 AMM flow + 8 trade + 11 agent state
+    std::array<double, OBS_DIM> state;  // 13 market + 4 AMM flow + 8 trade + 11 agent state + 1 previous spread + 2 bid/ask distances + 1 mid_change
+    
+    // EMA smoothing for noisy AMM signals (inventory_delta and flow_imbalance)
+    double flow_imbalance_ema_ = 0.0;
+    double inventory_delta_ema_ = 0.0;
+    static constexpr double AMM_SIGNAL_EMA_ALPHA = 0.1;  // ~7 step half-life for smoothing noisy signals
+    
+    // Cached signals from last tick (updated in next() loop, used in computeState())
+    std::vector<double> last_market_signals_;
+    TradeSignals last_trade_signals_;
     std::unordered_map<std::string, double> info;
     FixedVector<double, 20> bid_prices;
     FixedVector<double, 20> ask_prices;

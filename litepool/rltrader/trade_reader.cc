@@ -190,11 +190,7 @@ Trade TradeReader::parseTradeLine(const std::string& line) {
     
     // Get timestamp (3rd column)
     if (!std::getline(lineStream, cell, ',')) return trade;
-    try {
         trade.timestamp = std::stoll(cell);
-    } catch (...) {
-        return trade;  // Invalid timestamp
-    }
     
     // Skip local_timestamp (4th column)
     if (!std::getline(lineStream, cell, ',')) return trade;
@@ -217,19 +213,11 @@ Trade TradeReader::parseTradeLine(const std::string& line) {
     
     // Get price (7th column)
     if (!std::getline(lineStream, cell, ',')) return trade;
-    try {
         trade.price = std::stod(cell);
-    } catch (...) {
-        return trade;  // Invalid price
-    }
     
     // Get amount (8th column) - this is the trade size
     if (!std::getline(lineStream, cell, ',')) return trade;
-    try {
         trade.size = std::stod(cell);
-    } catch (...) {
-        return trade;  // Invalid amount
-    }
     
     return trade;
 }

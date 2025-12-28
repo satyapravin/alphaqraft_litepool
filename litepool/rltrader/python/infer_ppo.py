@@ -5,8 +5,14 @@ Live inference script for trained Hierarchical PPO model.
 Runs on production environment with real exchange connection.
 """
 
-import os
+# Ensure we use the local litepool, not system-installed version
+import sys
 from pathlib import Path
+_project_root = Path(__file__).resolve().parent.parent.parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+
+import os
 import numpy as np
 import torch
 import litepool
@@ -71,9 +77,12 @@ def load_model_and_env():
         maker_fee=-0.000025,
         taker_fee=0.0005,
         foldername="",  # Not used in prod
-        balance=20000.0,  # Will be fetched from exchange
+        balance=2000.0,  # Initial balance (will be fetched from exchange in prod)
         start=1,
         max_episode_steps=MAX_STEPS,
+        base_spread_bps=1.0,  # Match training config
+        min_size_pct=1.0,     # Match training config
+        max_size_pct=25.0,    # Match training config
     )
     env.spec.id = "RlTrader-v0"
 
@@ -92,7 +101,8 @@ def load_model_and_env():
     if not model_path.exists():
         raise FileNotFoundError(f"No model found in {results_dir}")
     
-    checkpoint = torch.load(model_path, map_location=device)
+    # weights_only=False needed for PyTorch 2.6+ (checkpoint contains config objects)
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     policy.inventory_agent.load_state_dict(checkpoint['inventory_agent'])
     policy.mm_agent.load_state_dict(checkpoint['mm_agent'])
     print(f"[Model] Loaded hierarchical policy from {model_path}")

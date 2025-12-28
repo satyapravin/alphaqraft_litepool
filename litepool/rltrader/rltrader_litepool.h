@@ -60,12 +60,14 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) StateSpec(const Config& conf) {
-    return MakeDict("obs"_.Bind(Spec<double>({RLTrader::OBS_DIM})),  // 13 market + 4 AMM + 8 trade + 11 agent state = 36
+    return MakeDict("obs"_.Bind(Spec<double>({RLTrader::OBS_DIM})),  // 13 market + 4 AMM + 8 trade + 11 agent state + 1 previous spread + 2 bid/ask distances + 1 mid_change = 40
                     "info:mid_price"_.Bind(Spec<double>({-1})),
                     "info:balance"_.Bind(Spec<double>({-1})),
                     "info:unrealized_pnl"_.Bind(Spec<double>({-1})),
+                    "info:lifo_unrealized_pnl"_.Bind(Spec<double>({-1})),  // LIFO unrealized (consistent with spread_capture)
                     "info:realized_pnl"_.Bind(Spec<double>({-1})),
                     "info:leverage"_.Bind(Spec<double>({-1})),
+                    "info:target_inventory"_.Bind(Spec<double>({-1})),  // Agent's desired inventory level (EMA smoothed)
                     "info:trade_count"_.Bind(Spec<double>({-1})),
                     "info:buy_trades"_.Bind(Spec<double>({-1})),
                     "info:sell_trades"_.Bind(Spec<double>({-1})),
@@ -80,6 +82,10 @@ class RlTraderEnvFns {
                     "info:last_bid_price"_.Bind(Spec<double>({-1})),
                     "info:last_ask_price"_.Bind(Spec<double>({-1})),
                     "info:last_mid_price"_.Bind(Spec<double>({-1})),
+                    "info:market_bid_price"_.Bind(Spec<double>({-1})),
+                    "info:market_ask_price"_.Bind(Spec<double>({-1})),
+                    "info:net_amount_btc_raw"_.Bind(Spec<double>({-1})),
+                    "info:average_price_raw"_.Bind(Spec<double>({-1})),
                     "info:deviation_from_target"_.Bind(Spec<double>({-1})),
                     "info:spread_capture"_.Bind(Spec<double>({-1})),
                     // Hierarchical RL: separate reward streams for two agents
@@ -130,12 +136,15 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   long long steps = 0;
   
   // Reward tracking (used for hierarchical RL reward streams)
-  double prev_realized_pnl = 0.0;    // For logging only
-  double prev_unrealized_pnl = 0.0;  // For inv_reward
-  double prev_fees = 0.0;            // For mm_reward (fee rebates)
-  double prev_spread_capture = 0.0;  // For mm_reward (LIFO round-trip profit)
-  double initial_balance_ = 0.0; // Store initial balance for consistent reward scaling
-  
+  double prev_realized_pnl = 0.0;         // For logging only
+  double prev_unrealized_pnl = 0.0;       // Weighted-average unrealized (for logging, matches balance cash flow)
+  double prev_lifo_unrealized_pnl = 0.0;  // LIFO unrealized (for inv_reward, consistent with spread_capture)
+  double prev_fees = 0.0;                 // For mm_reward (fee rebates)
+  double prev_spread_capture = 0.0;       // For mm_reward (LIFO round-trip profit)
+  double initial_balance_ = 0.0;          // Store initial balance for consistent reward scaling
+  double inv_reward_ema_ = 0.0;           // EMA of inventory reward for smoothing (reduces noise in strategic signal)
+  double prev_flow_misalignment_ = 0.0;   // Flow misalignment tracking for delta penalty
+					  
   // Terminal info cache (stores metrics before reset for episode logging)
   std::unordered_map<std::string, double> terminal_info_;
   bool has_terminal_info_ = false;
@@ -214,17 +223,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   }
 
   void Reset() override {
-    // CRITICAL: Wrap entire Reset in try-catch to ensure WriteState() is ALWAYS called
-    // Without this, any uncaught exception causes deadlock (Python waits forever for state)
-    try {
-        ResetInternal();
-    } catch (...) {
-        // If anything goes wrong, still write state to prevent deadlock
-        isDone = true;
-        // WriteState() MUST be called - it calls Allocate() which sets up the semaphore callback
-        // Even if WriteState() throws, Allocate() calls Done(1) before throwing, signaling semaphore
-        WriteState();
-    }
+    ResetInternal();
   }
   
   void ResetInternal() {
@@ -235,9 +234,12 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     
     prev_realized_pnl = 0.0;
     prev_unrealized_pnl = 0.0;
+    prev_lifo_unrealized_pnl = 0.0;
     prev_fees = 0.0;
     prev_spread_capture = 0.0;
     initial_balance_ = balance;  // Store initial balance for consistent reward scaling
+    inv_reward_ema_ = 0.0;       // Reset EMA smoothing
+    prev_flow_misalignment_ = 0.0;  // Reset flow misalignment tracking
     steps = 0;
     had_fills_prev_step_ = false;  // Reset fill tracking
     prev_quoted_bid_ = 0.0;       // Reset quote tracking
@@ -248,30 +250,19 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     long long book_start_timestamp = 0;
     
     // Reset exchange first (picks random starting row)
-    try {
-        exchange_ptr->reset();
-    } catch (...) {  // Catch ALL exceptions, not just std::exception
-        reset_failed = true;
-    }
+    exchange_ptr->reset();
     
     // Get starting timestamp from book reader to sync trade reader
     if (!reset_failed) {
         RLTrader::SimExchange* sim_exch = dynamic_cast<RLTrader::SimExchange*>(exchange_ptr.get());
         if (sim_exch) {
-            try {
-                // Peek at first timestamp without consuming the row
-                // CRITICAL: hasData() checks if dataReader.hasNext(), which ensures rows is populated
-                // Only call peekFirstTimestamp() if hasData() returns true
-                if (sim_exch->hasData()) {
-                    book_start_timestamp = sim_exch->peekFirstTimestamp();
-                } else {
-                    // No data available after reset - this should not happen if CSV has enough data
-                    reset_failed = true;
-                }
-            } catch (const std::exception& e) {
-                // If peekFirstTimestamp() throws (e.g., rows is empty), mark reset as failed
-                reset_failed = true;
-            } catch (...) {  // Catch ALL other exceptions
+            // Peek at first timestamp without consuming the row
+            // CRITICAL: hasData() checks if dataReader.hasNext(), which ensures rows is populated
+            // Only call peekFirstTimestamp() if hasData() returns true
+            if (sim_exch->hasData()) {
+                book_start_timestamp = sim_exch->peekFirstTimestamp();
+            } else {
+                // No data available after reset - this should not happen if CSV has enough data
                 reset_failed = true;
             }
         }
@@ -279,23 +270,14 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     
     // Reset adaptor (which will reset trade reader if present)
     if (!reset_failed) {
-        try {
-            adaptor_ptr->reset();
-            
-            // Sync trade reader to book's starting timestamp
-            if (book_start_timestamp > 0) {
-                adaptor_ptr->syncTradeReader(book_start_timestamp);
-            }
-            
-            isDone = false;
-        } catch (...) {
-            reset_failed = true;
+        adaptor_ptr->reset();
+        
+        // Sync trade reader to book's starting timestamp
+        if (book_start_timestamp > 0) {
+            adaptor_ptr->syncTradeReader(book_start_timestamp);
         }
-    }
-    
-    // If any reset step failed, mark episode as done
-    if (reset_failed) {
-        isDone = true;
+        
+        isDone = false;
     }
     
     // CRITICAL: ALWAYS call WriteState at end of Reset
@@ -305,15 +287,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   }
 
   void Step(const Action& action_dict) override { 
-      // CRITICAL: Wrap entire Step in try-catch to ensure WriteState() is ALWAYS called
-      // Without this, any uncaught exception causes deadlock (Python waits forever for state)
-      try {
-          StepInternal(action_dict);
-      } catch (...) {
-          // If anything goes wrong, still write state to prevent deadlock
-          isDone = true;
-          WriteState();
-      }
+      StepInternal(action_dict);
   }
   
   void StepInternal(const Action& action_dict) {
@@ -332,7 +306,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
       action.target_inventory = static_cast<double>(action_dict["action"_][2]);
       action.should_requote   = 0.0;  // Not used - smart requote logic handles this
       
-      // Update smoothed target inventory (EMA smoothing to prevent flickering)
+      // Update target inventory (direct assignment, no smoothing)
       strategy_ptr->updateTargetInventory(action.target_inventory);
       
       // === SMART REQUOTE LOGIC ===
@@ -366,12 +340,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
       double trade_count_before = strategy_ptr->getPosition().getNumberOfTrades();
       
       // Advance time and read data
-      bool has_data = false;
-      try {
-          has_data = adaptor_ptr->next();
-      } catch (...) {
-          has_data = false;
-      }
+      bool has_data = adaptor_ptr->next();
       
       // CRITICAL: current_step_ is incremented in PreProcess() BEFORE Step() is called.
       // So when WriteState() calls Allocate(), current_step_ represents the step we're
@@ -462,27 +431,18 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     State state = Allocate(1);
     
     std::array<double, RLTrader::OBS_DIM> data;
-    try {
-        adaptor_ptr->getState(data);
-    } catch (...) {
-        // If getState fails, fill with zeros and mark done
-        data.fill(0.0);
-        isDone = true;
-    }
+    adaptor_ptr->getState(data);
     
     std::unordered_map<std::string, double> info;
-    try {
     adaptor_ptr->getInfo(info);
-    } catch (...) {
-        // If getInfo fails, use empty info (all zeros)
-        isDone = true;
-    }
     
     state["info:mid_price"_] = info["mid_price"];
     state["info:balance"_] = info["balance"];
     state["info:unrealized_pnl"_] = info["unrealized_pnl"];
+    state["info:lifo_unrealized_pnl"_] = info["lifo_unrealized_pnl"];
     state["info:realized_pnl"_] = info["realized_pnl"];
     state["info:leverage"_] = info["leverage"];
+    state["info:target_inventory"_] = info["target_inventory"];  // Agent's desired inventory level (EMA smoothed)
     state["info:trade_count"_] = info["trade_count"];
     state["info:buy_trades"_] = info["buy_trades"];
     state["info:sell_trades"_] = info["sell_trades"];
@@ -497,6 +457,10 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     state["info:last_bid_price"_] = info["last_bid_price"];
     state["info:last_ask_price"_] = info["last_ask_price"];
     state["info:last_mid_price"_] = info["last_mid_price"];
+    state["info:market_bid_price"_] = info["market_bid_price"];
+    state["info:market_ask_price"_] = info["market_ask_price"];
+    state["info:net_amount_btc_raw"_] = info["net_amount_btc_raw"];
+    state["info:average_price_raw"_] = info["average_price_raw"];
     
     // Leverage deviation from target (for monitoring and debugging)
     // Positive when leverage > target (over-leveraged), negative when leverage < target (under-leveraged)
@@ -510,7 +474,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     // This is populated when isDone becomes true, before auto-reset
     if (has_terminal_info_) {
         state["info:final_realized_pnl"_] = terminal_info_["realized_pnl"];
-        state["info:final_unrealized_pnl"_] = terminal_info_["unrealized_pnl"];
+        state["info:final_unrealized_pnl"_] = terminal_info_["lifo_unrealized_pnl"];  // Use LIFO for consistency
         state["info:final_trade_count"_] = terminal_info_["trade_count"];
         state["info:final_fees"_] = terminal_info_["fees"];
         state["info:final_net_amount_btc"_] = terminal_info_["net_amount_btc"];
@@ -535,7 +499,12 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     // MM agent optimizes for completing profitable round-trips + earning rebates
     // Inv agent optimizes for holding inventory in the right direction
     
-    constexpr double REWARD_SCALE = 10000.0;  // Scale for readability
+    // Reward scaling: Use log rewards to handle wide dynamic range
+    // Log rewards: sign(r) * log(1 + |r|) compresses large rewards while preserving sign
+    // This prevents extreme advantage values and stabilizes learning
+    constexpr double MM_REWARD_SCALE = 10000.0;  // Scale before log transform
+    constexpr double INV_REWARD_SCALE = 10000.0; // Scale before log transform (increased from 100.0 to match MM scale)
+    constexpr bool USE_LOG_REWARDS = true;        // Use log transform for reward normalization
     
     // 1. Spread capture delta (LIFO profit from round-trips)
     double current_spread_capture = info["spread_capture"];
@@ -557,17 +526,33 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
         fee_delta = 0.0;
     }
     
-    // 3. Unrealized P&L delta (for inv_reward)
-    double current_unrealized_pnl = info["unrealized_pnl"];
-    double unrealized_pnl_delta = current_unrealized_pnl - prev_unrealized_pnl;
-    prev_unrealized_pnl = current_unrealized_pnl;
-    if (initial_balance_ > 1e-9) {
-        unrealized_pnl_delta /= initial_balance_;
-    } else {
-        unrealized_pnl_delta = 0.0;
+    // 3. LIFO Unrealized P&L delta (for inv_reward)
+    // Use LIFO unrealized to be consistent with spread_capture accounting
+    // This ensures: spread_capture + lifo_unrealized = total P&L
+    double current_lifo_unrealized = info["lifo_unrealized_pnl"];
+    double lifo_unrealized_delta = current_lifo_unrealized - prev_lifo_unrealized_pnl;
+    
+    // CRITICAL: On first step after reset, prev_lifo_unrealized_pnl is 0, so delta = current value
+    // This can cause a huge first-step reward if position is already underwater
+    // Skip first step delta to prevent this (steps == 0 means first step after reset)
+    if (steps == 0) {
+        lifo_unrealized_delta = 0.0;  // Skip first step to prevent huge initial delta
     }
     
+    prev_lifo_unrealized_pnl = current_lifo_unrealized;
+    if (initial_balance_ > 1e-9) {
+        lifo_unrealized_delta /= initial_balance_;
+    } else {
+        lifo_unrealized_delta = 0.0;
+    }
+    
+    // Also track weighted-average unrealized for display/penalties (not used in reward)
+    // This is weighted-average (matches balance cash flow), not LIFO
+    double current_unrealized_pnl = info["unrealized_pnl"];
+    prev_unrealized_pnl = current_unrealized_pnl;
+    
     // Track realized P&L for logging only (not used in reward)
+    // This is weighted-average realized PnL (matches balance cash flow), not LIFO spreadCapture
     double current_realized_pnl = info["realized_pnl"];
     prev_realized_pnl = current_realized_pnl;
     
@@ -575,24 +560,82 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     // spread_capture: LIFO profit from completing round-trips
     // fee_delta: maker rebates earned from providing liquidity
     // Both are directly controllable by the agent's quoting behavior
-    double mm_reward = (spread_capture_delta + fee_delta) * REWARD_SCALE;
+    double mm_reward_raw = (spread_capture_delta + fee_delta) * MM_REWARD_SCALE;
     
-    // Inactivity cost: small penalty for steps without fills
-    // This prevents the agent from learning "don't trade = safe"
-    // 0.001 per step = 4.096 per episode if no trades (comparable to spread capture rewards)
-    // With 200 trades: penalty ≈ 3.9, spread capture reward ≈ 5 → net positive
-    if (!had_fills_prev_step_ && steps > 0) {
-        mm_reward -= 0.0001;
-    }
-    state["info:mm_reward"_] = mm_reward;
+    // Apply log transform if enabled: sign(r) * log(1 + |r|)
+    // This compresses large rewards while preserving sign and relative ordering
+    double mm_reward = USE_LOG_REWARDS 
+        ? (mm_reward_raw >= 0 ? 1.0 : -1.0) * std::log(1.0 + std::abs(mm_reward_raw))
+        : mm_reward_raw;
     
     // === Inventory Agent Reward: market direction ===
-    // Rewards holding inventory in the right direction (unrealized P&L)
-    double inv_reward = unrealized_pnl_delta * REWARD_SCALE;
-    state["info:inv_reward"_] = inv_reward;
+    // Rewards holding inventory in the right direction (total P&L = realized + unrealized)
+    // When positions close, unrealized P&L becomes realized (spread_capture), so we need both
+    // Total P&L delta = spread_capture_delta + lifo_unrealized_delta
+    // This gives the inventory agent the full picture of market direction
+    double total_pnl_delta = spread_capture_delta + lifo_unrealized_delta;
+    double inv_reward_raw = total_pnl_delta * INV_REWARD_SCALE;
+    
+    // Apply log transform if enabled
+    // CRITICAL: Ensure log transform is actually applied to prevent extreme values
+    // If inv_reward_raw is -15700, log transform should give -log(1+15700) ≈ -9.66, not -15700
+    // Use natural log (log) not log10 - log10 compresses 2.3x less, leading to larger values
+    double inv_reward_instant;
+    if constexpr (USE_LOG_REWARDS) {
+        // Use constexpr if to ensure compile-time evaluation and prevent optimization issues
+        // Natural log provides better compression: log(10001) ≈ 9.21 vs log10(10001) ≈ 4.0
+        inv_reward_instant = (inv_reward_raw >= 0 ? 1.0 : -1.0) * std::log(1.0 + std::abs(inv_reward_raw));
+    } else {
+        inv_reward_instant = inv_reward_raw;
+    }
+    
+    // EMA smoothing for inventory reward (reduces noise in strategic signal)
+    // Alpha = 0.3 gives ~2.3 step half-life, smoothing over ~5-10 steps
+    // This aligns with inventory agent's update frequency (every 5 steps)
+    // and reduces variance in the weak reward signal
+    constexpr double INV_REWARD_EMA_ALPHA = 0.3;
+    inv_reward_ema_ = INV_REWARD_EMA_ALPHA * inv_reward_instant + 
+                      (1.0 - INV_REWARD_EMA_ALPHA) * inv_reward_ema_;
+    double inv_reward = inv_reward_ema_;
+   
+    // Cumulative flow alignment penalty: guide inventory agent to follow flow direction
+    double cumulative_flow_signal = data[16];  // Normalized cumulative flow [-1, 1] from observation
+    double target_inventory_signal = info["target_inventory"];  // Current target inventory (EMA smoothed)
+    
+    // Calculate misalignment: penalty when signs are opposite
+    constexpr double TYPICAL_TARGET_RANGE = 2.0;  // Match config.target_range
+    double target_normalized = target_inventory_signal / TYPICAL_TARGET_RANGE;  // Normalize to [-1, 1] range
+    double flow_alignment = cumulative_flow_signal * target_normalized;  // Product in [-1, 1]
+    double flow_misalignment = std::max(0.0, -flow_alignment);  // Positive when misaligned (opposite signs), in [0, 1]
+    
+    // Calculate DELTA: only penalize when misalignment INCREASES (agent is getting worse)
+    double flow_misalignment_delta = flow_misalignment - prev_flow_misalignment_;
+    prev_flow_misalignment_ = flow_misalignment;
+    
+    // Only penalize increases in misalignment (positive delta)
+    double misalignment_increase = std::max(0.0, flow_misalignment_delta);
+    
+    // Scale penalty: use very small scale since this is a delta (not persistent)
+    constexpr double FLOW_ALIGNMENT_PENALTY_SCALE = 10.0;  // Scale for delta penalty
+    double flow_penalty_raw = -misalignment_increase * FLOW_ALIGNMENT_PENALTY_SCALE;
+    double flow_alignment_penalty = USE_LOG_REWARDS
+        ? (flow_penalty_raw >= 0 ? 1.0 : -1.0) * std::log(1.0 + std::abs(flow_penalty_raw))
+        : flow_penalty_raw;
+
+    // Apply penalties to inventory reward
+    double inv_reward_with_penalties = inv_reward + flow_alignment_penalty;
+    
+    // Clip final rewards to prevent extreme values from dominating learning
+    // Clipping to [-2, 2] ensures stable learning without outlier amplification
+    double mm_reward_clipped = std::clamp(mm_reward, -2.0, 2.0);
+    double inv_reward_clipped = std::clamp(inv_reward_with_penalties, -2.0, 2.0);
+    
+    state["info:mm_reward"_] = mm_reward_clipped;
+    state["info:inv_reward"_] = inv_reward_clipped;
     
     // === Combined Reward: for backwards compatibility ===
-    double reward = mm_reward + inv_reward;
+    // Use clipped rewards for combined reward (sum can exceed [-2, 2] but that's fine for combined)
+    double reward = mm_reward_clipped + inv_reward_clipped;
     state["reward"_] = reward;
     
     state["obs"_].Assign(data.begin(), data.size());

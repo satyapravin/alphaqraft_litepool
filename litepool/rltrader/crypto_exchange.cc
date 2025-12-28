@@ -25,11 +25,7 @@ namespace {
     
     // Safe string to double conversion
     double safeStod(const std::string& str, double default_val = 0.0) {
-        try {
             return std::stod(str);
-        } catch (...) {
-            return default_val;
-        }
     }
 }
 

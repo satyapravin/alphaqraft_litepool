@@ -162,20 +162,12 @@ class Env {
 
   void EnvStep(StateBufferQueue* sbq, int order, bool reset) {
     PreProcess(sbq, order, reset);
-    try {
     if (reset) {
       Reset();
     } else {
       ParseAction();
       Step(Action(std::move(raw_action_)));
       raw_action_.clear();
-      }
-    } catch (...) {
-      // If Reset() or Step() throws, we still need to call PostProcess()
-      // to ensure done_write() is called and the state buffer semaphore is signaled
-      // Otherwise, Wait() will block forever waiting for all environments to call Done()
-      PostProcess();
-      throw;  // Re-throw the exception after ensuring PostProcess is called
     }
     PostProcess();
   }

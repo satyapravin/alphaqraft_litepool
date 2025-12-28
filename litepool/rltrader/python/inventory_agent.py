@@ -22,10 +22,10 @@ class InventoryAgent(nn.Module):
     
     Architecture: Small MLP [64, 32] - runs infrequently
     
-    Input observations (14 dims):
-        - AMM signals: net_flow, flow_imbalance, inventory_delta, cumulative_flow (4)
+    Input observations (12 dims):
+        - AMM signals: net_flow, cumulative_flow (2 stable signals only, removed noisy flow_imbalance and inventory_delta)
         - Position state: leverage, deviation_from_target, target_ema, entry_distance (4)
-        - Price: spread, mid_diff (2)
+        - Quote spreads: actual_bid_spread, actual_ask_spread, total_spread, mid_change (4)
         - Trade signals: volume_imbalance, trade_intensity, buy_pressure, sell_pressure (4)
     
     Output:
@@ -34,7 +34,7 @@ class InventoryAgent(nn.Module):
     
     def __init__(
         self,
-        obs_dim: int = 14,
+        obs_dim: int = 12,
         hidden_dims: Tuple[int, ...] = (64, 32),
         target_range: float = 0.1,  # Max leverage target
     ):
@@ -67,10 +67,15 @@ class InventoryAgent(nn.Module):
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize with small weights for stable training."""
-        for m in self.modules():
+        """Initialize weights: gain ~1.0 for hidden layers, 0.01 for output layers."""
+        for name, m in self.named_modules():
             if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=0.01)
+                # Output layers (actor_mean, actor_log_std, critic): use small gain
+                if 'actor_mean' in name or 'critic' in name:
+                    nn.init.orthogonal_(m.weight, gain=0.01)
+                else:
+                    # Hidden layers: use standard gain
+                    nn.init.orthogonal_(m.weight, gain=1.0)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
     
@@ -88,7 +93,10 @@ class InventoryAgent(nn.Module):
         features = self.encoder(obs)
         
         # Actor: mean of target_inventory, scaled to [-target_range, target_range]
-        action_mean = torch.tanh(self.actor_mean(features)) * self.target_range
+        # Scale actor_mean output by 0.5 before tanh to prevent saturation and encourage smoother actions
+        # This allows the network to output intermediate values more easily
+        raw_mean = self.actor_mean(features) * 0.5
+        action_mean = torch.tanh(raw_mean) * self.target_range
         
         # Critic: value estimate
         value = self.critic(features)
@@ -98,7 +106,8 @@ class InventoryAgent(nn.Module):
     def get_action(
         self, 
         obs: torch.Tensor, 
-        deterministic: bool = False
+        deterministic: bool = False,
+        temperature: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample action for execution.
@@ -106,6 +115,7 @@ class InventoryAgent(nn.Module):
         Args:
             obs: Observations [batch, obs_dim]
             deterministic: If True, return mean (no exploration)
+            temperature: Scale exploration noise (0.0 = deterministic, 1.0 = full exploration)
             
         Returns:
             action: Sampled target_inventory [batch, 1]
@@ -114,11 +124,15 @@ class InventoryAgent(nn.Module):
         """
         action_mean, value = self.forward(obs)
         
-        if deterministic:
+        if temperature == 0.0:
+            # Fully deterministic: use means (regardless of deterministic flag)
             return action_mean, torch.zeros_like(action_mean), value
         
-        # Sample from Gaussian
-        std = torch.exp(self.actor_log_std).expand_as(action_mean)
+        # Sample from Gaussian with temperature scaling
+        # Clamp log_std to prevent explosion: [-5, 1.5] → std range [0.0067, 4.48]
+        # Max clamp prevents std from exploding (which makes policy completely random)
+        log_std_clamped = torch.clamp(self.actor_log_std, min=-5.0, max=1.5)
+        std = torch.exp(log_std_clamped).expand_as(action_mean) * temperature
         dist = torch.distributions.Normal(action_mean, std)
         action = dist.sample()
         log_prob = dist.log_prob(action)
@@ -147,7 +161,10 @@ class InventoryAgent(nn.Module):
         """
         action_mean, value = self.forward(obs)
         
-        std = torch.exp(self.actor_log_std).expand_as(action_mean)
+        # Clamp log_std to prevent explosion: [-5, 1.5] → std range [0.0067, 4.48]
+        # Max clamp prevents std from exploding (which makes policy completely random)
+        log_std_clamped = torch.clamp(self.actor_log_std, min=-5.0, max=1.5)
+        std = torch.exp(log_std_clamped).expand_as(action_mean)
         dist = torch.distributions.Normal(action_mean, std)
         
         log_prob = dist.log_prob(actions)
@@ -160,27 +177,33 @@ class InventoryAgent(nn.Module):
         """
         Extract inventory-relevant observations from full observation.
         
-        Full observation (36 dims):
+        Full observation (40 dims):
             [0-12]: Market signals (13)
             [13-16]: AMM flow signals (4)
             [17-24]: Trade signals (8)
             [25-35]: Agent state (11)
+            [36]: Previous actual bid/ask spread (1)
+            [37]: Bid distance from mid (1)
+            [38]: Ask distance from mid (1)
+            [39]: Mid price change (1)
             
-        Inventory obs (14 dims):
-            - AMM: net_flow[13], flow_imbalance[14], inventory_delta[15], cumulative_flow[16]
+        Inventory obs (12 dims):
+            - AMM: net_flow[13], cumulative_flow[16] (only stable signals, removed noisy flow_imbalance[14] and inventory_delta[15])
             - Position: leverage[25], deviation[30], target_ema[32], entry_distance[33]
-            - Price: spread[0], mid_change[1]
+            - Quote spreads: bid_distance[37], ask_distance[38], total_spread[36], mid_change[39]
             - Trade: volume_imbalance[19], intensity[20], buy_pressure[22], sell_pressure[23]
         """
-        # Select relevant indices
+        # Select relevant indices (removed noisy AMM signals: flow_imbalance[14] and inventory_delta[15])
         indices = [
-            13, 14, 15, 16,  # AMM signals (4)
+            13, 16,          # AMM signals (2): net_flow, cumulative_flow (stable signals only)
             25,              # current_leverage (1)
             30,              # deviation_from_target (1)
             32,              # target_inventory_ema (1)
             33,              # entry_price_distance (1)
-            0,               # spread (1)
-            1,               # mid_price change (1)
+            37,              # bid_distance_from_mid (1)
+            38,              # ask_distance_from_mid (1)
+            36,              # total_spread (previous actual spread) (1)
+            39,              # mid_price_change (1)
             19, 20, 22, 23,  # trade signals (4)
         ]
         
@@ -190,16 +213,19 @@ class InventoryAgent(nn.Module):
             return full_obs[:, indices]
 
 
-# Observation indices for inventory agent (from full 36-dim obs)
+# Observation indices for inventory agent (from full 40-dim obs)
+# Removed noisy AMM signals: flow_imbalance[14] and inventory_delta[15]
 INVENTORY_OBS_INDICES = [
-    13, 14, 15, 16,  # AMM: net_flow, flow_imbalance, inventory_delta, cumulative_flow
+    13, 16,          # AMM: net_flow, cumulative_flow (stable signals only)
     25,              # current_leverage
     30,              # deviation_from_target
     32,              # target_inventory_ema (what agent asked for)
     33,              # entry_price_distance (how far from entry)
-    0,               # spread
-    1,               # mid change
+    37,              # bid_distance_from_mid (actual bid spread)
+    38,              # ask_distance_from_mid (actual ask spread)
+    36,              # total_spread (previous actual bid/ask spread)
+    39,              # mid_change (mid price change)
     19, 20, 22, 23,  # trade: volume_imbalance, intensity, buy_pressure, sell_pressure
 ]
-INVENTORY_OBS_DIM = len(INVENTORY_OBS_INDICES)  # 14
+INVENTORY_OBS_DIM = len(INVENTORY_OBS_INDICES)  # 12 (removed noisy AMM signals)
 

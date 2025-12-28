@@ -37,49 +37,16 @@ from hierarchical_policy import HierarchicalPolicy, create_hierarchical_policy
 from inventory_agent import INVENTORY_OBS_INDICES
 from mm_agent import MARKET_OBS_DIM
 from metric_logger import MetricLogger
-
+from hierarchical_config import HierarchicalConfig
 
 # === Device setup ===
 device = torch.device("cpu")
 print(f"Using device: {device}")
 
 
-# === Configuration ===
-@dataclass
-class HierarchicalConfig:
-    # Environment
-    num_envs: int = 6
-    num_threads: int = 6
-    n_steps: int = 4096
-    max_episode_steps: int = 4096
-    
-    # Hierarchical
-    inventory_update_freq: int = 100  # Every 100 steps = 50 seconds (5 ticks/step × 100ms/tick)
-    
-    # PPO hyperparameters
-    learning_rate: float = 1e-4
-    gamma: float = 0.995
-    gae_lambda: float = 0.995
-    clip_range: float = 0.2
-    entropy_coef: float = 0.01
-    value_coef: float = 0.5
-    max_grad_norm: float = 0.5
-    update_epochs: int = 4
-    minibatch_size: int = 128
-    
-    # Trading parameters
-    base_spread_bps: float = 1.0
-    min_size_pct: float = 1.0
-    max_size_pct: float = 5.0
-    balance: float = 20000.0
-    
-    # Training
-    total_epochs: int = 10000
-    save_interval: int = 100
-    log_interval: int = 1
-
-
 config = HierarchicalConfig()
+
+
 
 
 @dataclass
@@ -95,6 +62,7 @@ class RolloutBuffer:
     log_probs_inv: np.ndarray
     values_mm: np.ndarray
     values_inv: np.ndarray
+    inv_decision_mask: np.ndarray  # Mask: 1 if inventory decision was made at this timestep, 0 otherwise
     # Info tracking for logging
     infos: List = None
     advantages_mm: np.ndarray = None
@@ -115,15 +83,22 @@ class RolloutBuffer:
             log_probs_inv=np.zeros((n_steps, num_envs), dtype=np.float32),
             values_mm=np.zeros((n_steps, num_envs), dtype=np.float32),
             values_inv=np.zeros((n_steps, num_envs), dtype=np.float32),
+            inv_decision_mask=np.zeros((n_steps, num_envs), dtype=np.float32),
             infos=[],
         )
     
     def compute_gae(self, last_values_mm: np.ndarray, last_values_inv: np.ndarray,
-                    gamma: float, gae_lambda: float):
-        """Compute GAE for both agents."""
-        n_steps = self.mm_rewards.shape[0]
+                    gamma: float, gae_lambda: float, inventory_update_freq: int):
+        """
+        Compute GAE for both agents.
         
-        # GAE for MM agent
+        For inventory agent: Use effective gamma^update_freq to account for temporal mismatch.
+        Decisions are made every update_freq steps, so rewards accumulate over that period.
+        """
+        n_steps = self.mm_rewards.shape[0]
+        num_envs = self.mm_rewards.shape[1]
+        
+        # GAE for MM agent (standard, updates every step)
         self.advantages_mm = np.zeros_like(self.mm_rewards)
         last_gae = 0
         for t in reversed(range(n_steps)):
@@ -136,17 +111,75 @@ class RolloutBuffer:
             self.advantages_mm[t] = last_gae = delta + gamma * gae_lambda * next_non_terminal * last_gae
         self.returns_mm = self.advantages_mm + self.values_mm
         
-        # GAE for Inventory agent
+        # GAE for Inventory agent (account for temporal mismatch)
+        # Effective discount: gamma^update_freq because decisions happen every update_freq steps
+        effective_gamma = gamma ** inventory_update_freq
+        effective_gae_lambda = gae_lambda ** inventory_update_freq
+        
         self.advantages_inv = np.zeros_like(self.inv_rewards)
-        last_gae = 0
-        for t in reversed(range(n_steps)):
-            if t == n_steps - 1:
-                next_values = last_values_inv
-            else:
-                next_values = self.values_inv[t + 1]
-            next_non_terminal = 1.0 - self.dones[t]
-            delta = self.inv_rewards[t] + gamma * next_values * next_non_terminal - self.values_inv[t]
-            self.advantages_inv[t] = last_gae = delta + gamma * gae_lambda * next_non_terminal * last_gae
+        
+        # Compute GAE only at decision boundaries, then propagate to intermediate steps
+        # For each environment, find decision timesteps and compute GAE there
+        for env_id in range(num_envs):
+            # Find decision timesteps for this environment
+            decision_timesteps = np.where(self.inv_decision_mask[:, env_id] > 0.5)[0]
+            
+            if len(decision_timesteps) == 0:
+                # No decisions in this rollout for this env, set advantages to 0
+                self.advantages_inv[:, env_id] = 0.0
+                continue
+            
+            # Compute GAE backwards from last decision to first
+            last_gae = 0.0
+            for i in reversed(range(len(decision_timesteps))):
+                t = decision_timesteps[i]
+                
+                # Find next decision timestep (or end of rollout)
+                if i == len(decision_timesteps) - 1:
+                    # Last decision: use last value estimate
+                    next_values = last_values_inv[env_id] if t == n_steps - 1 else self.values_inv[t + 1, env_id]
+                else:
+                    # Next decision timestep
+                    next_t = decision_timesteps[i + 1]
+                    next_values = self.values_inv[next_t, env_id]
+                
+                # Accumulate rewards between this decision and next (or end)
+                if i == len(decision_timesteps) - 1:
+                    # Last decision: accumulate to end of rollout
+                    reward_sum = np.sum(self.inv_rewards[t:, env_id])
+                    # Check if episode ended
+                    episode_ended = np.any(self.dones[t:, env_id])
+                    next_non_terminal = 1.0 - (1.0 if episode_ended else 0.0)
+                else:
+                    # Accumulate rewards to next decision
+                    next_t = decision_timesteps[i + 1]
+                    reward_sum = np.sum(self.inv_rewards[t:next_t, env_id])
+                    next_non_terminal = 1.0
+                
+                # Compute delta and GAE
+                delta = reward_sum + effective_gamma * next_values * next_non_terminal - self.values_inv[t, env_id]
+                gae = delta + effective_gamma * effective_gae_lambda * next_non_terminal * last_gae
+                self.advantages_inv[t, env_id] = gae
+                last_gae = gae
+                
+                # Propagate advantage to intermediate steps (use same advantage for all steps until next decision)
+                if i < len(decision_timesteps) - 1:
+                    next_t = decision_timesteps[i + 1]
+                    # Use decaying advantage for intermediate steps
+                    for intermediate_t in range(t + 1, next_t):
+                        steps_away = intermediate_t - t
+                        decay_factor = gamma ** steps_away
+                        self.advantages_inv[intermediate_t, env_id] = gae * decay_factor
+                else:
+                    # Last decision: propagate to end
+                    for intermediate_t in range(t + 1, n_steps):
+                        steps_away = intermediate_t - t
+                        decay_factor = gamma ** steps_away
+                        # Also account for episode termination
+                        if self.dones[intermediate_t, env_id]:
+                            break
+                        self.advantages_inv[intermediate_t, env_id] = gae * decay_factor
+        
         self.returns_inv = self.advantages_inv + self.values_inv
 
 
@@ -179,12 +212,13 @@ class HierarchicalPPOTrainer:
         self.policy = create_hierarchical_policy(
             inventory_update_freq=config.inventory_update_freq,
             device=str(device),
+            target_range=config.target_range,
         )
         
         # Separate optimizers for each agent
         self.optimizer_inv = optim.Adam(
             self.policy.inventory_agent.parameters(),
-            lr=config.learning_rate,
+            lr=config.inv_learning_rate,  # Higher LR for noisier reward signal
         )
         self.optimizer_mm = optim.Adam(
             self.policy.mm_agent.parameters(),
@@ -199,7 +233,7 @@ class HierarchicalPPOTrainer:
         self.completed_episodes: List[EpisodeInfo] = []
         
         # Rollout buffer
-        obs_dim = 36  # 13 market + 4 AMM + 8 trade + 11 agent state
+        obs_dim = 40  # 13 market + 4 AMM + 8 trade + 11 agent state + 1 previous spread + 2 bid/ask distances + 1 mid_change
         action_dim = 3  # bid_spread, ask_spread, target_inventory (requote removed)
         self.buffer = RolloutBuffer.create(
             config.n_steps, config.num_envs, obs_dim, action_dim
@@ -225,6 +259,24 @@ class HierarchicalPPOTrainer:
         self.tb_writer = SummaryWriter(log_dir=f"runs/{run_name}")
         print(f"TensorBoard logging to: runs/{run_name}")
         print("View with: tensorboard --logdir=runs/")
+    
+    def _get_entropy_coef_mm(self) -> float:
+        """Get current entropy coefficient for MM agent with annealing."""
+        # Linear annealing: start at initial value, decay to 0.01 over total training
+        initial_coef = self.config.entropy_coef_mm
+        final_coef = 0.01
+        total_steps = self.config.total_epochs * self.config.n_steps * self.config.num_envs
+        progress = min(1.0, self.global_step / (total_steps * 0.5))  # Anneal over first 50% of training
+        return initial_coef * (1.0 - progress) + final_coef * progress
+    
+    def _get_entropy_coef_inv(self) -> float:
+        """Get current entropy coefficient for Inventory agent with annealing."""
+        # Linear annealing: start at initial value, decay to 0.01 over total training
+        initial_coef = self.config.entropy_coef_inv
+        final_coef = 0.01
+        total_steps = self.config.total_epochs * self.config.n_steps * self.config.num_envs
+        progress = min(1.0, self.global_step / (total_steps * 0.5))  # Anneal over first 50% of training
+        return initial_coef * (1.0 - progress) + final_coef * progress
     
     def _create_env(self):
         """Create the litepool environment."""
@@ -274,8 +326,15 @@ class HierarchicalPPOTrainer:
         else:
             obs = self.current_obs
         
-        # Clear completed episodes from previous epoch
-        self.completed_episodes.clear()
+        # Keep completed episodes across epochs (persist episode metrics)
+        # Limit to last 1 episode to keep only the most recent
+        if len(self.completed_episodes) > 1:
+            self.completed_episodes = self.completed_episodes[-1:]
+        
+        # Track episode count at start of epoch to show only new episodes in logging
+        self._episode_count_at_epoch_start = len(self.completed_episodes)
+        
+        # Only clear buffer infos for epoch-level metrics
         self.buffer.infos = []
         
         for step in range(self.config.n_steps):
@@ -290,6 +349,8 @@ class HierarchicalPPOTrainer:
             self.buffer.log_probs_inv[step] = info['log_prob_inv'].squeeze()
             self.buffer.values_mm[step] = info['value_mm'].squeeze()
             self.buffer.values_inv[step] = info['value_inv'].squeeze()
+            # Track which timesteps had inventory decisions
+            self.buffer.inv_decision_mask[step] = info['updated_inventory'].astype(np.float32)
             
             # Step environment
             next_obs, reward, terminated, truncated, env_info = self.env.step(action)
@@ -369,8 +430,8 @@ class HierarchicalPPOTrainer:
         # Compute GAE
         self.buffer.compute_gae(
             last_values_mm, last_values_inv,
-            self.config.gamma, self.config.gae_lambda
-        )
+            self.config.gamma, self.config.gae_lambda,
+            inventory_update_freq=self.config.inventory_update_freq)
         
         return last_values_mm, last_values_inv
     
@@ -391,9 +452,18 @@ class HierarchicalPPOTrainer:
         returns_mm = self.buffer.returns_mm.reshape(n_samples)
         returns_inv = self.buffer.returns_inv.reshape(n_samples)
         
-        # Normalize advantages
-        advantages_mm = (advantages_mm - advantages_mm.mean()) / (advantages_mm.std() + 1e-8)
-        advantages_inv = (advantages_inv - advantages_inv.mean()) / (advantages_inv.std() + 1e-8)
+        # Decision mask for inventory agent: only train on timesteps where decisions were made
+        inv_decision_mask = self.buffer.inv_decision_mask.reshape(n_samples)
+        
+        # Normalize advantages (optional - can disable if max >> mean suggests over-normalization)
+        if self.config.normalize_advantages:
+            advantages_mm = (advantages_mm - advantages_mm.mean()) / (advantages_mm.std() + 1e-8)
+            # Only normalize inventory advantages over decision timesteps
+            inv_decision_advantages = advantages_inv[inv_decision_mask > 0.5]
+            if len(inv_decision_advantages) > 0:
+                inv_mean = inv_decision_advantages.mean()
+                inv_std = inv_decision_advantages.std() + 1e-8
+                advantages_inv = (advantages_inv - inv_mean) / inv_std
         
         # Convert to tensors
         obs_t = torch.as_tensor(obs_flat, dtype=torch.float32, device=device)
@@ -407,10 +477,24 @@ class HierarchicalPPOTrainer:
         advantages_inv_t = torch.as_tensor(advantages_inv, dtype=torch.float32, device=device)
         returns_mm_t = torch.as_tensor(returns_mm, dtype=torch.float32, device=device)
         returns_inv_t = torch.as_tensor(returns_inv, dtype=torch.float32, device=device)
+        inv_decision_mask_t = torch.as_tensor(inv_decision_mask, dtype=torch.float32, device=device)
         
         losses = {'policy_loss_mm': 0, 'value_loss_mm': 0, 'entropy_mm': 0,
-                  'policy_loss_inv': 0, 'value_loss_inv': 0, 'entropy_inv': 0}
+                  'policy_loss_inv': 0, 'value_loss_inv': 0, 'entropy_inv': 0,
+                  'advantage_mm_mean': 0, 'advantage_mm_std': 0, 'advantage_mm_max': 0,
+                  'advantage_inv_mean': 0, 'advantage_inv_std': 0, 'advantage_inv_max': 0,
+                  'grad_norm_mm': 0, 'grad_norm_inv': 0}
         n_updates = 0
+        
+        # Track advantage statistics (before normalization)
+        advantages_mm_raw = advantages_mm.copy()
+        advantages_inv_raw = advantages_inv.copy()
+        losses['advantage_mm_mean'] = float(np.mean(advantages_mm_raw))
+        losses['advantage_mm_std'] = float(np.std(advantages_mm_raw))
+        losses['advantage_mm_max'] = float(np.max(np.abs(advantages_mm_raw)))
+        losses['advantage_inv_mean'] = float(np.mean(advantages_inv_raw))
+        losses['advantage_inv_std'] = float(np.std(advantages_inv_raw))
+        losses['advantage_inv_max'] = float(np.max(np.abs(advantages_inv_raw)))
         
         for _ in range(self.config.update_epochs):
             # Random permutation for minibatches
@@ -430,6 +514,7 @@ class HierarchicalPPOTrainer:
                 advantages_inv_batch = advantages_inv_t[batch_indices]
                 returns_mm_batch = returns_mm_t[batch_indices]
                 returns_inv_batch = returns_inv_t[batch_indices]
+                inv_decision_mask_batch = inv_decision_mask_t[batch_indices]
                 
                 # Evaluate actions
                 eval_results = self.policy.evaluate_actions(
@@ -449,41 +534,86 @@ class HierarchicalPPOTrainer:
                                        1 + self.config.clip_range) * advantages_mm_batch
                 policy_loss_mm = -torch.min(surr1_mm, surr2_mm).mean()
                 
+                # Value loss with clipping and L2 regularization
                 value_loss_mm = nn.functional.mse_loss(value_mm, returns_mm_batch)
+                value_loss_mm = torch.clamp(value_loss_mm, max=self.config.value_loss_clip)
                 
+                # L2 regularization on value function parameters
+                value_l2_reg_mm = 0.0
+                for param in self.policy.mm_agent.critic.parameters():
+                    value_l2_reg_mm += torch.sum(param ** 2)
+                value_l2_reg_mm = self.config.value_l2_reg * value_l2_reg_mm
+                
+                # Get current entropy coefficient (with annealing)
+                current_entropy_coef_mm = self._get_entropy_coef_mm()
+                    
                 loss_mm = (policy_loss_mm 
                           + self.config.value_coef * value_loss_mm 
-                          - self.config.entropy_coef * entropy_mm)
+                          + value_l2_reg_mm
+                          - current_entropy_coef_mm * entropy_mm)
                 
                 self.optimizer_mm.zero_grad()
                 loss_mm.backward()
-                nn.utils.clip_grad_norm_(self.policy.mm_agent.parameters(), 
-                                         self.config.max_grad_norm)
+                grad_norm_mm = nn.utils.clip_grad_norm_(self.policy.mm_agent.parameters(), 
+                                                       self.config.max_grad_norm)
                 self.optimizer_mm.step()
                 
+                # Track gradient norm
+                losses['grad_norm_mm'] += grad_norm_mm.item()
+                
                 # === Update Inventory Agent ===
+                # Only update on timesteps where decisions were actually made
                 log_prob_inv, entropy_inv, value_inv = eval_results['inventory']
                 log_prob_inv = log_prob_inv.squeeze()
                 entropy_inv = entropy_inv.mean()
                 value_inv = value_inv.squeeze()
                 
-                ratio_inv = torch.exp(log_prob_inv - old_log_probs_inv_batch)
-                surr1_inv = ratio_inv * advantages_inv_batch
-                surr2_inv = torch.clamp(ratio_inv, 1 - self.config.clip_range,
-                                        1 + self.config.clip_range) * advantages_inv_batch
-                policy_loss_inv = -torch.min(surr1_inv, surr2_inv).mean()
+                # Mask: only compute loss for decision timesteps
+                decision_mask = inv_decision_mask_batch > 0.5
+                n_decisions = decision_mask.sum().item()
                 
-                value_loss_inv = nn.functional.mse_loss(value_inv, returns_inv_batch)
-                
-                loss_inv = (policy_loss_inv
-                           + self.config.value_coef * value_loss_inv
-                           - self.config.entropy_coef * entropy_inv)
+                if n_decisions > 0:
+                    # Compute losses only on decision timesteps
+                    ratio_inv = torch.exp(log_prob_inv - old_log_probs_inv_batch)
+                    surr1_inv = ratio_inv * advantages_inv_batch
+                    surr2_inv = torch.clamp(ratio_inv, 1 - self.config.clip_range,
+                                            1 + self.config.clip_range) * advantages_inv_batch
+                    policy_loss_inv = -torch.min(surr1_inv[decision_mask], surr2_inv[decision_mask]).mean()
+                    
+                    # Value loss with clipping and L2 regularization (only on decision timesteps)
+                    value_loss_inv = nn.functional.mse_loss(
+                        value_inv[decision_mask], 
+                        returns_inv_batch[decision_mask]
+                    )
+                    value_loss_inv = torch.clamp(value_loss_inv, max=self.config.value_loss_clip)
+                    
+                    # L2 regularization on value function parameters
+                    value_l2_reg_inv = 0.0
+                    for param in self.policy.inventory_agent.critic.parameters():
+                        value_l2_reg_inv += torch.sum(param ** 2)
+                    value_l2_reg_inv = self.config.value_l2_reg * value_l2_reg_inv
+                    
+                    # Get current entropy coefficient (with annealing)
+                    current_entropy_coef_inv = self._get_entropy_coef_inv()
+                    
+                    loss_inv = (policy_loss_inv
+                               + self.config.value_coef * value_loss_inv
+                               + value_l2_reg_inv
+                               - current_entropy_coef_inv * entropy_inv)
+                else:
+                    # No decisions in this batch, skip update
+                    policy_loss_inv = torch.tensor(0.0, device=device)
+                    value_loss_inv = torch.tensor(0.0, device=device)
+                    loss_inv = torch.tensor(0.0, device=device)
                 
                 self.optimizer_inv.zero_grad()
                 loss_inv.backward()
-                nn.utils.clip_grad_norm_(self.policy.inventory_agent.parameters(),
-                                         self.config.max_grad_norm)
+                grad_norm_inv = nn.utils.clip_grad_norm_(self.policy.inventory_agent.parameters(),
+                                                         self.config.max_grad_norm)
                 self.optimizer_inv.step()
+                
+                # Track gradient norm
+                losses['grad_norm_inv'] += grad_norm_inv.item()
                 
                 # Track losses
                 losses['policy_loss_mm'] += policy_loss_mm.item()
@@ -494,28 +624,39 @@ class HierarchicalPPOTrainer:
                 losses['entropy_inv'] += entropy_inv.item()
                 n_updates += 1
         
-        # Average losses
+        # Average losses (except advantage stats which are already computed once)
         if n_updates > 0:
             for key in losses:
-                losses[key] /= n_updates
+                if key not in ['advantage_mm_mean', 'advantage_mm_std', 'advantage_mm_max',
+                              'advantage_inv_mean', 'advantage_inv_std', 'advantage_inv_max']:
+                    losses[key] /= n_updates
         
         return losses
     
     def _log_epoch(self, epoch: int, losses: Dict[str, float]):
         """Log epoch statistics."""
-        # Compute averages from completed episodes
-        if self.completed_episodes:
-            avg_mm_reward = np.mean([e.mm_reward for e in self.completed_episodes])
-            avg_inv_reward = np.mean([e.inv_reward for e in self.completed_episodes])
-            avg_realized_pnl = np.mean([e.realized_pnl for e in self.completed_episodes])
-            avg_unrealized_pnl = np.mean([e.unrealized_pnl for e in self.completed_episodes])
-            total_trades = sum(e.trade_count for e in self.completed_episodes)
-        else:
-            avg_mm_reward = np.mean(self.episode_mm_rewards) if self.episode_mm_rewards else 0
-            avg_inv_reward = np.mean(self.episode_inv_rewards) if self.episode_inv_rewards else 0
-            avg_realized_pnl = 0
-            avg_unrealized_pnl = 0
-            total_trades = 0
+        # Always compute epoch-level stats from the buffer (this epoch's data)
+        # Sum rewards across all steps and envs for this epoch
+        avg_mm_reward = self.buffer.mm_rewards.sum() / self.config.num_envs
+        avg_inv_reward = self.buffer.inv_rewards.sum() / self.config.num_envs
+        
+        # Get P&L from last info in buffer (end of epoch snapshot - RUNNING TOTALS, not episode totals)
+        # NOTE: These are running totals from the current episode, not final episode values
+        # For final episode values, see completed_episodes which use final_* keys
+        avg_realized_pnl = 0.0
+        avg_unrealized_pnl = 0.0
+        total_trades = 0
+        if self.buffer.infos and len(self.buffer.infos) > 0:
+            last_info = self.buffer.infos[-1]
+            if 'realized_pnl' in last_info:
+                val = last_info['realized_pnl']
+                avg_realized_pnl = float(val.mean()) if isinstance(val, np.ndarray) else float(val)
+            if 'lifo_unrealized_pnl' in last_info:
+                val = last_info['lifo_unrealized_pnl']
+                avg_unrealized_pnl = float(val.mean()) if isinstance(val, np.ndarray) else float(val)
+            if 'trade_count' in last_info:
+                val = last_info['trade_count']
+                total_trades = int(val.sum()) if isinstance(val, np.ndarray) else int(val)
         
         # Compute action statistics (3-action space: bid_spread, ask_spread, target)
         actions = self.buffer.actions.reshape(-1, 3)
@@ -546,33 +687,42 @@ class HierarchicalPPOTrainer:
         inv_std = torch.exp(self.policy.inventory_agent.actor_log_std).mean().item()
         
         # Print epoch summary with full learning diagnostics
+        # NOTE: R.PnL and U.PnL are RUNNING TOTALS (current episode state), not final episode values
         print(f"Epoch {epoch:5d} | "
               f"Step {self.global_step:8d} | "
               f"MM.Rew {avg_mm_reward:8.2f} | "
               f"Inv.Rew {avg_inv_reward:8.2f} | "
-              f"R.PnL ${avg_realized_pnl:7.2f} | "
-              f"U.PnL ${avg_unrealized_pnl:7.2f} | "
+              f"R.PnL ${avg_realized_pnl:7.2f} (running) | "
+              f"U.PnL ${avg_unrealized_pnl:7.2f} (running) | "
               f"Trades {total_trades:4d} (B:{buy_trades}/S:{sell_trades})")
         print(f"         Loss: PL_mm {losses['policy_loss_mm']:.4f} VL_mm {losses['value_loss_mm']:.4f} | "
               f"PL_inv {losses['policy_loss_inv']:.4f} VL_inv {losses['value_loss_inv']:.4f} | "
               f"Ent {losses['entropy_mm']:.3f}/{losses['entropy_inv']:.3f} | "
               f"Std {mm_spread_std:.3f}/{inv_std:.3f}")
+        print(f"         Adv: MM μ={losses['advantage_mm_mean']:.4f} σ={losses['advantage_mm_std']:.4f} max={losses['advantage_mm_max']:.4f} | "
+              f"Inv μ={losses['advantage_inv_mean']:.4f} σ={losses['advantage_inv_std']:.4f} max={losses['advantage_inv_max']:.4f}")
+        print(f"         Grad: MM={losses['grad_norm_mm']:.4f} Inv={losses['grad_norm_inv']:.4f}")
         
-        # Print completed episodes
-        if self.completed_episodes:
-            print(f"\n  Completed {len(self.completed_episodes)} episode(s):")
-            for ep in self.completed_episodes:
+        # Print completed episodes (only show episodes from this epoch to avoid spam)
+        episodes_this_epoch = self.completed_episodes[self._episode_count_at_epoch_start:]
+        if episodes_this_epoch:
+            print(f"\n  Completed {len(episodes_this_epoch)} episode(s) this epoch (total: {len(self.completed_episodes)}):")
+            for ep in episodes_this_epoch:
                 net_pnl = ep.realized_pnl + ep.unrealized_pnl + ep.fees
-                print(f"  [Episode] Env {ep.env_id} | "
+                # Note: R.PnL includes fees (balance change), so net_pnl double-counts fees
+                # True Net = R.PnL + U.PnL (fees already in R.PnL)
+                # NOTE: These are FINAL episode values (from final_* keys), not running totals
+                true_net = ep.realized_pnl + ep.unrealized_pnl
+                print(f"  [Episode FINAL] Env {ep.env_id} | "
                       f"Steps {ep.steps:5d} | "
                       f"MM.Rew {ep.mm_reward:7.2f} | "
                       f"Inv.Rew {ep.inv_reward:7.2f} | "
-                      f"SprdCap ${ep.spread_capture:6.2f} | "
-                      f"U.PnL ${ep.unrealized_pnl:7.2f} | "
-                      f"Fees ${ep.fees:5.2f} | "
-                      f"Net ${net_pnl:7.2f} | "
-                      f"Trades {ep.trade_count:4d} | "
-                      f"Pos {ep.net_amount_btc:+.5f} BTC")
+                      f"R.PnL ${ep.realized_pnl:7.2f} (final) | "
+                      f"SprdCap ${ep.spread_capture:6.2f} (final) | "
+                      f"U.PnL ${ep.unrealized_pnl:7.2f} (final) | "
+                      f"Net ${true_net:7.2f} (final) | "
+                      f"Trades {ep.trade_count:4d} (final) | "
+                      f"Pos {ep.net_amount_btc:+.5f} BTC (final)")
             print()
         
         # === TensorBoard Logging ===
@@ -582,6 +732,18 @@ class HierarchicalPPOTrainer:
         self.tb_writer.add_scalar('Reward/MM_Agent', avg_mm_reward, step)
         self.tb_writer.add_scalar('Reward/Inventory_Agent', avg_inv_reward, step)
         self.tb_writer.add_scalar('Reward/Total', avg_mm_reward + avg_inv_reward, step)
+        
+        # Advantage statistics
+        self.tb_writer.add_scalar('Advantage/MM_Mean', losses['advantage_mm_mean'], step)
+        self.tb_writer.add_scalar('Advantage/MM_Std', losses['advantage_mm_std'], step)
+        self.tb_writer.add_scalar('Advantage/MM_Max', losses['advantage_mm_max'], step)
+        self.tb_writer.add_scalar('Advantage/Inv_Mean', losses['advantage_inv_mean'], step)
+        self.tb_writer.add_scalar('Advantage/Inv_Std', losses['advantage_inv_std'], step)
+        self.tb_writer.add_scalar('Advantage/Inv_Max', losses['advantage_inv_max'], step)
+        
+        # Gradient norms
+        self.tb_writer.add_scalar('Gradient/MM_Norm', losses['grad_norm_mm'], step)
+        self.tb_writer.add_scalar('Gradient/Inv_Norm', losses['grad_norm_inv'], step)
         
         # P&L Metrics
         self.tb_writer.add_scalar('PnL/Realized', avg_realized_pnl, step)
@@ -640,7 +802,7 @@ class HierarchicalPPOTrainer:
         print(f"MM Agent: updates every step (500ms)")
         print(f"Steps per epoch: {self.config.n_steps}")
         print(f"Total epochs: {self.config.total_epochs}")
-        print(f"Observations: 36 signals (13 market + 4 AMM + 8 trade + 11 agent state)")
+        print(f"Observations: 40 signals (13 market + 4 AMM + 8 trade + 11 agent state + 1 previous spread + 2 bid/ask distances + 1 mid_change)")
         print(f"Actions: 3 (bid_spread, ask_spread, target_inventory)")
         print(f"Smart requote: only when prices change by >2 ticks")
         print("="*80 + "\n")
@@ -665,6 +827,9 @@ class HierarchicalPPOTrainer:
             if avg_reward > self.best_reward:
                 self.best_reward = avg_reward
                 self.save_checkpoint(str(self.results_dir / "best_model.pt"))
+            
+            # Always save latest checkpoint for resuming
+            self.save_checkpoint(str(self.results_dir / "latest.pt"))
             
             # Save checkpoint periodically
             if epoch % self.config.save_interval == 0 and epoch > 0:
@@ -703,7 +868,8 @@ class HierarchicalPPOTrainer:
     
     def load_checkpoint(self, path: str):
         """Load training checkpoint."""
-        checkpoint = torch.load(path, map_location=device)
+        # weights_only=False needed for PyTorch 2.6+ (checkpoint contains config objects)
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
         self.policy.inventory_agent.load_state_dict(checkpoint['inventory_agent'])
         self.policy.mm_agent.load_state_dict(checkpoint['mm_agent'])
         self.optimizer_inv.load_state_dict(checkpoint['optimizer_inv'])
@@ -720,11 +886,22 @@ def main():
     # Create trainer
     trainer = HierarchicalPPOTrainer(config)
     
-    # Check for existing checkpoint
-    checkpoint_path = Path("results/hierarchical/latest.pt")
-    if checkpoint_path.exists():
-        print(f"Found checkpoint at {checkpoint_path}")
+    # Check for existing checkpoint (prefer best_model, then latest)
+    checkpoint_path = None
+    best_model_path = Path("results/hierarchical/best_model.pt")
+    latest_path = Path("results/hierarchical/latest.pt")
+    
+    if best_model_path.exists():
+        checkpoint_path = best_model_path
+        print(f"Found best model checkpoint at {checkpoint_path}")
+    elif latest_path.exists():
+        checkpoint_path = latest_path
+        print(f"Found latest checkpoint at {checkpoint_path}")
+    
+    if checkpoint_path:
         trainer.load_checkpoint(str(checkpoint_path))
+    else:
+        print("No checkpoint found, starting from scratch")
     
     # Train
     trainer.train()
