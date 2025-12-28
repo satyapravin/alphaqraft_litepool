@@ -104,7 +104,7 @@ class RlTraderEnvFns {
   static decltype(auto) ActionSpec(const Config& conf) {
     // 3-action space: bid_spread, ask_spread, target_inventory
     // Note: requote removed - we use smart requote (only when prices change by >5 ticks)
-    return MakeDict("action"_.Bind(Spec<float>({3}, {{ -1., -1., -1. },
+    return MakeDict("action"_.Bind(Spec<float>({3}, {{  0.,  0., -1. },
                                                      {  1.,  1.,  1. }})));
   }
 };
@@ -570,9 +570,9 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     
     // === Inventory Agent Reward: market direction ===
     // Rewards holding inventory in the right direction (total P&L = realized + unrealized)
-    // When positions close, unrealized P&L becomes realized (spread_capture), so we need both
     // Total P&L delta = spread_capture_delta + lifo_unrealized_delta
     // This gives the inventory agent the full picture of market direction
+    // The inventory agent controls WHAT position to hold, so it should see the total impact
     double total_pnl_delta = spread_capture_delta + lifo_unrealized_delta;
     double inv_reward_raw = total_pnl_delta * INV_REWARD_SCALE;
     

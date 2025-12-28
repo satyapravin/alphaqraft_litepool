@@ -600,17 +600,18 @@ class HierarchicalPPOTrainer:
                                + self.config.value_coef * value_loss_inv
                                + value_l2_reg_inv
                                - current_entropy_coef_inv * entropy_inv)
+                    
+                    self.optimizer_inv.zero_grad()
+                    loss_inv.backward()
+                    grad_norm_inv = nn.utils.clip_grad_norm_(self.policy.inventory_agent.parameters(),
+                                                             self.config.max_grad_norm)
+                    self.optimizer_inv.step()
                 else:
                     # No decisions in this batch, skip update
-                    policy_loss_inv = torch.tensor(0.0, device=device)
-                    value_loss_inv = torch.tensor(0.0, device=device)
-                    loss_inv = torch.tensor(0.0, device=device)
-                
-                self.optimizer_inv.zero_grad()
-                loss_inv.backward()
-                grad_norm_inv = nn.utils.clip_grad_norm_(self.policy.inventory_agent.parameters(),
-                                                         self.config.max_grad_norm)
-                self.optimizer_inv.step()
+                    policy_loss_inv = torch.tensor(0.0, device=device, requires_grad=False)
+                    value_loss_inv = torch.tensor(0.0, device=device, requires_grad=False)
+                    loss_inv = torch.tensor(0.0, device=device, requires_grad=False)
+                    grad_norm_inv = torch.tensor(0.0, device=device)
                 
                 # Track gradient norm
                 losses['grad_norm_inv'] += grad_norm_inv.item()

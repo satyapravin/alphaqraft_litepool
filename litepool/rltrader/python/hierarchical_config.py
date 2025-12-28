@@ -7,13 +7,13 @@ class HierarchicalConfig:
     n_steps: int = 1200  # 10 minutes 
     max_episode_steps: int = 14399
 
-    inventory_update_freq: int = 30  # Every 30 steps = 15 seconds (faster updates for more responsive target inventory)
+    inventory_update_freq: int = 1  # Every step (target is smoothed by 120-step EMA in strategy)
 
     # PPO hyperparameters
     learning_rate: float = 1e-3
     inv_learning_rate: float = 1e-3  # Reduced from 4e-5 to stabilize (large gradients causing instability)
-    gamma: float = 0.995  # Higher gamma for longer episodes (2 hours)
-    gae_lambda: float = 0.95
+    gamma: float = 0.99  # Higher gamma for longer episodes (2 hours)
+    gae_lambda: float = 0.99
     clip_range: float = 0.2
     entropy_coef: float = 0.5  # Base entropy coefficient (reduced to prevent std explosion)
     entropy_coef_mm: float = 0.5  # Higher entropy for MM agent (encourages exploration, small policy loss suggests early convergence)
@@ -27,11 +27,11 @@ class HierarchicalConfig:
     minibatch_size: int = 256
 
     # Trading parameters
-    base_spread_bps: float = 1
+    base_spread_bps: float = 2
     min_size_pct: float = 1
     max_size_pct: float = 25.0
     balance: float = 20000.0
-    target_range: float = 0.4  # Inventory agent outputs actions in [-target_range, +target_range], used directly in C++
+    target_range: float = 1.0  # Inventory agent outputs actions in [-target_range, +target_range], used directly in C++
 
     # Training
     total_epochs: int = 10000

@@ -31,8 +31,8 @@ class MMAgent(nn.Module):
         - Ask distance from mid [38] (1)
     
     Output (2 actions):
-        - bid_spread: [-1, 1] → controls bid quote width
-        - ask_spread: [-1, 1] → controls ask quote width
+        - bid_spread: [0, 1] → multiplies base_spread_bps to get actual bid spread
+        - ask_spread: [0, 1] → multiplies base_spread_bps to get actual ask spread
         
     Note: Requote is handled automatically by the environment (smart requote).
     """
@@ -133,8 +133,8 @@ class MMAgent(nn.Module):
         # Take last timestep
         last_out = lstm_out[:, -1, :]  # [batch, lstm_hidden]
         
-        # Actor output: spread actions
-        spread_mean = torch.tanh(self.spread_mean(last_out))  # [-1, 1]
+        # Actor output: spread actions [0, 1] - multiplies base_spread_bps
+        spread_mean = torch.sigmoid(self.spread_mean(last_out))  # [0, 1]
         
         # Critic
         value = self.critic(last_out)
@@ -184,7 +184,7 @@ class MMAgent(nn.Module):
         spread_std = torch.exp(log_std_clamped).expand_as(spread_mean) * temperature
         spread_dist = torch.distributions.Normal(spread_mean, spread_std)
         action = spread_dist.sample()
-        action = torch.clamp(action, -1, 1)
+        action = torch.clamp(action, 0, 1)  # Clamp to [0, 1] range
         log_prob = spread_dist.log_prob(action).sum(dim=-1, keepdim=True)
         
         return action, log_prob, value, hidden

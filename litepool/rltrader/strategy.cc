@@ -124,35 +124,20 @@ std::pair<double, double> Strategy::computeQuotePrices(
     // === Step 1: Compute base spread (in bps) ===
     double base_spread_bps = config.base_spread_bps;
     
-    // === Step 2: Volatility adjustment ===
-    // In volatile markets, widen spreads to compensate for adverse selection risk
-    // vol_mult = 1 + volatility * VOL_SPREAD_MULT
-    // E.g., if vol=0.001 (0.1% per tick) and MULT=50, spread widens by 5%
-    // For liquidity crunches, allow much larger volatility adjustments
-    double vol_mult = 1.0 + realized_vol * VOL_SPREAD_MULT;
-    vol_mult = std::clamp(vol_mult, 1.0, 20.0);  // Cap at 20x widening (was 5x) - allows huge spreads during crashes
+    // === Step 2: Agent spread control (full spreads in bps) ===
+    // bid_spread/ask_spread actions: [0, 1] → directly multiplies base_spread_bps
+    // action=0 → 0 bps (no quote), action=1 → base_spread_bps (full base spread)
+    // Clamp actions to [0, 1] range
+    double bid_action = std::clamp(action.bid_spread, 0.0, 1.0);
+    double ask_action = std::clamp(action.ask_spread, 0.0, 1.0);
     
-    // === Step 3: Agent spread control (full spreads in bps) ===
-    // bid_spread/ask_spread actions: [-1, 1] → [MIN_SPREAD_MULT, MAX_SPREAD_MULT]
-    // EXPONENTIAL mapping: more control at tighter spreads (where it matters most)
-    // action=-1 → MIN_SPREAD_MULT (0.5x), action=0 → 1.0x, action=+1 → MAX_SPREAD_MULT (50.0x)
-    // Allows agent to widen spreads dramatically during liquidity crunches
-    double log_ratio = std::log(MAX_SPREAD_MULT / MIN_SPREAD_MULT) / 2.0;  // ~2.3 for 50.0/0.5
-    double center_mult = std::sqrt(MAX_SPREAD_MULT * MIN_SPREAD_MULT);     // Geometric mean ~5.0 for sqrt(50.0*0.5)
+    // === Step 3: Compute base spreads (full spreads in bps) ===
+    // Direct multiplication: action * base_spread_bps
+    double bid_spread_bps = base_spread_bps * bid_action;
+    double ask_spread_bps = base_spread_bps * ask_action;
     
-    double bid_spread_mult = center_mult * std::exp(action.bid_spread * log_ratio);
-    double ask_spread_mult = center_mult * std::exp(action.ask_spread * log_ratio);
-    
-    // Clamp to ensure within bounds (handles numerical edge cases)
-    bid_spread_mult = std::clamp(bid_spread_mult, MIN_SPREAD_MULT, MAX_SPREAD_MULT);
-    ask_spread_mult = std::clamp(ask_spread_mult, MIN_SPREAD_MULT, MAX_SPREAD_MULT);
-    
-    // === Step 4: Compute base spreads (full spreads in bps) ===
-    double bid_spread_bps = base_spread_bps * vol_mult * bid_spread_mult;
-    double ask_spread_bps = base_spread_bps * vol_mult * ask_spread_mult;
-    
-    // === Step 5: Apply inventory skew by adjusting spreads directly ===
-    // Goal: Push current leverage toward target leverage
+    // === Step 4: Apply inventory skew by adjusting spreads directly ===
+    // Goal: Push current leverage toward target leverage gradually (at least 5 minutes = 600 steps)
     // If too long (leverage > target): widen bid, tighten ask → more likely to sell (reduce long)
     // If too short (leverage < target): tighten bid, widen ask → more likely to buy (reduce short)
     // target_inventory_ema is in [-target_range, +target_range] (e.g., [-5, +5] if target_range=5.0)
@@ -176,14 +161,24 @@ std::pair<double, double> Strategy::computeQuotePrices(
     prev_inventory_error_ = inventory_error;
     
     // === Adaptive skew multiplier based on volatility, urgency, and time ===
+    constexpr double MIN_RESET_TIME_STEPS = 120.0;  // 1 minutes = 120 steps at 0.5s per step
+    
     // 1. Error magnitude urgency: smooth tanh function (saturates for large errors)
     //    tanh provides smooth response: small errors get linear scaling, large errors saturate
     double error_magnitude = std::abs(inventory_error);
     double error_urgency = std::tanh(error_magnitude * 5.0);  // Scale: 0.2 error → tanh(1) ≈ 0.76, saturates at 1.0
     
-    // 2. Time-based urgency: increases with time away from target (up to 2x multiplier)
-    //    More time away = more urgent = stronger skew
-    double time_urgency = 1.0 + std::tanh(steps_away_from_target_ / 100.0);  // 100 steps → tanh(1) ≈ 0.76, max 2.0x
+    // 2. Time-based urgency: increases with time away from target, but capped to respect 5-minute minimum
+    //    Scale urgency based on how much time has passed vs minimum reset time
+    //    Only increase urgency after we've given enough time (600 steps)
+    double time_urgency_base = 1.0;
+    if (steps_away_from_target_ > MIN_RESET_TIME_STEPS) {
+        // After 5 minutes, gradually increase urgency (up to 2x)
+        double excess_time = steps_away_from_target_ - MIN_RESET_TIME_STEPS;
+        double urgency_increase = std::tanh(excess_time / 300.0);  // Gradual increase over next 5 minutes
+        time_urgency_base = 1.0 + urgency_increase;  // 1.0 to 2.0
+    }
+    // Before 5 minutes: keep urgency at 1.0 (no rush, allow gradual movement)
     
     // 3. Volatility adjustment: higher vol → stronger skew (but risk-averse mode for extreme vol)
     //    Moderate vol: increase skew (need to move faster)
@@ -208,9 +203,12 @@ std::pair<double, double> Strategy::computeQuotePrices(
     // Combined adaptive skew multiplier: base * error_urgency * time_urgency * vol_skew_mult
     // This gives stronger skew when:
     // - Error is large (error_urgency)
-    // - We've been away from target for a while (time_urgency)
+    // - We've been away from target for more than 5 minutes (time_urgency)
     // - Volatility is moderate (vol_skew_mult), but weak in extreme vol (risk-averse)
-    double adaptive_skew_mult = INVENTORY_SKEW_MULT * error_urgency * time_urgency * vol_skew_mult;
+    // INVENTORY_SKEW_MULT is now conservative (0.5) to preserve spread capture
+    // Scale down further to ensure at least 5 minutes to reach target
+    double base_skew_scale = 1.0 / (MIN_RESET_TIME_STEPS / 100.0);  // Scale to allow 600 steps for full error
+    double adaptive_skew_mult = INVENTORY_SKEW_MULT * base_skew_scale * error_urgency * time_urgency_base * vol_skew_mult;
     
     // Skew factor: positive when too long (need to sell), negative when too short (need to buy)
     // inventory_error > 0 means too long → need to sell → positive skew (widen bid, tighten ask)
@@ -223,7 +221,12 @@ std::pair<double, double> Strategy::computeQuotePrices(
     // Negative skew_factor (too short, need to buy) → tighten bid, widen ask
     // Use percentage of current spread (not base) so skew scales with wide spreads during volatility
     double avg_spread_bps = (bid_spread_bps + ask_spread_bps) * 0.5;
+    
+    // Compute skew adjustment as percentage of average spread
+    // Cap at 50% to preserve spread capture opportunity (round-trips still possible)
     double skew_adjustment_bps = std::abs(skew_factor) * avg_spread_bps;
+    double max_adjustment = avg_spread_bps * 0.5;  // Max 50% of spread can be adjusted
+    skew_adjustment_bps = std::min(skew_adjustment_bps, max_adjustment);
     
     // Apply opposite adjustments to create asymmetry:
     // Positive skew_factor (too long, need to sell) → widen bid (+), tighten ask (-)
@@ -244,7 +247,7 @@ std::pair<double, double> Strategy::computeQuotePrices(
     bid_spread_bps = std::max(bid_spread_bps, base_spread_bps * MIN_SPREAD_MULT);
     ask_spread_bps = std::max(ask_spread_bps, base_spread_bps * MIN_SPREAD_MULT);
     
-    // === Step 6: Convert spreads to price units and place quotes ===
+    // === Step 5: Convert spreads to price units and place quotes ===
     // Agent controls FULL spreads (distance from mid to quote)
     // No division by 2 - bid_spread_bps is already the full distance from mid
     double bid_spread_price = mid_price * bid_spread_bps / 10000.0;
@@ -253,7 +256,7 @@ std::pair<double, double> Strategy::computeQuotePrices(
     double bid_price = mid_price - bid_spread_price;
     double ask_price = mid_price + ask_spread_price;
     
-    // === Step 7: Safety checks ===
+    // === Step 6: Safety checks ===
     // REMOVED: 1 bps minimum floor - let agent learn consequences of tight spreads
     // Agent will experience adverse selection if quoting too tight, which is the learning signal
     
@@ -275,7 +278,7 @@ std::pair<double, double> Strategy::computeQuoteSizes(
     const RLAction& action,
     double init_balance) {
     
-    constexpr double SIZE_PER_LEVEL_PCT = 1;
+    constexpr double SIZE_PER_LEVEL_PCT = 5;
     double size_usd = SIZE_PER_LEVEL_PCT / 100.0 * init_balance;
     
     return {size_usd, size_usd};

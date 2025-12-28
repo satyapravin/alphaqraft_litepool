@@ -139,10 +139,11 @@ namespace RLTrader {
         bool first_call_ = true;               // First call flag (for detecting changes without fills)
         
         // Model parameters
-        static constexpr double TARGET_EMA_ALPHA = 0.0058;   // Target inventory smoothing (120 step half-life = 60 sec) 
+        static constexpr double TARGET_EMA_ALPHA = 0.0058;   // Target inventory smoothing (120 step half-life = 60 sec)
+        // Alpha = 0.0058 gives half-life of ~120 steps: 0.5 = (1 - alpha)^n → n ≈ 120 
         static constexpr double VOL_EMA_ALPHA = 0.01;        // Volatility EMA (~100 sample half-life)
         static constexpr double VOL_SPREAD_MULT = 50.0;      // How much volatility widens spread
-        static constexpr double INVENTORY_SKEW_MULT = 50000.0;  // Reduced: smoother quote shifts, agent spreads respected more
+        static constexpr double INVENTORY_SKEW_MULT = 0.5;  // Conservative skew: max 50% of spread can be adjusted (preserves spread capture)
         static constexpr double MAX_SPREAD_MULT = 50.0;      // Maximum spread multiplier from action (allows huge spreads for liquidity crunches)
         static constexpr double MIN_SPREAD_MULT = 0.5;       // Minimum spread multiplier (0.5x base = 1.5bps floor)
     };
