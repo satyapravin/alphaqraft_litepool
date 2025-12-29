@@ -3,30 +3,27 @@
 # Inventory Agent for Hierarchical RL Market Making
 # 
 # This agent learns WHAT position to hold (strategic, slow decisions)
-# Based on AMM flow signals, volatility, and market regime
+# Uses shared encoder + attention to focus on relevant signals
 # Reward: Unrealized P&L changes (learns market direction)
 
 import torch
 import torch.nn as nn
 import numpy as np
 from typing import Tuple, Dict, Any, Optional
+from shared_encoder import SharedEncoder, AttentionModule
 
 
 class InventoryAgent(nn.Module):
     """
     Inventory Agent - Strategic position sizing
     
-    Decides target_inventory based on market flow signals.
-    Updates every N steps (e.g., 100 steps = 10 seconds).
+    Decides target_inventory based on market signals using shared encoder + attention.
+    Attention mechanism allows focusing on flow, position, and volatility signals.
     Learns from unrealized P&L (market direction).
     
-    Architecture: Small MLP [64, 32] - runs infrequently
+    Architecture: Shared Encoder + Attention + LSTM + Actor/Critic
     
-    Input observations (12 dims):
-        - AMM signals: net_flow, cumulative_flow (2 stable signals only, removed noisy flow_imbalance and inventory_delta)
-        - Position state: leverage, deviation_from_target, target_ema, entry_distance (4)
-        - Quote spreads: actual_bid_spread, actual_ask_spread, total_spread, mid_change (4)
-        - Trade signals: volume_imbalance, trade_intensity, buy_pressure, sell_pressure (4)
+    Input observations (40 dims): All observations (shared with MM agent)
     
     Output:
         - target_inventory: [-0.1, 0.1] (target leverage)
@@ -35,10 +32,12 @@ class InventoryAgent(nn.Module):
     
     def __init__(
         self,
-        obs_dim: int = 12,
-        hidden_dims: Tuple[int, ...] = (64, 32),
+        obs_dim: int = 40,  # Full observation dimension
+        shared_encoder: Optional[SharedEncoder] = None,
+        hidden_dim: int = 128,
         lstm_hidden: int = 32,
         target_range: float = 0.1,  # Max leverage target
+        attention_heads: int = 4,
     ):
         super().__init__()
         
@@ -46,22 +45,20 @@ class InventoryAgent(nn.Module):
         self.target_range = target_range
         self.lstm_hidden = lstm_hidden
         
-        # Build MLP encoder layers
-        layers = []
-        prev_dim = obs_dim
-        for hidden_dim in hidden_dims:
-            layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.ReLU(),
-            ])
-            prev_dim = hidden_dim
+        # Shared encoder (created externally and passed in)
+        if shared_encoder is None:
+            self.shared_encoder = SharedEncoder(obs_dim, hidden_dim)
+            self.owns_encoder = True
+        else:
+            self.shared_encoder = shared_encoder
+            self.owns_encoder = False
         
-        self.encoder = nn.Sequential(*layers)
+        # Attention mechanism for Inventory agent (focuses on flow, position, volatility)
+        self.attention = AttentionModule(hidden_dim, attention_heads)
         
         # LSTM for temporal patterns (helps reduce flipping by learning sequences)
         self.lstm = nn.LSTM(
-            input_size=prev_dim,  # Last hidden_dim from encoder
+            input_size=hidden_dim,
             hidden_size=lstm_hidden,
             num_layers=1,
             batch_first=True,
@@ -118,7 +115,7 @@ class InventoryAgent(nn.Module):
         Forward pass.
         
         Args:
-            obs: Inventory observations [batch, obs_dim] or [batch, seq_len, obs_dim]
+            obs: Full observations [batch, obs_dim] or [batch, seq_len, obs_dim]
             lstm_hidden: LSTM hidden state (h, c) tuple, or None for initial state
             
         Returns:
@@ -126,32 +123,44 @@ class InventoryAgent(nn.Module):
             value: State value estimate [batch, 1] or [batch, seq_len, 1]
             lstm_hidden: Updated LSTM hidden state (h, c) tuple
         """
-        # Encode observations
-        features = self.encoder(obs)  # [batch, hidden_dim] or [batch, seq_len, hidden_dim]
-        
         # Add sequence dimension if needed (for single timestep)
-        if features.dim() == 2:
-            features = features.unsqueeze(1)  # [batch, 1, hidden_dim]
-            squeeze_output = True
-        else:
-            squeeze_output = False
+        add_seq_dim = obs.dim() == 2
+        if add_seq_dim:
+            obs = obs.unsqueeze(1)  # [batch, 1, obs_dim]
+        
+        # Ensure observations are completely fresh to avoid in-place modification errors
+        # This is critical when the same encoder is used in both rollout and update phases
+        obs = obs.clone()
+        
+        # Shared encoder processes all observations
+        encoded = self.shared_encoder(obs)  # [batch, seq_len, hidden_dim]
+        
+        # Apply attention (allows focusing on relevant signals)
+        # Don't clone here - let attention handle it internally if needed
+        attended = self.attention(encoded)  # [batch, seq_len, hidden_dim]
         
         # LSTM forward pass
         if lstm_hidden is None:
             # Initialize hidden state if not provided
-            batch_size = features.shape[0]
-            lstm_hidden = self._init_hidden(batch_size, features.device)
+            batch_size = attended.shape[0]
+            lstm_hidden = self._init_hidden(batch_size, attended.device)
+        else:
+            # Detach and clone hidden states to prevent in-place modifications by LSTM
+            # This ensures they're completely independent of any computation graph
+            h, c = lstm_hidden
+            lstm_hidden = (h.detach().clone(), c.detach().clone())
         
-        lstm_out, lstm_hidden = self.lstm(features, lstm_hidden)  # [batch, seq_len, lstm_hidden]
+        lstm_out, lstm_hidden = self.lstm(attended, lstm_hidden)  # [batch, seq_len, lstm_hidden]
         
         # Remove sequence dimension if we added it
-        if squeeze_output:
+        if add_seq_dim:
             lstm_out = lstm_out.squeeze(1)  # [batch, lstm_hidden]
         
         # Actor: outputs [target_inventory, risk_aversion]
-        # Use smaller scaling (0.3 instead of 0.5) to prevent saturation and encourage learning from 0
+        # Use very small scaling (0.05) to prevent saturation and encourage learning from 0
         # With small weights (gain=0.01) and bias=0, initial output should be near 0
-        raw_mean = self.actor_mean(lstm_out) * 0.3
+        # This prevents the network from learning extreme actions too quickly
+        raw_mean = self.actor_mean(lstm_out) * 0.05
         raw_mean = torch.tanh(raw_mean)
         
         # target_inventory: [-target_range, target_range]
@@ -243,9 +252,6 @@ class InventoryAgent(nn.Module):
         entropy = dist.entropy().sum(dim=-1, keepdim=True)  # Sum entropy for both outputs
         
         return log_prob, entropy, value
-    
-    @staticmethod
-    def extract_obs(full_obs: np.ndarray) -> np.ndarray:
         """
         Extract inventory-relevant observations from full observation.
         

@@ -54,8 +54,6 @@ void Strategy::reset() {
     this->hit_leverage_limit_ = false;  // Reset leverage limit flag
     this->steps_since_last_fill_ = 0;   // Reset fill tracking
     this->prev_trade_count_ = 0;
-    this->prev_inventory_error_ = 0.0;  // Reset inventory error tracking
-    this->steps_away_from_target_ = 0;  // Reset urgency tracking
     this->last_netAmount_ = 0.0;         // Reset netAmount tracking
     this->last_trades_ = 0;              // Reset trade count tracking
     this->first_call_ = true;             // Reset first call flag
@@ -181,22 +179,24 @@ std::pair<double, double> Strategy::computeQuotePrices(
     // Compute inventory error (difference between current leverage and target)
     // This is what drives the A-S adjustments, not absolute inventory
     double target_leverage = target_inventory_ema;
-    double inventory_error = leverage - target_leverage;
+    double inventory_error = leverage - target_leverage; // Positive = too long, Negative = too short
     
     // Inventory adjustment: positive inventory_error (too long) → widen bid, tighten ask
     //                     negative inventory_error (too short) → tighten bid, widen ask
-    double inventory_adjustment = inventory_error * gamma * variance * TIME_HORIZON_SEC;
+    double inventory_adjustment = inventory_error * gamma * variance / TIME_HORIZON_SEC;
     // Cap adjustment to reasonable range (1% of price max)
     inventory_adjustment = std::clamp(inventory_adjustment, -mid_price * 0.01, mid_price * 0.01);
     
     // Agent controls bid_spread and ask_spread in [0, 1] range
     // These are base spreads, then we apply inventory adjustment for skewing
-    double bid_action = std::clamp(action.bid_spread, 0.0, 1.0) * vol_2min_;
-    double ask_action = std::clamp(action.ask_spread, 0.0, 1.0) * vol_2min_;
+    double bid_action = std::clamp(action.bid_spread, 0.0, 1.0) * vol_2min_ * vol_2min_;
+    double ask_action = std::clamp(action.ask_spread, 0.0, 1.0) * vol_2min_ * vol_2min_;
     
+
     double bid_spread = bid_action + inventory_adjustment;  // Widen bid when positive error
     double ask_spread = ask_action - inventory_adjustment;  // Tighten ask when positive error
     
+
     // Ensure spreads are positive (can't be negative)
     bid_spread = std::max(bid_spread, tick_size);
     ask_spread = std::max(ask_spread, tick_size);

@@ -129,11 +129,6 @@ namespace RLTrader {
         double vol_2min_ = 0.0;               // 2-minute volatility estimate
         static constexpr int VOL_WINDOW_STEPS = 240;  // 2 minutes = 240 steps at 0.5s per step
         
-        // Inventory skew urgency tracking (time-based)
-        double prev_inventory_error_ = 0.0;   // Previous inventory error for tracking persistence
-        int steps_away_from_target_ = 0;      // Steps since we've been away from target (urgency)
-        static constexpr double URGENCY_TIME_THRESHOLD = 0.01;  // Error threshold to consider "away from target"
-        
         // Leverage limit tracking
         bool hit_leverage_limit_ = false;     // True if leverage hit ±1.0 and quoting stopped
         
@@ -147,11 +142,7 @@ namespace RLTrader {
         bool first_call_ = true;               // First call flag (for detecting changes without fills)
         
         // Model parameters
-        static constexpr double TARGET_EMA_ALPHA = 0.0058;   // Target inventory smoothing (120 step half-life = 60 sec)
-        // Alpha = 0.0058 gives half-life of ~120 steps: 0.5 = (1 - alpha)^n → n ≈ 120 
-        static constexpr double VOL_SPREAD_MULT = 50.0;      // How much volatility widens spread
-        static constexpr double INVENTORY_SKEW_MULT = 0.5;  // Conservative skew: max 50% of spread can be adjusted (preserves spread capture)
-        static constexpr double MAX_SPREAD_MULT = 50.0;      // Maximum spread multiplier from action (allows huge spreads for liquidity crunches)
-        static constexpr double MIN_SPREAD_MULT = 0.5;       // Minimum spread multiplier (0.5x base = 1.5bps floor)
+        static constexpr double TARGET_EMA_ALPHA = 0.00058;   // Target inventory smoothing (120 step half-life = 60 sec)
+        // Alpha = 0.0058 gives half-life of ~120 steps: 0.5 = (1 - alpha)^n → n ≈ 120
     };
 }

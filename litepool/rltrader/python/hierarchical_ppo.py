@@ -23,6 +23,7 @@ if str(_project_root) not in sys.path:
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import gc
 from typing import Dict, List, Tuple, Optional
@@ -54,8 +55,6 @@ from datetime import datetime
 import litepool
 from torch.utils.tensorboard import SummaryWriter
 from hierarchical_policy import HierarchicalPolicy, create_hierarchical_policy
-from inventory_agent import INVENTORY_OBS_INDICES
-from mm_agent import MARKET_OBS_DIM
 from metric_logger import MetricLogger
 from hierarchical_config import HierarchicalConfig
 
@@ -222,165 +221,67 @@ class RolloutBuffer:
                 delta = reward_sum + effective_gamma * next_values * next_non_terminal - self.values_inv[t, env_id]
                 # Clip TD error to prevent extreme values
                 delta = np.clip(delta, -clip_delta, clip_delta)
-                gae = delta + effective_gamma * effective_gae_lambda * next_non_terminal * last_gae
-                self.advantages_inv[t, env_id] = gae
-                last_gae = gae
+                last_gae = delta + effective_gamma * effective_gae_lambda * next_non_terminal * last_gae
                 
-                # Propagate advantage to intermediate steps (use same advantage for all steps until next decision)
+                # Assign GAE to this decision timestep
+                self.advantages_inv[t, env_id] = last_gae
+                
+                # Propagate GAE to intermediate steps (if any) with discounting
                 if i < len(decision_timesteps) - 1:
-                    next_t = decision_timesteps[i + 1]
-                    # Use decaying advantage for intermediate steps
-                    for intermediate_t in range(t + 1, next_t):
-                        steps_away = intermediate_t - t
-                        decay_factor = gamma ** steps_away
-                        self.advantages_inv[intermediate_t, env_id] = gae * decay_factor
-                else:
-                    # Last decision: propagate to end
-                    for intermediate_t in range(t + 1, n_steps):
-                        steps_away = intermediate_t - t
-                        decay_factor = gamma ** steps_away
-                        # Also account for episode termination
-                        if self.dones[intermediate_t, env_id]:
-                            break
-                        self.advantages_inv[intermediate_t, env_id] = gae * decay_factor
+                    num_intermediate = next_t - t - 1
+                    if num_intermediate > 0:
+                        discount_factors = np.power(gamma, np.arange(1, num_intermediate + 1))
+                        self.advantages_inv[t+1:next_t, env_id] = last_gae * discount_factors[::-1]
         
         self.returns_inv = self.advantages_inv + self.values_inv
         
-        # Normalize Inventory advantages if enabled
+        # Normalize inventory advantages if enabled
         if normalize_gae:
-            # Only normalize over decision timesteps for inventory agent
-            inv_decision_advantages = []
-            for env_id in range(num_envs):
-                decision_timesteps = np.where(self.inv_decision_mask[:, env_id] > 0.5)[0]
-                if len(decision_timesteps) > 0:
-                    inv_decision_advantages.extend(self.advantages_inv[decision_timesteps, env_id])
-            
-            if len(inv_decision_advantages) > 0:
-                # Compute statistics on decision timesteps only
-                inv_decision_array = np.array(inv_decision_advantages)
-                inv_median = np.median(inv_decision_array)
-                inv_q75 = np.quantile(inv_decision_array, 0.75)
-                inv_q25 = np.quantile(inv_decision_array, 0.25)
-                inv_iqr = inv_q75 - inv_q25
-                
-                if inv_iqr < 1e-8:
-                    # If IQR is too small, just center by median
-                    self.advantages_inv = self.advantages_inv - inv_median
-                else:
-                    # Apply robust normalization to all advantages using decision timestep statistics
-                    # Normalize by IQR (1.349 converts IQR to std for normal dist)
-                    normalized_all = (self.advantages_inv - inv_median) / (inv_iqr / 1.349)
-                    # Soft clip extreme values
-                    self.advantages_inv = np.tanh(normalized_all / 5.0) * 5.0
-
-
-@dataclass
-class EpisodeInfo:
-    """Track info for a completed episode."""
-    env_id: int
-    steps: int
-    mm_reward: float
-    inv_reward: float
-    total_reward: float
-    realized_pnl: float
-    unrealized_pnl: float
-    spread_capture: float  # LIFO round-trip profit
-    fees: float
-    trade_count: int
-    net_amount_btc: float
-
-
+            inv_advantages_flat = self.advantages_inv.flatten()
+            if len(inv_advantages_flat) > 0:
+                inv_advantages_tensor = torch.from_numpy(inv_advantages_flat).float()
+                inv_normalized = robust_normalize(inv_advantages_tensor)
+                self.advantages_inv = inv_normalized.numpy().reshape(self.advantages_inv.shape)
+    
 class HierarchicalPPOTrainer:
-    """Trainer for hierarchical two-agent PPO."""
+    """Hierarchical PPO Trainer for Two-Agent Market Making."""
     
     def __init__(self, config: HierarchicalConfig):
         self.config = config
-        
-        # Create environment
-        self.env = self._create_env()
-        
-        # Create hierarchical policy
-        self.policy = create_hierarchical_policy(
-            inventory_update_freq=config.inventory_update_freq,
-            device=str(device),
-            target_range=config.target_range,
-        )
-        
-        # Separate optimizers for each agent
-        self.optimizer_inv = optim.Adam(
-            self.policy.inventory_agent.parameters(),
-            lr=config.inv_learning_rate,  # Higher LR for noisier reward signal
-        )
-        self.optimizer_mm = optim.Adam(
-            self.policy.mm_agent.parameters(),
-            lr=config.learning_rate,
-        )
-        
-        # Metrics
-        self.logger = MetricLogger(print_interval=1024)
-        self.episode_rewards = deque(maxlen=100)
-        self.episode_mm_rewards = deque(maxlen=100)
-        self.episode_inv_rewards = deque(maxlen=100)
-        self.completed_episodes: List[EpisodeInfo] = []
-        
-        # Rollout buffer
-        obs_dim = 40  # 13 market + 4 AMM + 8 trade + 11 agent state + 1 previous spread + 2 bid/ask distances + 1 mid_change
-        action_dim = 4  # bid_spread, ask_spread, target_inventory, risk_aversion
-        self.buffer = RolloutBuffer.create(
-            config.n_steps, config.num_envs, obs_dim, action_dim
-        )
-        
-        # Tracking
-        self.global_step = 0
-        self.epochs_completed = 0
-        self.best_reward = float('-inf')
-        
-        # Per-env tracking
-        self.episode_steps = np.zeros(config.num_envs, dtype=np.int32)
-        self.episode_mm_total = np.zeros(config.num_envs)
-        self.episode_inv_total = np.zeros(config.num_envs)
-        self.current_obs = None  # Track current observation across epochs
+        self.device = device
         
         # Results directory
         self.results_dir = Path("results/hierarchical")
         self.results_dir.mkdir(parents=True, exist_ok=True)
         
-        # TensorBoard logging
-        run_name = f"hierarchical_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        self.tb_writer = SummaryWriter(log_dir=f"runs/{run_name}")
-        print(f"TensorBoard logging to: runs/{run_name}")
-        print("View with: tensorboard --logdir=runs/")
+        # TensorBoard writer
+        self.tb_writer = SummaryWriter(str(self.results_dir / "runs"))
         
-        # Value normalizers for both agents (helps value function learn with high std)
-        self.value_normalizer_mm = ValueNormalizer(shape=(), clip_range=10.0)
-        self.value_normalizer_inv = ValueNormalizer(shape=(), clip_range=10.0)
-    
-    def _get_entropy_coef_mm(self) -> float:
-        """Get current entropy coefficient for MM agent with annealing."""
-        # Linear annealing: start at initial value, decay to 0.01 over total training
-        initial_coef = self.config.entropy_coef_mm
-        final_coef = 0.01
-        total_steps = self.config.total_epochs * self.config.n_steps * self.config.num_envs
-        progress = min(1.0, self.global_step / (total_steps * 0.5))  # Anneal over first 50% of training
-        return initial_coef * (1.0 - progress) + final_coef * progress
-    
-    def _get_entropy_coef_inv(self) -> float:
-        """Get current entropy coefficient for Inventory agent with annealing."""
-        # Linear annealing: start at initial value, decay to 0.01 over total training
-        initial_coef = self.config.entropy_coef_inv
-        final_coef = 0.01
-        total_steps = self.config.total_epochs * self.config.n_steps * self.config.num_envs
-        progress = min(1.0, self.global_step / (total_steps * 0.5))  # Anneal over first 50% of training
-        return initial_coef * (1.0 - progress) + final_coef * progress
-    
-    def _create_env(self):
-        """Create the litepool environment."""
-        return litepool.make(
+        # Policy
+        self.policy = create_hierarchical_policy(
+            obs_dim=40,
+            inventory_update_freq=config.inventory_update_freq,
+            device=str(device),
+            target_range=config.target_range,
+        )
+        
+        # Define separate optimizers for shared and specific parameters
+        shared_params = set(self.policy.shared_encoder.parameters())
+        inv_specific_params = [p for p in self.policy.inventory_agent.parameters() if p not in shared_params]
+        mm_specific_params = [p for p in self.policy.mm_agent.parameters() if p not in shared_params]
+
+        self.optimizer_shared = optim.Adam(self.policy.shared_encoder.parameters(), lr=config.learning_rate)
+        self.optimizer_inv = optim.Adam(inv_specific_params, lr=config.inv_learning_rate)
+        self.optimizer_mm = optim.Adam(mm_specific_params, lr=config.learning_rate)
+        
+        # Environment
+        self.env = litepool.make(
             "RlTrader-v0",
             env_type="gymnasium",
-            num_envs=self.config.num_envs,
-            batch_size=self.config.num_envs,
-            num_threads=self.config.num_threads,
+            num_envs=config.num_envs,
+            batch_size=config.num_envs,
+            num_threads=config.num_threads,
+            seed=42,
             is_prod=False,
             is_inverse_instr=False,
             api_key="",
@@ -392,80 +293,73 @@ class HierarchicalPPOTrainer:
             maker_fee=-0.000025,
             taker_fee=0.0005,
             foldername="/home/pravin/dev/alphaqraft_litepool/data/training/",
-            balance=self.config.balance,
-            start=360000,
-            max_episode_steps=self.config.max_episode_steps,
-            base_spread_bps=self.config.base_spread_bps,
-            min_size_pct=self.config.min_size_pct,
-            max_size_pct=self.config.max_size_pct,
+            balance=config.balance,
+            start=0,
+            max_episode_steps=config.max_episode_steps,
+            base_spread_bps=config.base_spread_bps,
+            min_size_pct=config.min_size_pct,
+            max_size_pct=config.max_size_pct,
         )
+        self.env.spec.id = "RlTrader-v0"
+        
+        # Buffer
+        self.buffer = RolloutBuffer.create(
+            n_steps=config.n_steps,
+            num_envs=config.num_envs,
+            obs_dim=self.env.observation_space.shape[0],
+            action_dim=self.env.action_space.shape[0],
+        )
+        
+        # Tracking
+        self.global_step = 0
+        self.epochs_completed = 0
+        self.best_reward = float('-inf')
+        self.episode_rewards = []
+        self.completed_episodes = []
+        
+        # Value normalizers
+        self.value_norm_mm = ValueNormalizer((1,))
+        self.value_norm_inv = ValueNormalizer((1,))
     
-    def _extract_info_value(self, env_info: dict, key: str, env_id: int, default=0.0) -> float:
-        """Safely extract a value from env_info for a specific environment."""
-        val = env_info.get(key, default)
-        if isinstance(val, np.ndarray):
-            return float(val[env_id]) if env_id < len(val) else default
-        return float(val) if val is not None else default
-    
-    def collect_rollout(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Collect one rollout of experience."""
-        # DON'T call env.reset() every epoch! Episodes run continuously with auto-reset.
-        # Only reset on first epoch when self.current_obs is None
-        if self.current_obs is None:
-            obs, _ = self.env.reset()
-            self.policy.reset(self.config.num_envs)
-            # Reset accumulators at training start
-            self.episode_steps.fill(0)
-            self.episode_mm_total.fill(0)
-            self.episode_inv_total.fill(0)
-        else:
-            obs = self.current_obs
+    def collect_rollout(self):
+        """Collect rollout data."""
+        # Reset policy state
+        self.policy.reset(self.config.num_envs)
         
-        # Keep completed episodes across epochs (persist episode metrics)
-        # Limit to last 1 episode to keep only the most recent
-        if len(self.completed_episodes) > 1:
-            self.completed_episodes = self.completed_episodes[-1:]
+        # Get initial observations (gymnasium returns (obs, info) tuple)
+        obs, _ = self.env.reset()
+        self.buffer.observations[0] = obs
         
-        # Track episode count at start of epoch to show only new episodes in logging
-        self._episode_count_at_epoch_start = len(self.completed_episodes)
-        
-        # Only clear buffer infos for epoch-level metrics
-        self.buffer.infos = []
+        # Track running statistics
+        episode_infos = [{} for _ in range(self.config.num_envs)]
+        done_mask = np.zeros(self.config.num_envs, dtype=bool)
         
         for step in range(self.config.n_steps):
-            # Get action from hierarchical policy
-            action, info = self.policy.get_action(obs)
+            self.global_step += self.config.num_envs
             
-            # Store experience
-            self.buffer.observations[step] = obs
-            self.buffer.actions[step] = action
-            # Store inventory agent actions: [target_inventory, risk_aversion]
-            targets = info['targets'].squeeze() if info['targets'].ndim > 1 else info['targets']
-            risk_aversion = info.get('risk_aversion', np.ones(self.config.num_envs) * 0.5)
-            if isinstance(risk_aversion, torch.Tensor):
-                risk_aversion = risk_aversion.cpu().numpy()
-            risk_aversion = risk_aversion.squeeze() if hasattr(risk_aversion, 'ndim') and risk_aversion.ndim > 1 else risk_aversion
-            inv_actions = np.column_stack([targets, risk_aversion])
-            self.buffer.inv_actions[step] = inv_actions
-            self.buffer.log_probs_mm[step] = info['log_prob_mm'].squeeze()
-            self.buffer.log_probs_inv[step] = info['log_prob_inv'].squeeze()
-            self.buffer.values_mm[step] = info['value_mm'].squeeze()
-            self.buffer.values_inv[step] = info['value_inv'].squeeze()
-            # Track which timesteps had inventory decisions
-            self.buffer.inv_decision_mask[step] = info['updated_inventory'].astype(np.float32)
+            # Get actions
+            with torch.no_grad():
+                action, info = self.policy.get_action(obs)
             
             # Step environment
-            next_obs, reward, terminated, truncated, env_info = self.env.step(action)
-            done = terminated | truncated
+            next_obs, _, done, truncated, env_info = self.env.step(action)
             
-            # Store info for logging
-            self.buffer.infos.append(env_info)
+            # Store data
+            self.buffer.actions[step] = action
+            self.buffer.inv_actions[step] = info['targets']  # target_inventory, risk_aversion
+            self.buffer.log_probs_mm[step] = info['log_prob_mm'].squeeze(-1)
+            self.buffer.log_probs_inv[step] = info['log_prob_inv'].squeeze(-1)
+            self.buffer.values_mm[step] = info['value_mm'].squeeze(-1)
+            self.buffer.values_inv[step] = info['value_inv'].squeeze(-1)
+            self.buffer.inv_decision_mask[step] = info['updated_inventory'].astype(np.float32)
+            self.buffer.dones[step] = (done | truncated).astype(np.float32)
             
-            # Extract separate rewards from env_info
+            # Extract rewards from env_info
+            # Environment provides separate rewards in info dict (vectorized: each key maps to array of shape (num_envs,))
             mm_reward = env_info.get('mm_reward', np.zeros(self.config.num_envs))
             inv_reward = env_info.get('inv_reward', np.zeros(self.config.num_envs))
             
-            # Handle numpy array extraction
+            # Handle numpy array extraction (ensure it's 1D array)
             if isinstance(mm_reward, np.ndarray):
                 mm_reward = mm_reward.flatten()
             else:
@@ -475,446 +369,397 @@ class HierarchicalPPOTrainer:
             else:
                 inv_reward = np.array([inv_reward] * self.config.num_envs)
             
+            # Store rewards
             self.buffer.mm_rewards[step] = mm_reward
             self.buffer.inv_rewards[step] = inv_reward
-            self.buffer.dones[step] = done
             
-            # Accumulate this step's reward FIRST (before handling episode ends)
-            # IMPORTANT: Rewards on done=True are from the ENDING episode, not the new one!
-            # The C++ env calculates rewards BEFORE reset, so they belong to the current episode.
-            self.episode_mm_total += mm_reward
-            self.episode_inv_total += inv_reward
-            self.episode_steps += 1
+            # Extract other info values (vectorized)
+            def _ensure_array(val, default=0.0):
+                """Ensure value is a 1D numpy array of shape (num_envs,)."""
+                if isinstance(val, np.ndarray):
+                    return val.flatten()
+                else:
+                    return np.array([val] * self.config.num_envs)
             
-            # Handle episode ends AFTER accumulating rewards
+            realized_pnl = _ensure_array(env_info.get('realized_pnl', 0.0))
+            unrealized_pnl = _ensure_array(env_info.get('unrealized_pnl', 0.0))
+            spread_capture = _ensure_array(env_info.get('spread_capture', 0.0))
+            fees = _ensure_array(env_info.get('fees', 0.0))
+            trade_count = _ensure_array(env_info.get('trade_count', 0))
+            net_amount_btc = _ensure_array(env_info.get('net_amount_btc', 0.0))
+            
+            # Accumulate episode info for each environment
             for env_id in range(self.config.num_envs):
-                if done[env_id]:
-                    # Extract terminal info from final_* fields
-                    episode_info = EpisodeInfo(
-                        env_id=env_id,
-                        steps=int(self.episode_steps[env_id]),
-                        mm_reward=float(self.episode_mm_total[env_id]),
-                        inv_reward=float(self.episode_inv_total[env_id]),
-                        total_reward=float(self.episode_mm_total[env_id] + self.episode_inv_total[env_id]),
-                        realized_pnl=self._extract_info_value(env_info, 'final_realized_pnl', env_id),
-                        unrealized_pnl=self._extract_info_value(env_info, 'final_unrealized_pnl', env_id),
-                        spread_capture=self._extract_info_value(env_info, 'final_spread_capture', env_id),
-                        fees=self._extract_info_value(env_info, 'final_fees', env_id),
-                        trade_count=int(self._extract_info_value(env_info, 'final_trade_count', env_id)),
-                        net_amount_btc=self._extract_info_value(env_info, 'final_net_amount_btc', env_id),
-                    )
-                    self.completed_episodes.append(episode_info)
-                    
-                    # Add to running averages
-                    self.episode_mm_rewards.append(episode_info.mm_reward)
-                    self.episode_inv_rewards.append(episode_info.inv_reward)
-                    self.episode_rewards.append(episode_info.total_reward)
-                    
-                    # Reset per-env tracking for the NEW episode
-                    self.episode_steps[env_id] = 0
-                    self.episode_mm_total[env_id] = 0
-                    self.episode_inv_total[env_id] = 0
-                    self.policy.reset_env(env_id)
+                episode_infos[env_id]['mm_reward'] = episode_infos[env_id].get('mm_reward', 0.0) + mm_reward[env_id]
+                episode_infos[env_id]['inv_reward'] = episode_infos[env_id].get('inv_reward', 0.0) + inv_reward[env_id]
+                episode_infos[env_id]['realized_pnl'] = episode_infos[env_id].get('realized_pnl', 0.0) + realized_pnl[env_id]
+                episode_infos[env_id]['unrealized_pnl'] = unrealized_pnl[env_id]
+                episode_infos[env_id]['spread_capture'] = episode_infos[env_id].get('spread_capture', 0.0) + spread_capture[env_id]
+                episode_infos[env_id]['fees'] = episode_infos[env_id].get('fees', 0.0) + fees[env_id]
+                episode_infos[env_id]['trade_count'] = episode_infos[env_id].get('trade_count', 0) + int(trade_count[env_id])
+                episode_infos[env_id]['net_amount_btc'] = net_amount_btc[env_id]
             
+            # Handle done environments
+            new_done = (done | truncated) & ~done_mask
+            for env_id in np.where(new_done)[0]:
+                self.completed_episodes.append(episode_infos[env_id])
+                self.episode_rewards.append(
+                    episode_infos[env_id]['mm_reward'] + episode_infos[env_id]['inv_reward']
+                )
+                # Reset episode info for this env
+                episode_infos[env_id] = {}
+                # Reset policy state for this env
+                self.policy.reset_env(env_id)
+            
+            done_mask = (done | truncated)
+            
+            # Store next obs
             obs = next_obs
-            self.global_step += self.config.num_envs
+            if step < self.config.n_steps - 1:
+                self.buffer.observations[step + 1] = obs
+            
+            # Store info for logging
+            self.buffer.infos.append(env_info)
         
-        # Store current observation for next epoch
-        self.current_obs = obs
-        
-        # Get last values for GAE
+        # Compute advantages
         with torch.no_grad():
-            obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device)
-            _, log_probs, values, _ = self.policy.forward(obs_tensor)
-            last_values_mm = values['mm'].cpu().numpy().squeeze()
-            last_values_inv = values['inventory'].cpu().numpy().squeeze()
+            last_obs_tensor = torch.from_numpy(obs).float().to(self.device)
+            _, _, last_values, _ = self.policy.forward(last_obs_tensor)
+            last_values_mm = last_values['mm'].cpu().numpy().squeeze(-1)
+            last_values_inv = last_values['inventory'].cpu().numpy().squeeze(-1)
         
-        # Compute GAE
         self.buffer.compute_gae(
-            last_values_mm, last_values_inv,
-            self.config.gamma, self.config.gae_lambda,
+            last_values_mm=last_values_mm,
+            last_values_inv=last_values_inv,
+            gamma=self.config.gamma,
+            gae_lambda=self.config.gae_lambda,
             inventory_update_freq=self.config.inventory_update_freq,
             clip_delta=self.config.gae_clip_delta,
-            normalize_gae=self.config.normalize_gae)
-        
-        return last_values_mm, last_values_inv
+            normalize_gae=self.config.normalize_gae,
+        )
     
     def update(self) -> Dict[str, float]:
-        """Update both agents using PPO."""
-        # Flatten buffer
-        n_samples = self.config.n_steps * self.config.num_envs
+        """Update policy using PPO."""
+        # Flatten buffer for easier batching
+        flat_obs = self.buffer.observations.reshape((-1, self.buffer.observations.shape[-1]))
+        flat_actions = self.buffer.actions.reshape((-1, self.buffer.actions.shape[-1]))
+        flat_inv_actions = self.buffer.inv_actions.reshape((-1, self.buffer.inv_actions.shape[-1]))
+        flat_log_probs_mm = self.buffer.log_probs_mm.flatten()
+        flat_log_probs_inv = self.buffer.log_probs_inv.flatten()
+        flat_values_mm = self.buffer.values_mm.flatten()
+        flat_values_inv = self.buffer.values_inv.flatten()
+        flat_advantages_mm = self.buffer.advantages_mm.flatten()
+        flat_advantages_inv = self.buffer.advantages_inv.flatten()
+        flat_returns_mm = self.buffer.returns_mm.flatten()
+        flat_returns_inv = self.buffer.returns_inv.flatten()
+        flat_inv_mask = self.buffer.inv_decision_mask.flatten()
         
-        obs_flat = self.buffer.observations.reshape(n_samples, -1)
-        actions_flat = self.buffer.actions.reshape(n_samples, -1)
-        inv_actions_flat = self.buffer.inv_actions.reshape(n_samples, -1)
+        total_steps = flat_obs.shape[0]
         
-        old_log_probs_mm = self.buffer.log_probs_mm.reshape(n_samples)
-        old_log_probs_inv = self.buffer.log_probs_inv.reshape(n_samples)
+        losses = {
+            'policy_loss_mm': 0.0,
+            'value_loss_mm': 0.0,
+            'entropy_mm': 0.0,
+            'policy_loss_inv': 0.0,
+            'value_loss_inv': 0.0,
+            'entropy_inv': 0.0,
+            'grad_norm_mm': 0.0,
+            'grad_norm_inv': 0.0,
+            'advantage_mm_mean': np.mean(flat_advantages_mm),
+            'advantage_mm_std': np.std(flat_advantages_mm),
+            'advantage_mm_max': np.max(flat_advantages_mm),
+            'advantage_inv_mean': np.mean(flat_advantages_inv[flat_inv_mask > 0.5]),
+            'advantage_inv_std': np.std(flat_advantages_inv[flat_inv_mask > 0.5]),
+            'advantage_inv_max': np.max(flat_advantages_inv[flat_inv_mask > 0.5]),
+        }
         
-        advantages_mm = self.buffer.advantages_mm.reshape(n_samples)
-        advantages_inv = self.buffer.advantages_inv.reshape(n_samples)
-        returns_mm = self.buffer.returns_mm.reshape(n_samples)
-        returns_inv = self.buffer.returns_inv.reshape(n_samples)
+        num_updates = 0
         
-        # Decision mask for inventory agent: only train on timesteps where decisions were made
-        inv_decision_mask = self.buffer.inv_decision_mask.reshape(n_samples)
-        
-        # Advantages are already normalized in compute_gae() if normalize_gae=True
-        
-        # Convert to tensors
-        obs_t = torch.as_tensor(obs_flat, dtype=torch.float32, device=device)
-        # MM actions: [bid_spread, ask_spread] = indices [0, 1]
-        mm_actions = actions_flat[:, 0:2]
-        actions_t = torch.as_tensor(mm_actions, dtype=torch.float32, device=device)
-        inv_actions_t = torch.as_tensor(inv_actions_flat, dtype=torch.float32, device=device)
-        old_log_probs_mm_t = torch.as_tensor(old_log_probs_mm, dtype=torch.float32, device=device)
-        old_log_probs_inv_t = torch.as_tensor(old_log_probs_inv, dtype=torch.float32, device=device)
-        advantages_mm_t = torch.as_tensor(advantages_mm, dtype=torch.float32, device=device)
-        advantages_inv_t = torch.as_tensor(advantages_inv, dtype=torch.float32, device=device)
-        returns_mm_t = torch.as_tensor(returns_mm, dtype=torch.float32, device=device)
-        returns_inv_t = torch.as_tensor(returns_inv, dtype=torch.float32, device=device)
-        inv_decision_mask_t = torch.as_tensor(inv_decision_mask, dtype=torch.float32, device=device)
-        
-        # Update value normalizers with full batch returns (before minibatching)
-        self.value_normalizer_mm.update(returns_mm_t)
-        self.value_normalizer_inv.update(returns_inv_t)
-        
-        losses = {'policy_loss_mm': 0, 'value_loss_mm': 0, 'entropy_mm': 0,
-                  'policy_loss_inv': 0, 'value_loss_inv': 0, 'entropy_inv': 0,
-                  'advantage_mm_mean': 0, 'advantage_mm_std': 0, 'advantage_mm_max': 0,
-                  'advantage_inv_mean': 0, 'advantage_inv_std': 0, 'advantage_inv_max': 0,
-                  'grad_norm_mm': 0, 'grad_norm_inv': 0}
-        n_updates = 0
-        
-        # Track advantage statistics (before normalization)
-        advantages_mm_raw = advantages_mm.copy()
-        advantages_inv_raw = advantages_inv.copy()
-        losses['advantage_mm_mean'] = float(np.mean(advantages_mm_raw))
-        losses['advantage_mm_std'] = float(np.std(advantages_mm_raw))
-        losses['advantage_mm_max'] = float(np.max(np.abs(advantages_mm_raw)))
-        losses['advantage_inv_mean'] = float(np.mean(advantages_inv_raw))
-        losses['advantage_inv_std'] = float(np.std(advantages_inv_raw))
-        losses['advantage_inv_max'] = float(np.max(np.abs(advantages_inv_raw)))
-        
-        for _ in range(self.config.update_epochs):
-            # Random permutation for minibatches
-            indices = np.random.permutation(n_samples)
+        for epoch in range(self.config.update_epochs):
+            indices = torch.randperm(total_steps, device=self.device)
             
-            for start in range(0, n_samples, self.config.minibatch_size):
+            for start in range(0, total_steps, self.config.minibatch_size):
                 end = start + self.config.minibatch_size
-                batch_indices = indices[start:end]
+                mb_indices = indices[start:end]
                 
-                # Get batch data
-                obs_batch = obs_t[batch_indices]
-                actions_batch = actions_t[batch_indices]
-                inv_actions_batch = inv_actions_t[batch_indices]
-                old_log_probs_mm_batch = old_log_probs_mm_t[batch_indices]
-                old_log_probs_inv_batch = old_log_probs_inv_t[batch_indices]
-                advantages_mm_batch = advantages_mm_t[batch_indices]
-                advantages_inv_batch = advantages_inv_t[batch_indices]
-                returns_mm_batch = returns_mm_t[batch_indices]
-                returns_inv_batch = returns_inv_t[batch_indices]
-                inv_decision_mask_batch = inv_decision_mask_t[batch_indices]
+                # Minibatch tensors
+                obs_tensor = torch.from_numpy(flat_obs[mb_indices.cpu().numpy()]).float().to(self.device)
+                # MM agent only needs first 2 actions (bid_spread, ask_spread)
+                mm_actions_tensor = torch.from_numpy(flat_actions[mb_indices.cpu().numpy()][:, 0:2]).float().to(self.device)
+                inv_actions_tensor = torch.from_numpy(flat_inv_actions[mb_indices.cpu().numpy()]).float().to(self.device)
+                old_log_probs_mm = torch.from_numpy(flat_log_probs_mm[mb_indices.cpu().numpy()]).float().to(self.device)
+                old_log_probs_inv = torch.from_numpy(flat_log_probs_inv[mb_indices.cpu().numpy()]).float().to(self.device)
+                advantages_mm = torch.from_numpy(flat_advantages_mm[mb_indices.cpu().numpy()]).float().to(self.device)
+                advantages_inv = torch.from_numpy(flat_advantages_inv[mb_indices.cpu().numpy()]).float().to(self.device)
+                returns_mm = torch.from_numpy(flat_returns_mm[mb_indices.cpu().numpy()]).float().to(self.device)
+                returns_inv = torch.from_numpy(flat_returns_inv[mb_indices.cpu().numpy()]).float().to(self.device)
+                inv_update_mask = torch.from_numpy(flat_inv_mask[mb_indices.cpu().numpy()]).float().to(self.device)
                 
                 # Evaluate actions
                 eval_results = self.policy.evaluate_actions(
-                    obs_batch, actions_batch, inv_actions_batch
+                    obs_tensor,
+                    mm_actions_tensor,
+                    inv_actions_tensor,
                 )
                 
-                # === Update MM Agent ===
-                log_prob_mm, entropy_mm, value_mm = eval_results['mm']
-                log_prob_mm = log_prob_mm.squeeze()
-                entropy_mm = entropy_mm.mean()
-                value_mm = value_mm.squeeze()
+                # Extract
+                mm_log_prob, mm_entropy, mm_value = eval_results['mm']
+                inv_log_prob, inv_entropy, inv_value = eval_results['inventory']
                 
-                # PPO clipped objective
-                ratio_mm = torch.exp(log_prob_mm - old_log_probs_mm_batch)
-                surr1_mm = ratio_mm * advantages_mm_batch
-                surr2_mm = torch.clamp(ratio_mm, 1 - self.config.clip_range, 
-                                       1 + self.config.clip_range) * advantages_mm_batch
-                policy_loss_mm = -torch.min(surr1_mm, surr2_mm).mean()
-                
-                # Value loss with normalization, clipping and L2 regularization
-                # Normalize returns to help value function learn with high std
-                returns_mm_normalized = self.value_normalizer_mm.normalize(returns_mm_batch)
-                value_mm_normalized = self.value_normalizer_mm.normalize(value_mm)
-                value_loss_mm = nn.functional.mse_loss(value_mm_normalized, returns_mm_normalized)
-                value_loss_mm = torch.clamp(value_loss_mm, max=self.config.value_loss_clip)
-                
-                # L2 regularization on value function parameters
-                value_l2_reg_mm = 0.0
-                for param in self.policy.mm_agent.critic.parameters():
-                    value_l2_reg_mm += torch.sum(param ** 2)
-                value_l2_reg_mm = self.config.value_l2_reg * value_l2_reg_mm
-                
-                # Get current entropy coefficient (with annealing)
-                current_entropy_coef_mm = self._get_entropy_coef_mm()
+                # Inventory agent update (only if there are decisions)
+                loss_inv = None
+                if inv_update_mask.sum() > 0:
+                    # Policy loss (masked)
+                    ratio_inv = torch.exp(inv_log_prob - old_log_probs_inv.unsqueeze(-1))
+                    surrogate1_inv = ratio_inv * advantages_inv.unsqueeze(-1)
+                    surrogate2_inv = torch.clamp(ratio_inv, 1.0 - self.config.clip_range, 1.0 + self.config.clip_range) * advantages_inv.unsqueeze(-1)
+                    policy_loss_inv = -torch.min(surrogate1_inv, surrogate2_inv).mean()
                     
-                loss_mm = (policy_loss_mm 
-                          + self.config.value_coef * value_loss_mm 
-                          + value_l2_reg_mm
-                          - current_entropy_coef_mm * entropy_mm)
+                    # Value loss (clipped and masked)
+                    value_loss_inv = F.mse_loss(inv_value, returns_inv.unsqueeze(-1), reduction='none')
+                    value_loss_inv = (value_loss_inv * inv_update_mask.unsqueeze(-1)).mean()
+                    
+                    # Entropy
+                    entropy_inv = inv_entropy.mean()
+                    
+                    # Regularization
+                    value_l2_reg_inv = torch.mean(inv_value ** 2)
+                    log_std_l2_reg_inv = torch.mean(self.policy.inventory_agent.actor_log_std ** 2)
+                    
+                    loss_inv = (
+                        policy_loss_inv +
+                        self.config.value_coef * value_loss_inv -
+                        self.config.entropy_coef_inv * entropy_inv +
+                        self.config.value_l2_reg * value_l2_reg_inv +
+                        self.config.log_std_l2_reg * log_std_l2_reg_inv
+                    )
                 
-                self.optimizer_mm.zero_grad()
+                # MM agent
+                ratio_mm = torch.exp(mm_log_prob - old_log_probs_mm.unsqueeze(-1))
+                surrogate1_mm = ratio_mm * advantages_mm.unsqueeze(-1)
+                surrogate2_mm = torch.clamp(ratio_mm, 1.0 - self.config.clip_range, 1.0 + self.config.clip_range) * advantages_mm.unsqueeze(-1)
+                policy_loss_mm = -torch.min(surrogate1_mm, surrogate2_mm).mean()
+                
+                # Value loss (clipped)
+                value_loss_mm = F.mse_loss(mm_value, returns_mm.unsqueeze(-1))
+                
+                # Entropy
+                entropy_mm = mm_entropy.mean()
+                
+                # Regularization
+                value_l2_reg_mm = torch.mean(mm_value ** 2)
+                # MM agent uses Beta distribution with spread_concentration, not log_std
+                # Light regularization on concentration parameters to prevent extreme values
+                concentration_l2_reg_mm = torch.sum(
+                    (self.policy.mm_agent.spread_concentration.weight ** 2).sum(dim=1)
+                )
+                concentration_l2_reg_mm = 1e-4 * concentration_l2_reg_mm  # Light regularization
+                
+                loss_mm = (
+                    policy_loss_mm +
+                    self.config.value_coef * value_loss_mm -
+                    self.config.entropy_coef_mm * entropy_mm +
+                    self.config.value_l2_reg * value_l2_reg_mm +
+                    concentration_l2_reg_mm
+                )
+                
+                # Backprop BOTH losses FIRST (grads accumulate on shared params)
+                if loss_inv is not None:
+                    loss_inv.backward()
                 loss_mm.backward()
                 
-                # Clip value function gradients separately (max_norm=0.5)
-                value_grad_norm_mm = nn.utils.clip_grad_norm_(self.policy.mm_agent.critic.parameters(), 
-                                                               max_norm=0.5)
-                # Clip policy and shared network gradients
-                policy_params = list(self.policy.mm_agent.spread_mean.parameters()) + \
-                               list(self.policy.mm_agent.encoder.parameters()) + \
-                               list(self.policy.mm_agent.lstm.parameters())
-                policy_grad_norm_mm = nn.utils.clip_grad_norm_(policy_params, 
-                                                                self.config.max_grad_norm)
+                # Clip grads
+                grad_norm_inv = nn.utils.clip_grad_norm_(self.policy.inventory_agent.parameters(), self.config.max_grad_norm)
+                grad_norm_mm = nn.utils.clip_grad_norm_(self.policy.mm_agent.parameters(), self.config.max_grad_norm)
                 
-                grad_norm_mm = max(value_grad_norm_mm.item(), policy_grad_norm_mm.item())
-                self.optimizer_mm.step()
-                
-                # Track gradient norm
-                losses['grad_norm_mm'] += grad_norm_mm
-                
-                # === Update Inventory Agent ===
-                # Only update on timesteps where decisions were actually made
-                log_prob_inv, entropy_inv, value_inv = eval_results['inventory']
-                log_prob_inv = log_prob_inv.squeeze()
-                entropy_inv = entropy_inv.mean()
-                value_inv = value_inv.squeeze()
-                
-                # Mask: only compute loss for decision timesteps
-                decision_mask = inv_decision_mask_batch > 0.5
-                n_decisions = decision_mask.sum().item()
-                
-                if n_decisions > 0:
-                    # Compute losses only on decision timesteps
-                    ratio_inv = torch.exp(log_prob_inv - old_log_probs_inv_batch)
-                    surr1_inv = ratio_inv * advantages_inv_batch
-                    surr2_inv = torch.clamp(ratio_inv, 1 - self.config.clip_range,
-                                            1 + self.config.clip_range) * advantages_inv_batch
-                    policy_loss_inv = -torch.min(surr1_inv[decision_mask], surr2_inv[decision_mask]).mean()
-                    
-                    # Value loss with normalization, clipping and L2 regularization (only on decision timesteps)
-                    # Normalize returns to help value function learn with high std
-                    returns_inv_normalized = self.value_normalizer_inv.normalize(returns_inv_batch[decision_mask])
-                    value_inv_normalized = self.value_normalizer_inv.normalize(value_inv[decision_mask])
-                    value_loss_inv = nn.functional.mse_loss(value_inv_normalized, returns_inv_normalized)
-                    value_loss_inv = torch.clamp(value_loss_inv, max=self.config.value_loss_clip)
-                    
-                    # L2 regularization on value function parameters
-                    value_l2_reg_inv = 0.0
-                    for param in self.policy.inventory_agent.critic.parameters():
-                        value_l2_reg_inv += torch.sum(param ** 2)
-                    value_l2_reg_inv = self.config.value_l2_reg * value_l2_reg_inv
-                    
-                    # Get current entropy coefficient (with annealing)
-                    current_entropy_coef_inv = self._get_entropy_coef_inv()
-                    
-                    loss_inv = (policy_loss_inv
-                               + self.config.value_coef * value_loss_inv
-                               + value_l2_reg_inv
-                               - current_entropy_coef_inv * entropy_inv)
-                    
-                    self.optimizer_inv.zero_grad()
-                    loss_inv.backward()
-                    
-                    # Clip value function gradients separately (max_norm=0.5)
-                    value_grad_norm_inv = nn.utils.clip_grad_norm_(self.policy.inventory_agent.critic.parameters(), 
-                                                                   max_norm=0.5)
-                    # Clip policy and shared network gradients
-                    policy_params_inv = list(self.policy.inventory_agent.actor_mean.parameters()) + \
-                                       list(self.policy.inventory_agent.encoder.parameters())
-                    policy_grad_norm_inv = nn.utils.clip_grad_norm_(policy_params_inv, 
-                                                                    self.config.max_grad_norm)
-                    
-                    grad_norm_inv = max(value_grad_norm_inv.item(), policy_grad_norm_inv.item())
+                # Step ALL optimizers
+                if loss_inv is not None:
                     self.optimizer_inv.step()
-                else:
-                    # No decisions in this batch, skip update
-                    policy_loss_inv = torch.tensor(0.0, device=device, requires_grad=False)
-                    value_loss_inv = torch.tensor(0.0, device=device, requires_grad=False)
-                    loss_inv = torch.tensor(0.0, device=device, requires_grad=False)
-                    grad_norm_inv = 0.0
+                self.optimizer_mm.step()
+                self.optimizer_shared.step()
                 
-                # Track gradient norm
-                losses['grad_norm_inv'] += grad_norm_inv
+                # Zero ALL
+                self.optimizer_inv.zero_grad()
+                self.optimizer_mm.zero_grad()
+                self.optimizer_shared.zero_grad()
                 
-                # Track losses
+                # Accumulate losses
                 losses['policy_loss_mm'] += policy_loss_mm.item()
                 losses['value_loss_mm'] += value_loss_mm.item()
                 losses['entropy_mm'] += entropy_mm.item()
-                losses['policy_loss_inv'] += policy_loss_inv.item()
-                losses['value_loss_inv'] += value_loss_inv.item()
-                losses['entropy_inv'] += entropy_inv.item()
-                n_updates += 1
+                losses['grad_norm_mm'] += grad_norm_mm.item()
+                
+                if loss_inv is not None:
+                    losses['policy_loss_inv'] += policy_loss_inv.item()
+                    losses['value_loss_inv'] += value_loss_inv.item()
+                    losses['entropy_inv'] += entropy_inv.item()
+                    losses['grad_norm_inv'] += grad_norm_inv.item()
+                
+                num_updates += 1
         
-        # Average losses (except advantage stats which are already computed once)
-        if n_updates > 0:
-            for key in losses:
-                if key not in ['advantage_mm_mean', 'advantage_mm_std', 'advantage_mm_max',
-                              'advantage_inv_mean', 'advantage_inv_std', 'advantage_inv_max']:
-                    losses[key] /= n_updates
+        # Average losses
+        for key in losses:
+            if 'advantage' not in key:
+                losses[key] /= max(num_updates, 1)
         
         return losses
     
     def _log_epoch(self, epoch: int, losses: Dict[str, float]):
         """Log epoch statistics."""
-        # Always compute epoch-level stats from the buffer (this epoch's data)
-        # Sum rewards across all steps and envs for this epoch
-        avg_mm_reward = self.buffer.mm_rewards.sum() / self.config.num_envs
-        avg_inv_reward = self.buffer.inv_rewards.sum() / self.config.num_envs
-        
-        # Get P&L from last info in buffer (end of epoch snapshot - RUNNING TOTALS, not episode totals)
-        # NOTE: These are running totals from the current episode, not final episode values
-        # For final episode values, see completed_episodes which use final_* keys
-        avg_realized_pnl = 0.0
-        avg_unrealized_pnl = 0.0
-        total_trades = 0
-        if self.buffer.infos and len(self.buffer.infos) > 0:
-            last_info = self.buffer.infos[-1]
-            if 'realized_pnl' in last_info:
-                val = last_info['realized_pnl']
-                avg_realized_pnl = float(val.mean()) if isinstance(val, np.ndarray) else float(val)
-            if 'lifo_unrealized_pnl' in last_info:
-                val = last_info['lifo_unrealized_pnl']
-                avg_unrealized_pnl = float(val.mean()) if isinstance(val, np.ndarray) else float(val)
-            if 'trade_count' in last_info:
-                val = last_info['trade_count']
-                total_trades = int(val.sum()) if isinstance(val, np.ndarray) else int(val)
-        
-        # Compute action statistics (4-action space: bid_spread, ask_spread, target_inventory, risk_aversion)
-        actions = self.buffer.actions.reshape(-1, 4)
-        avg_bid_spread = actions[:, 0].mean()
-        avg_ask_spread = actions[:, 1].mean()
-        avg_target = actions[:, 2].mean()
-        
-        # Buy/sell breakdown from last info
-        buy_trades = 0
-        sell_trades = 0
-        if self.buffer.infos and len(self.buffer.infos) > 0:
-            last_info = self.buffer.infos[-1]
-            if 'buy_trades' in last_info:
-                buy_val = last_info['buy_trades']
-                if isinstance(buy_val, np.ndarray):
-                    buy_trades = int(buy_val.sum())
-                else:
-                    buy_trades = int(buy_val)
-            if 'sell_trades' in last_info:
-                sell_val = last_info['sell_trades']
-                if isinstance(sell_val, np.ndarray):
-                    sell_trades = int(sell_val.sum())
-                else:
-                    sell_trades = int(sell_val)
-        
-        # Get action standard deviations from policies
-        mm_spread_std = torch.exp(self.policy.mm_agent.spread_log_std).mean().item()
-        inv_std = torch.exp(self.policy.inventory_agent.actor_log_std).mean().item()
-        
-        # Print epoch summary with full learning diagnostics
-        # NOTE: R.PnL and U.PnL are RUNNING TOTALS (current episode state), not final episode values
-        print(f"Epoch {epoch:5d} | "
-              f"Step {self.global_step:8d} | "
-              f"MM.Rew {avg_mm_reward:8.2f} | "
-              f"Inv.Rew {avg_inv_reward:8.2f} | "
-              f"R.PnL ${avg_realized_pnl:7.2f} (running) | "
-              f"U.PnL ${avg_unrealized_pnl:7.2f} (running) | "
-              f"Trades {total_trades:4d} (B:{buy_trades}/S:{sell_trades})")
-        print(f"         Loss: PL_mm {losses['policy_loss_mm']:.4f} VL_mm {losses['value_loss_mm']:.4f} | "
-              f"PL_inv {losses['policy_loss_inv']:.4f} VL_inv {losses['value_loss_inv']:.4f} | "
-              f"Ent {losses['entropy_mm']:.3f}/{losses['entropy_inv']:.3f} | "
-              f"Std {mm_spread_std:.3f}/{inv_std:.3f}")
-        print(f"         Adv: MM μ={losses['advantage_mm_mean']:.4f} σ={losses['advantage_mm_std']:.4f} max={losses['advantage_mm_max']:.4f} | "
-              f"Inv μ={losses['advantage_inv_mean']:.4f} σ={losses['advantage_inv_std']:.4f} max={losses['advantage_inv_max']:.4f}")
-        print(f"         Grad: MM={losses['grad_norm_mm']:.4f} Inv={losses['grad_norm_inv']:.4f}")
-        
-        # Print completed episodes (only show episodes from this epoch to avoid spam)
-        episodes_this_epoch = self.completed_episodes[self._episode_count_at_epoch_start:]
-        if episodes_this_epoch:
-            print(f"\n  Completed {len(episodes_this_epoch)} episode(s) this epoch (total: {len(self.completed_episodes)}):")
-            for ep in episodes_this_epoch:
-                net_pnl = ep.realized_pnl + ep.unrealized_pnl + ep.fees
-                # Note: R.PnL includes fees (balance change), so net_pnl double-counts fees
-                # True Net = R.PnL + U.PnL (fees already in R.PnL)
-                # NOTE: These are FINAL episode values (from final_* keys), not running totals
-                true_net = ep.realized_pnl + ep.unrealized_pnl
-                print(f"  [Episode FINAL] Env {ep.env_id} | "
-                      f"Steps {ep.steps:5d} | "
-                      f"MM.Rew {ep.mm_reward:7.2f} | "
-                      f"Inv.Rew {ep.inv_reward:7.2f} | "
-                      f"R.PnL ${ep.realized_pnl:7.2f} (final) | "
-                      f"SprdCap ${ep.spread_capture:6.2f} (final) | "
-                      f"U.PnL ${ep.unrealized_pnl:7.2f} (final) | "
-                      f"Net ${true_net:7.2f} (final) | "
-                      f"Trades {ep.trade_count:4d} (final) | "
-                      f"Pos {ep.net_amount_btc:+.5f} BTC (final)")
-            print()
-        
-        # === TensorBoard Logging ===
-        step = self.global_step
-        
-        # Rewards
-        self.tb_writer.add_scalar('Reward/MM_Agent', avg_mm_reward, step)
-        self.tb_writer.add_scalar('Reward/Inventory_Agent', avg_inv_reward, step)
-        self.tb_writer.add_scalar('Reward/Total', avg_mm_reward + avg_inv_reward, step)
-        
-        # Advantage statistics
-        self.tb_writer.add_scalar('Advantage/MM_Mean', losses['advantage_mm_mean'], step)
-        self.tb_writer.add_scalar('Advantage/MM_Std', losses['advantage_mm_std'], step)
-        self.tb_writer.add_scalar('Advantage/MM_Max', losses['advantage_mm_max'], step)
-        self.tb_writer.add_scalar('Advantage/Inv_Mean', losses['advantage_inv_mean'], step)
-        self.tb_writer.add_scalar('Advantage/Inv_Std', losses['advantage_inv_std'], step)
-        self.tb_writer.add_scalar('Advantage/Inv_Max', losses['advantage_inv_max'], step)
-        
-        # Gradient norms
-        self.tb_writer.add_scalar('Gradient/MM_Norm', losses['grad_norm_mm'], step)
-        self.tb_writer.add_scalar('Gradient/Inv_Norm', losses['grad_norm_inv'], step)
-        
-        # P&L Metrics
-        self.tb_writer.add_scalar('PnL/Realized', avg_realized_pnl, step)
-        self.tb_writer.add_scalar('PnL/Unrealized', avg_unrealized_pnl, step)
-        
-        # Losses - MM Agent
-        self.tb_writer.add_scalar('Loss/MM_Policy', losses['policy_loss_mm'], step)
-        self.tb_writer.add_scalar('Loss/MM_Value', losses['value_loss_mm'], step)
-        self.tb_writer.add_scalar('Loss/MM_Entropy', losses['entropy_mm'], step)
-        
-        # Losses - Inventory Agent
-        self.tb_writer.add_scalar('Loss/Inv_Policy', losses['policy_loss_inv'], step)
-        self.tb_writer.add_scalar('Loss/Inv_Value', losses['value_loss_inv'], step)
-        self.tb_writer.add_scalar('Loss/Inv_Entropy', losses['entropy_inv'], step)
-        
-        # Action Statistics
-        self.tb_writer.add_scalar('Actions/MM_Spread_Std', mm_spread_std, step)
-        self.tb_writer.add_scalar('Actions/Inv_Target_Std', inv_std, step)
-        self.tb_writer.add_scalar('Actions/Avg_Bid_Spread', avg_bid_spread, step)
-        self.tb_writer.add_scalar('Actions/Avg_Ask_Spread', avg_ask_spread, step)
-        self.tb_writer.add_scalar('Actions/Avg_Target_Inventory', avg_target, step)
-        
-        # Trading Statistics
-        self.tb_writer.add_scalar('Trading/Total_Trades', total_trades, step)
-        self.tb_writer.add_scalar('Trading/Buy_Trades', buy_trades, step)
-        self.tb_writer.add_scalar('Trading/Sell_Trades', sell_trades, step)
-        if total_trades > 0:
-            self.tb_writer.add_scalar('Trading/Buy_Sell_Ratio', 
-                                      buy_trades / max(sell_trades, 1), step)
-        
-        # Episode Statistics (if episodes completed)
-        if self.completed_episodes:
-            avg_episode_mm_rew = np.mean([ep.mm_reward for ep in self.completed_episodes])
-            avg_episode_inv_rew = np.mean([ep.inv_reward for ep in self.completed_episodes])
-            avg_spread_capture = np.mean([ep.spread_capture for ep in self.completed_episodes])
-            avg_unrealized = np.mean([ep.unrealized_pnl for ep in self.completed_episodes])
-            avg_fees = np.mean([ep.fees for ep in self.completed_episodes])
-            avg_trades = np.mean([ep.trade_count for ep in self.completed_episodes])
-            avg_net = np.mean([ep.realized_pnl + ep.unrealized_pnl + ep.fees 
-                              for ep in self.completed_episodes])
+        try:
+            # Rewards
+            avg_mm_reward = np.mean(self.buffer.mm_rewards)
+            avg_inv_reward = np.mean(self.buffer.inv_rewards)
             
-            self.tb_writer.add_scalar('Episode/MM_Reward', avg_episode_mm_rew, step)
-            self.tb_writer.add_scalar('Episode/Inv_Reward', avg_episode_inv_rew, step)
-            self.tb_writer.add_scalar('Episode/Spread_Capture', avg_spread_capture, step)
-            self.tb_writer.add_scalar('Episode/Unrealized_PnL', avg_unrealized, step)
-            self.tb_writer.add_scalar('Episode/Fees', avg_fees, step)
-            self.tb_writer.add_scalar('Episode/Net_PnL', avg_net, step)
-            self.tb_writer.add_scalar('Episode/Trades', avg_trades, step)
+            # P&L - env_info is a dict where each key maps to array of shape (num_envs,)
+            realized_pnl_list = []
+            unrealized_pnl_list = []
+            for env_info in (self.buffer.infos if self.buffer.infos else []):
+                rpnl = env_info.get('realized_pnl', np.zeros(self.config.num_envs))
+                upnl = env_info.get('unrealized_pnl', np.zeros(self.config.num_envs))
+                if isinstance(rpnl, np.ndarray):
+                    realized_pnl_list.extend(rpnl.flatten().tolist())
+                else:
+                    realized_pnl_list.append(float(rpnl))
+                if isinstance(upnl, np.ndarray):
+                    unrealized_pnl_list.extend(upnl.flatten().tolist())
+                else:
+                    unrealized_pnl_list.append(float(upnl))
+            avg_realized_pnl = np.mean(realized_pnl_list) if realized_pnl_list else 0.0
+            avg_unrealized_pnl = np.mean(unrealized_pnl_list) if unrealized_pnl_list else 0.0
+            
+            # Actions
+            bid_spreads = self.buffer.actions[:, :, 0].flatten()
+            ask_spreads = self.buffer.actions[:, :, 1].flatten()
+            targets = self.buffer.inv_actions[:, :, 0].flatten()
+            avg_bid_spread = np.mean(bid_spreads)
+            avg_ask_spread = np.mean(ask_spreads)
+            avg_target = np.mean(targets)
+            mm_spread_std = np.std(bid_spreads + ask_spreads)
+            inv_std = np.std(targets)
+            
+            # Trading stats - env_info is a dict where each key maps to array
+            total_trades = 0
+            buy_trades = 0
+            sell_trades = 0
+            for env_info in (self.buffer.infos if self.buffer.infos else []):
+                trade_count = env_info.get('trade_count', np.zeros(self.config.num_envs))
+                buy_count = env_info.get('buy_trades', np.zeros(self.config.num_envs))
+                sell_count = env_info.get('sell_trades', np.zeros(self.config.num_envs))
+                if isinstance(trade_count, np.ndarray):
+                    total_trades += int(np.sum(trade_count))
+                else:
+                    total_trades += int(trade_count)
+                if isinstance(buy_count, np.ndarray):
+                    buy_trades += int(np.sum(buy_count))
+                else:
+                    buy_trades += int(buy_count)
+                if isinstance(sell_count, np.ndarray):
+                    sell_trades += int(np.sum(sell_count))
+                else:
+                    sell_trades += int(sell_count)
+            
+            print(f"\nEpoch {epoch}/{self.config.total_epochs}")
+            print(f"MM Reward: {avg_mm_reward:.4f} | Inv Reward: {avg_inv_reward:.4f}")
+            print(f"Advantages MM: mean={losses['advantage_mm_mean']:.4f}, std={losses['advantage_mm_std']:.4f}, max={losses['advantage_mm_max']:.4f}")
+            print(f"Advantages Inv: mean={losses['advantage_inv_mean']:.4f}, std={losses['advantage_inv_std']:.4f}, max={losses['advantage_inv_max']:.4f}")
+            print(f"Policy Loss MM: {losses['policy_loss_mm']:.4f} | Value Loss MM: {losses['value_loss_mm']:.4f}")
+            print(f"Policy Loss Inv: {losses['policy_loss_inv']:.4f} | Value Loss Inv: {losses['value_loss_inv']:.4f}")
+            print(f"Entropy MM: {losses['entropy_mm']:.4f} | Entropy Inv: {losses['entropy_inv']:.4f}")
+            print(f"Grad Norm MM: {losses['grad_norm_mm']:.4f} | Grad Norm Inv: {losses['grad_norm_inv']:.4f}")
+            print(f"Avg Bid Spread: {avg_bid_spread:.4f} | Avg Ask Spread: {avg_ask_spread:.4f}")
+            print(f"Avg Target Inventory: {avg_target:.4f}")
+            print(f"Realized PnL: {avg_realized_pnl:.2f} | Unrealized PnL: {avg_unrealized_pnl:.2f}")
+            
+            # Log completed episodes
+            if self.completed_episodes:
+                print("\nCompleted Episodes:")
+                for i, ep in enumerate(self.completed_episodes, 1):
+                    true_net = ep.get('realized_pnl', 0.0) + ep.get('unrealized_pnl', 0.0) + ep.get('fees', 0.0)
+                    print(f"Ep {i}: MM Rew {ep.get('mm_reward', 0.0):.2f} | Inv Rew {ep.get('inv_reward', 0.0):.2f} | "
+                          f"R.PnL ${ep.get('realized_pnl', 0.0):7.2f} | "
+                          f"SprdCap ${ep.get('spread_capture', 0.0):6.2f} | "
+                          f"U.PnL ${ep.get('unrealized_pnl', 0.0):7.2f} | "
+                          f"Net ${true_net:7.2f} | "
+                          f"Trades {ep.get('trade_count', 0):4d} | "
+                          f"Pos {ep.get('net_amount_btc', 0.0):+.5f} BTC")
+                print()
+            
+            # === TensorBoard Logging ===
+            step = self.global_step
+            
+            # Rewards
+            self.tb_writer.add_scalar('Reward/MM_Agent', avg_mm_reward, step)
+            self.tb_writer.add_scalar('Reward/Inventory_Agent', avg_inv_reward, step)
+            self.tb_writer.add_scalar('Reward/Total', avg_mm_reward + avg_inv_reward, step)
+            
+            # Advantage statistics
+            self.tb_writer.add_scalar('Advantage/MM_Mean', losses['advantage_mm_mean'], step)
+            self.tb_writer.add_scalar('Advantage/MM_Std', losses['advantage_mm_std'], step)
+            self.tb_writer.add_scalar('Advantage/MM_Max', losses['advantage_mm_max'], step)
+            self.tb_writer.add_scalar('Advantage/Inv_Mean', losses['advantage_inv_mean'], step)
+            self.tb_writer.add_scalar('Advantage/Inv_Std', losses['advantage_inv_std'], step)
+            self.tb_writer.add_scalar('Advantage/Inv_Max', losses['advantage_inv_max'], step)
+            
+            # Gradient norms
+            self.tb_writer.add_scalar('Gradient/MM_Norm', losses['grad_norm_mm'], step)
+            self.tb_writer.add_scalar('Gradient/Inv_Norm', losses['grad_norm_inv'], step)
+            
+            # P&L Metrics
+            self.tb_writer.add_scalar('PnL/Realized', avg_realized_pnl, step)
+            self.tb_writer.add_scalar('PnL/Unrealized', avg_unrealized_pnl, step)
+            
+            # Losses - MM Agent
+            self.tb_writer.add_scalar('Loss/MM_Policy', losses['policy_loss_mm'], step)
+            self.tb_writer.add_scalar('Loss/MM_Value', losses['value_loss_mm'], step)
+            self.tb_writer.add_scalar('Loss/MM_Entropy', losses['entropy_mm'], step)
+            
+            # Losses - Inventory Agent
+            self.tb_writer.add_scalar('Loss/Inv_Policy', losses['policy_loss_inv'], step)
+            self.tb_writer.add_scalar('Loss/Inv_Value', losses['value_loss_inv'], step)
+            self.tb_writer.add_scalar('Loss/Inv_Entropy', losses['entropy_inv'], step)
+            
+            # Action Statistics
+            self.tb_writer.add_scalar('Actions/MM_Spread_Std', mm_spread_std, step)
+            self.tb_writer.add_scalar('Actions/Inv_Target_Std', inv_std, step)
+            self.tb_writer.add_scalar('Actions/Avg_Bid_Spread', avg_bid_spread, step)
+            self.tb_writer.add_scalar('Actions/Avg_Ask_Spread', avg_ask_spread, step)
+            self.tb_writer.add_scalar('Actions/Avg_Target_Inventory', avg_target, step)
+            
+            # Trading Statistics
+            self.tb_writer.add_scalar('Trading/Total_Trades', total_trades, step)
+            self.tb_writer.add_scalar('Trading/Buy_Trades', buy_trades, step)
+            self.tb_writer.add_scalar('Trading/Sell_Trades', sell_trades, step)
+            if total_trades > 0:
+                self.tb_writer.add_scalar('Trading/Buy_Sell_Ratio', 
+                                          buy_trades / max(sell_trades, 1), step)
+            
+            # Episode Statistics (if episodes completed)
+            if self.completed_episodes:
+                avg_episode_mm_rew = np.mean([ep.get('mm_reward', 0.0) for ep in self.completed_episodes])
+                avg_episode_inv_rew = np.mean([ep.get('inv_reward', 0.0) for ep in self.completed_episodes])
+                avg_spread_capture = np.mean([ep.get('spread_capture', 0.0) for ep in self.completed_episodes])
+                avg_unrealized = np.mean([ep.get('unrealized_pnl', 0.0) for ep in self.completed_episodes])
+                avg_fees = np.mean([ep.get('fees', 0.0) for ep in self.completed_episodes])
+                avg_trades = np.mean([ep.get('trade_count', 0) for ep in self.completed_episodes])
+                avg_net = np.mean([ep.get('realized_pnl', 0.0) + ep.get('unrealized_pnl', 0.0) + ep.get('fees', 0.0)
+                                  for ep in self.completed_episodes])
+                
+                self.tb_writer.add_scalar('Episode/MM_Reward', avg_episode_mm_rew, step)
+                self.tb_writer.add_scalar('Episode/Inv_Reward', avg_episode_inv_rew, step)
+                self.tb_writer.add_scalar('Episode/Spread_Capture', avg_spread_capture, step)
+                self.tb_writer.add_scalar('Episode/Unrealized_PnL', avg_unrealized, step)
+                self.tb_writer.add_scalar('Episode/Fees', avg_fees, step)
+                self.tb_writer.add_scalar('Episode/Net_PnL', avg_net, step)
+                self.tb_writer.add_scalar('Episode/Trades', avg_trades, step)
+            
+            # Flush TensorBoard to ensure data is written
+            self.tb_writer.flush()
+            
+        except Exception as e:
+            print(f"Error in _log_epoch: {e}")
+            import traceback
+            traceback.print_exc()
     
     def train(self):
         """Main training loop."""
@@ -977,8 +822,10 @@ class HierarchicalPPOTrainer:
         """Save training checkpoint."""
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         checkpoint = {
+            'shared_encoder': self.policy.shared_encoder.state_dict(),
             'inventory_agent': self.policy.inventory_agent.state_dict(),
             'mm_agent': self.policy.mm_agent.state_dict(),
+            'optimizer_shared': self.optimizer_shared.state_dict(),
             'optimizer_inv': self.optimizer_inv.state_dict(),
             'optimizer_mm': self.optimizer_mm.state_dict(),
             'global_step': self.global_step,
@@ -993,8 +840,11 @@ class HierarchicalPPOTrainer:
         """Load training checkpoint."""
         # weights_only=False needed for PyTorch 2.6+ (checkpoint contains config objects)
         checkpoint = torch.load(path, map_location=device, weights_only=False)
+        if 'shared_encoder' in checkpoint:
+            self.policy.shared_encoder.load_state_dict(checkpoint['shared_encoder'])
         self.policy.inventory_agent.load_state_dict(checkpoint['inventory_agent'])
         self.policy.mm_agent.load_state_dict(checkpoint['mm_agent'])
+        self.optimizer_shared.load_state_dict(checkpoint['optimizer_shared'])
         self.optimizer_inv.load_state_dict(checkpoint['optimizer_inv'])
         self.optimizer_mm.load_state_dict(checkpoint['optimizer_mm'])
         self.global_step = checkpoint['global_step']

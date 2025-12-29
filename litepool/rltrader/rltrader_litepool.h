@@ -482,7 +482,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     // This is populated when isDone becomes true, before auto-reset
     if (has_terminal_info_) {
         state["info:final_realized_pnl"_] = terminal_info_["realized_pnl"];
-        state["info:final_unrealized_pnl"_] = terminal_info_["lifo_unrealized_pnl"];  // Use LIFO for consistency
+        state["info:final_unrealized_pnl"_] = terminal_info_["unrealized_pnl"];  // Use weighted-average for consistency with realized_pnl
         state["info:final_trade_count"_] = terminal_info_["trade_count"];
         state["info:final_fees"_] = terminal_info_["fees"];
         state["info:final_net_amount_btc"_] = terminal_info_["net_amount_btc"];

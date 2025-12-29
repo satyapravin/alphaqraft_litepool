@@ -11,8 +11,9 @@ import torch.nn as nn
 import numpy as np
 from typing import Tuple, Optional, Dict, Any
 
-from inventory_agent import InventoryAgent, INVENTORY_OBS_INDICES, INVENTORY_OBS_DIM
-from mm_agent import MMAgent, MM_OBS_INDICES, MARKET_OBS_DIM
+from inventory_agent import InventoryAgent
+from mm_agent import MMAgent
+from shared_encoder import SharedEncoder
 
 
 class HierarchicalPolicy(nn.Module):
@@ -36,32 +37,41 @@ class HierarchicalPolicy(nn.Module):
     
     def __init__(
         self,
+        obs_dim: int = 40,  # Full observation dimension
         inventory_update_freq: int = 100,
-        inventory_hidden: Tuple[int, ...] = (64, 32),
         inventory_lstm: int = 32,
-        mm_hidden: int = 128,
         mm_lstm: int = 64,
+        hidden_dim: int = 128,  # Shared encoder hidden dimension
         target_range: float = 0.1,
+        attention_heads: int = 4,
         device: str = 'cpu',
     ):
         super().__init__()
         
+        self.obs_dim = obs_dim
         self.inventory_update_freq = inventory_update_freq
         self.target_range = target_range
         self.device = device
         
-        # Create agents
+        # Create shared encoder (both agents use this)
+        self.shared_encoder = SharedEncoder(obs_dim, hidden_dim)
+        
+        # Create agents with shared encoder
         self.inventory_agent = InventoryAgent(
-            obs_dim=INVENTORY_OBS_DIM,
-            hidden_dims=inventory_hidden,
+            obs_dim=obs_dim,
+            shared_encoder=self.shared_encoder,
+            hidden_dim=hidden_dim,
             lstm_hidden=inventory_lstm,
             target_range=target_range,
+            attention_heads=attention_heads,
         )
         
         self.mm_agent = MMAgent(
-            market_obs_dim=MARKET_OBS_DIM,
-            hidden_dim=mm_hidden,
+            obs_dim=obs_dim,
+            shared_encoder=self.shared_encoder,
+            hidden_dim=hidden_dim,
             lstm_hidden=mm_lstm,
+            attention_heads=attention_heads,
         )
         
         # State tracking (per environment)
@@ -75,12 +85,14 @@ class HierarchicalPolicy(nn.Module):
         self.to(device)
     
     def reset(self, num_envs: int):
-        """Reset state for new episodes."""
+        """Reset state for new episodes (all environments)."""
         self.current_targets = torch.zeros(num_envs, 1, device=self.device)
         self.current_risk_aversion = torch.ones(num_envs, 1, device=self.device) * 0.5  # Default risk_aversion = 0.5 [0, 1]
         self.step_counters = np.zeros(num_envs, dtype=np.int64)
-        self.mm_hidden = None
-        self.inv_hidden = None
+        # Initialize LSTM hidden states for all environments (will be created on first forward pass)
+        # Shape: (1, num_envs, lstm_hidden) for both h and c
+        self.mm_hidden = None  # Will be initialized on first forward pass
+        self.inv_hidden = None  # Will be initialized on first forward pass
     
     def reset_env(self, env_id: int):
         """Reset state for a specific environment (after episode end)."""
@@ -92,22 +104,31 @@ class HierarchicalPolicy(nn.Module):
             self.step_counters[env_id] = 0
         # Reset LSTM hidden state for this specific environment
         # LSTM hidden state shape: (1, batch_size, lstm_hidden) for both h and c
+        # Detach from computation graph before modifying to avoid gradient errors
         if self.mm_hidden is not None:
             h, c = self.mm_hidden
             # Safety check: ensure batch size matches
             if env_id < h.shape[1] and env_id < c.shape[1]:
+                # Detach and clone to avoid modifying tensors in computation graph
+                h = h.detach().clone()
+                c = c.detach().clone()
                 # Zero out hidden state for this environment in the batch
                 h[:, env_id, :] = 0.0
                 c[:, env_id, :] = 0.0
+                self.mm_hidden = (h, c)
         
         # Reset inventory agent LSTM hidden state for this specific environment
         if self.inv_hidden is not None:
             h, c = self.inv_hidden
             # Safety check: ensure batch size matches
             if env_id < h.shape[1] and env_id < c.shape[1]:
+                # Detach and clone to avoid modifying tensors in computation graph
+                h = h.detach().clone()
+                c = c.detach().clone()
                 # Zero out hidden state for this environment in the batch
                 h[:, env_id, :] = 0.0
                 c[:, env_id, :] = 0.0
+                self.inv_hidden = (h, c)
     
     def forward(
         self,
@@ -134,16 +155,32 @@ class HierarchicalPolicy(nn.Module):
         if self.current_targets is None or self.current_targets.shape[0] != batch_size:
             self.reset(batch_size)
         
-        # Extract observations for each agent
-        inv_obs = self._extract_inventory_obs(obs)
-        market_obs = self._extract_market_obs(obs)
+        # Both agents see all observations (shared encoder + attention handles filtering)
+        # Initialize LSTM hidden states if needed (first call or batch size changed)
+        if self.inv_hidden is None:
+            # Initialize hidden state for all environments
+            self.inv_hidden = self.inventory_agent._init_hidden(batch_size, self.device)
+        if self.mm_hidden is None:
+            # Initialize hidden state for all environments
+            self.mm_hidden = self.mm_agent._init_hidden(batch_size, self.device)
         
         # Inventory agent: update target if it's time
         update_inventory = self._should_update_inventory()
         
-        inv_action, inv_log_prob, inv_value, self.inv_hidden = self.inventory_agent.get_action(
-            inv_obs, self.inv_hidden, deterministic=deterministic, temperature=temperature
+        # Clone and detach hidden states BEFORE passing to LSTM to prevent in-place modification errors
+        # PyTorch's LSTM can modify hidden states in-place, so we need to clone them
+        inv_hidden_input = None
+        if self.inv_hidden is not None:
+            h, c = self.inv_hidden
+            inv_hidden_input = (h.detach().clone(), c.detach().clone())
+        
+        inv_action, inv_log_prob, inv_value, inv_hidden_new = self.inventory_agent.get_action(
+            obs, inv_hidden_input, deterministic=deterministic, temperature=temperature
         )
+        # Detach and clone hidden states after LSTM forward pass
+        if inv_hidden_new is not None:
+            h, c = inv_hidden_new
+            self.inv_hidden = (h.detach().clone(), c.detach().clone())
         
         # Update targets and risk aversion for envs that need updating
         if update_inventory.any():
@@ -153,14 +190,24 @@ class HierarchicalPolicy(nn.Module):
         # Increment step counters
         self.step_counters += 1
         
-        # MM agent: act every step based on market microstructure only
-        # (inventory skew comes from Inventory Agent, not MM Agent's input)
-        mm_action, mm_log_prob, mm_value, self.mm_hidden = self.mm_agent.get_action(
-            market_obs,
-            self.mm_hidden,
+        # MM agent: act every step (attention focuses on microstructure signals)
+        # Clone and detach hidden states BEFORE passing to LSTM to prevent in-place modification errors
+        # PyTorch's LSTM can modify hidden states in-place, so we need to clone them
+        mm_hidden_input = None
+        if self.mm_hidden is not None:
+            h, c = self.mm_hidden
+            mm_hidden_input = (h.detach().clone(), c.detach().clone())
+        
+        mm_action, mm_log_prob, mm_value, mm_hidden_new = self.mm_agent.get_action(
+            obs,
+            mm_hidden_input,
             deterministic=deterministic,
             temperature=temperature,
         )
+        # Detach and clone hidden states after LSTM forward pass
+        if mm_hidden_new is not None:
+            h, c = mm_hidden_new
+            self.mm_hidden = (h.detach().clone(), c.detach().clone())
         
         # Combine into environment action format: [bid_spread, ask_spread, target_inventory, risk_aversion]
         action = torch.cat([
@@ -231,24 +278,24 @@ class HierarchicalPolicy(nn.Module):
         Evaluate log probabilities for PPO update.
         
         Args:
-            obs: Full observations [batch, 36]
+            obs: Full observations [batch, obs_dim]
             actions: MM actions [batch, 2] (bid_spread, ask_spread)
-            inventory_actions: Inventory actions [batch, 1]
+            inventory_actions: Inventory actions [batch, 2] (target_inventory, risk_aversion)
             
         Returns:
             Dict with 'inventory' and 'mm' evaluation results
         """
-        inv_obs = self._extract_inventory_obs(obs)
-        market_obs = self._extract_market_obs(obs)
-        
+        # Observations should already be fresh tensors from the buffer (numpy arrays converted to tensors)
+        # The shared encoder will clone them if needed to ensure fresh computation graph
+        # Both agents see all observations (shared encoder + attention handles filtering)
         # Evaluate inventory agent
         inv_log_prob, inv_entropy, inv_value = self.inventory_agent.evaluate_actions(
-            inv_obs, inventory_actions
+            obs, inventory_actions
         )
         
-        # Evaluate MM agent (no target input - learns from microstructure only)
+        # Evaluate MM agent (attention focuses on microstructure signals)
         mm_log_prob, mm_entropy, mm_value = self.mm_agent.evaluate_actions(
-            market_obs, actions
+            obs, actions
         )
         
         return {
@@ -260,14 +307,7 @@ class HierarchicalPolicy(nn.Module):
         """Check which environments should update inventory target."""
         return (self.step_counters % self.inventory_update_freq) == 0
     
-    def _extract_inventory_obs(self, obs: torch.Tensor) -> torch.Tensor:
-        """Extract inventory-relevant observations."""
-        return obs[:, INVENTORY_OBS_INDICES]
-    
-    def _extract_market_obs(self, obs: torch.Tensor) -> torch.Tensor:
-        """Extract market observations (first 13 dims)."""
-        return obs[:, MM_OBS_INDICES]
-    
+    # NOTE: Observation extraction removed - both agents now see all observations via shared encoder + attention
     # NOTE: Reward calculation methods removed - rewards come directly from environment
     # The environment (rltrader_litepool.h) computes mm_reward and inv_reward in the info dict
     # These are extracted in hierarchical_ppo.py collect_rollout() method
@@ -291,17 +331,21 @@ class HierarchicalPolicy(nn.Module):
 
 
 def create_hierarchical_policy(
+    obs_dim: int = 40,  # Full observation dimension
     inventory_update_freq: int = 100,
     device: str = 'cpu',
     target_range: float = 0.2,  # Increased from 0.1 for more aggressive positioning
+    hidden_dim: int = 128,  # Shared encoder hidden dimension
+    attention_heads: int = 4,
 ) -> HierarchicalPolicy:
     """Factory function to create hierarchical policy with defaults."""
     return HierarchicalPolicy(
+        obs_dim=obs_dim,
         inventory_update_freq=inventory_update_freq,
-        inventory_hidden=(64, 32),
         inventory_lstm=32,
-        mm_hidden=128,
         mm_lstm=64,
+        hidden_dim=hidden_dim,
         target_range=target_range,
+        attention_heads=attention_heads,
         device=device,
     )

@@ -68,7 +68,9 @@ def main():
     env.spec.id = "RlTrader-v0"
 
     # Create hierarchical policy (matching training config)
+    obs_dim = 40  # Full observation dimension
     policy = create_hierarchical_policy(
+        obs_dim=obs_dim,
         inventory_update_freq=config.inventory_update_freq,
         device=str(device),
         target_range=config.target_range,  # Match training config
@@ -87,6 +89,12 @@ def main():
     
     # weights_only=False needed for PyTorch 2.6+ (checkpoint contains config objects)
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    
+    # Load shared encoder if present (for new architecture)
+    if 'shared_encoder' in checkpoint:
+        policy.shared_encoder.load_state_dict(checkpoint['shared_encoder'])
+        print(f"[Model] Loaded shared encoder from {model_path}")
+    
     policy.inventory_agent.load_state_dict(checkpoint['inventory_agent'])
     policy.mm_agent.load_state_dict(checkpoint['mm_agent'])
     print(f"[Model] Loaded hierarchical policy from {model_path}")
