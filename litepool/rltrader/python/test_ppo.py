@@ -99,7 +99,6 @@ def main():
     episode_steps = np.zeros(NUM_ENVS, dtype=np.int32)
     episode_mm_total = np.zeros(NUM_ENVS)
     episode_inv_total = np.zeros(NUM_ENVS)
-    episode_coop_total = np.zeros(NUM_ENVS)
     
     # Metrics tracking
     max_leverage = 0.0
@@ -121,7 +120,7 @@ def main():
     print(f"Max steps: {MAX_STEPS}")
     print("="*80)
     print(f"{'Step':>8} | {'MM.Rew':>8} | {'Inv.Rew':>8} | {'R.PnL':>10} | {'U.PnL':>10} | "
-          f"{'Fees':>8} | {'Lev':>6} | {'Trades':>6} | {'Target':>12}")
+          f"{'Fees':>8} | {'Lev':>6} | {'Trades':>6} | {'Target':>12} | {'RiskAv':>8}")
     print("-"*100)
     
     try:
@@ -137,7 +136,6 @@ def main():
             # Extract rewards (matching hierarchical_ppo.py structure)
             mm_reward = env_info.get('mm_reward', np.zeros(NUM_ENVS))
             inv_reward = env_info.get('inv_reward', np.zeros(NUM_ENVS))
-            coop_bonus = env_info.get('coop_bonus', np.zeros(NUM_ENVS))
             
             # Handle numpy array extraction
             if isinstance(mm_reward, np.ndarray):
@@ -148,15 +146,10 @@ def main():
                 inv_reward = inv_reward.flatten()
             else:
                 inv_reward = np.array([inv_reward] * NUM_ENVS)
-            if isinstance(coop_bonus, np.ndarray):
-                coop_bonus = coop_bonus.flatten()
-            else:
-                coop_bonus = np.array([coop_bonus] * NUM_ENVS)
             
             # Accumulate rewards (matching hierarchical_ppo.py)
             episode_mm_total += mm_reward
             episode_inv_total += inv_reward
-            episode_coop_total += coop_bonus
             episode_steps += 1
             total_steps += NUM_ENVS
 
@@ -164,6 +157,7 @@ def main():
             leverage = _extract_info_value(env_info, 'leverage', 0, 0.0)
             max_leverage = max(max_leverage, abs(leverage))
             target_inventory = _extract_info_value(env_info, 'target_inventory', 0, 0.0)
+            risk_aversion = _extract_info_value(env_info, 'risk_aversion', 0, 0.5)
             
             # Track target inventory changes
             if last_target_inventory is not None:
@@ -183,17 +177,24 @@ def main():
                 mm_r = float(episode_mm_total[0])
                 inv_r = float(episode_inv_total[0])
                 
-                # Get raw action from policy info (for debugging)
-                # Raw action is in [-target_range, +target_range] where target_range=5.0, so [-5, +5]
-                # C++ now uses this directly without scaling
-                raw_action = info.get('targets', np.array([0.0])) if 'targets' in info else np.array([0.0])
-                if isinstance(raw_action, np.ndarray):
-                    raw_action = float(raw_action.item()) if raw_action.size > 0 else 0.0
-                else:
-                    raw_action = float(raw_action)
+                # Get raw actions from policy info (for debugging)
+                # target_inventory is in [-target_range, +target_range], used directly in C++
+                # risk_aversion is in [0, 1]
+                raw_target = info.get('targets', np.array([0.0])) if 'targets' in info else np.array([0.0])
+                raw_risk_aversion = info.get('risk_aversion', np.array([0.5])) if 'risk_aversion' in info else np.array([0.5])
                 
-                # C++ uses raw action directly (no scaling), so show raw action for comparison
-                scaled_action = raw_action
+                if isinstance(raw_target, np.ndarray):
+                    raw_target = float(raw_target.item()) if raw_target.size > 0 else 0.0
+                else:
+                    raw_target = float(raw_target)
+                
+                if isinstance(raw_risk_aversion, np.ndarray):
+                    raw_risk_aversion = float(raw_risk_aversion.item()) if raw_risk_aversion.size > 0 else 1.0
+                else:
+                    raw_risk_aversion = float(raw_risk_aversion)
+                
+                # C++ uses raw actions directly (no scaling)
+                scaled_action = raw_target
                 
                 updated = info.get('updated_inventory', np.array([False]))
                 if isinstance(updated, np.ndarray):
@@ -203,10 +204,12 @@ def main():
                 
                 # Display: Tgt = EMA-smoothed target from env (actual value used in strategy)
                 #         act = raw action (what C++ receives before EMA)
+                #         RiskAv = risk aversion parameter (γ) for A-S model
                 print(f"{total_steps:8d} | {mm_r:+8.2f} | {inv_r:+8.2f} | "
                       f"{realized_pnl:+10.4f} | {unrealized_pnl:+10.4f} | "
                       f"{fees:8.4f} | {leverage:6.2f}x | {trade_count:6d} | "
-                      f"Tgt:{target_inventory:+.4f} (act:{scaled_action:+.4f}{'*' if updated else ''})")
+                      f"Tgt:{target_inventory:+.4f} (act:{scaled_action:+.4f}{'*' if updated else ''}) | "
+                      f"γ:{risk_aversion:.3f}")
             
             # Debug: Print when inventory agent updates
             if 'updated_inventory' in info:
@@ -216,13 +219,19 @@ def main():
                 else:
                     updated = bool(updated)
                 if updated:
-                    raw_action = info.get('targets', np.array([0.0]))
-                    if isinstance(raw_action, np.ndarray):
-                        raw_action = float(raw_action.item()) if raw_action.size > 0 else 0.0
+                    raw_target = info.get('targets', np.array([0.0]))
+                    raw_risk_aversion = info.get('risk_aversion', np.array([1.0]))
+                    if isinstance(raw_target, np.ndarray):
+                        raw_target = float(raw_target.item()) if raw_target.size > 0 else 0.0
                     else:
-                        raw_action = float(raw_action)
-                    # C++ uses raw action directly (no scaling)
-                    current_target = raw_action  # Use raw value for display
+                        raw_target = float(raw_target)
+                    if isinstance(raw_risk_aversion, np.ndarray):
+                        raw_risk_aversion = float(raw_risk_aversion.item()) if raw_risk_aversion.size > 0 else 1.0
+                    else:
+                        raw_risk_aversion = float(raw_risk_aversion)
+                    # C++ uses raw actions directly (no scaling)
+                    current_target = raw_target  # Use raw value for display
+                    current_risk_aversion = raw_risk_aversion
             
             # Handle episode ends (matching hierarchical_ppo.py structure)
             for env_id in range(NUM_ENVS):
@@ -254,7 +263,6 @@ def main():
                           f"Steps {int(episode_steps[env_id]):5d} | "
                           f"MM.Rew {float(episode_mm_total[env_id]):7.2f} | "
                           f"Inv.Rew {float(episode_inv_total[env_id]):7.2f} | "
-                          f"Coop {float(episode_coop_total[env_id]):6.2f} | "
                           f"R.PnL ${realized_pnl:7.2f} | "
                           f"SprdCap ${spread_capture:6.2f} | "
                           f"U.PnL ${unrealized_pnl:7.2f} | "
@@ -267,7 +275,6 @@ def main():
                     episode_steps[env_id] = 0
                     episode_mm_total[env_id] = 0
                     episode_inv_total[env_id] = 0
-                    episode_coop_total[env_id] = 0
                     policy.reset_env(env_id)
             
                 obs = next_obs

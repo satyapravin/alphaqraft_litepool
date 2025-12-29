@@ -38,6 +38,7 @@ class HierarchicalPolicy(nn.Module):
         self,
         inventory_update_freq: int = 100,
         inventory_hidden: Tuple[int, ...] = (64, 32),
+        inventory_lstm: int = 32,
         mm_hidden: int = 128,
         mm_lstm: int = 64,
         target_range: float = 0.1,
@@ -53,6 +54,7 @@ class HierarchicalPolicy(nn.Module):
         self.inventory_agent = InventoryAgent(
             obs_dim=INVENTORY_OBS_DIM,
             hidden_dims=inventory_hidden,
+            lstm_hidden=inventory_lstm,
             target_range=target_range,
         )
         
@@ -64,8 +66,10 @@ class HierarchicalPolicy(nn.Module):
         
         # State tracking (per environment)
         self.current_targets: Optional[torch.Tensor] = None
+        self.current_risk_aversion: Optional[torch.Tensor] = None
         self.step_counters: Optional[np.ndarray] = None
         self.mm_hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self.inv_hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         
         # Move to device
         self.to(device)
@@ -73,19 +77,32 @@ class HierarchicalPolicy(nn.Module):
     def reset(self, num_envs: int):
         """Reset state for new episodes."""
         self.current_targets = torch.zeros(num_envs, 1, device=self.device)
+        self.current_risk_aversion = torch.ones(num_envs, 1, device=self.device) * 0.5  # Default risk_aversion = 0.5 [0, 1]
         self.step_counters = np.zeros(num_envs, dtype=np.int64)
         self.mm_hidden = None
+        self.inv_hidden = None
     
     def reset_env(self, env_id: int):
         """Reset state for a specific environment (after episode end)."""
         if self.current_targets is not None:
             self.current_targets[env_id] = 0.0
+        if self.current_risk_aversion is not None:
+            self.current_risk_aversion[env_id] = 0.5
         if self.step_counters is not None:
             self.step_counters[env_id] = 0
         # Reset LSTM hidden state for this specific environment
         # LSTM hidden state shape: (1, batch_size, lstm_hidden) for both h and c
         if self.mm_hidden is not None:
             h, c = self.mm_hidden
+            # Safety check: ensure batch size matches
+            if env_id < h.shape[1] and env_id < c.shape[1]:
+                # Zero out hidden state for this environment in the batch
+                h[:, env_id, :] = 0.0
+                c[:, env_id, :] = 0.0
+        
+        # Reset inventory agent LSTM hidden state for this specific environment
+        if self.inv_hidden is not None:
+            h, c = self.inv_hidden
             # Safety check: ensure batch size matches
             if env_id < h.shape[1] and env_id < c.shape[1]:
                 # Zero out hidden state for this environment in the batch
@@ -124,13 +141,14 @@ class HierarchicalPolicy(nn.Module):
         # Inventory agent: update target if it's time
         update_inventory = self._should_update_inventory()
         
-        inv_action, inv_log_prob, inv_value = self.inventory_agent.get_action(
-            inv_obs, deterministic=deterministic, temperature=temperature
+        inv_action, inv_log_prob, inv_value, self.inv_hidden = self.inventory_agent.get_action(
+            inv_obs, self.inv_hidden, deterministic=deterministic, temperature=temperature
         )
         
-        # Update targets for envs that need updating
+        # Update targets and risk aversion for envs that need updating
         if update_inventory.any():
-            self.current_targets[update_inventory] = inv_action[update_inventory]
+            self.current_targets[update_inventory] = inv_action[update_inventory, 0:1]  # target_inventory
+            self.current_risk_aversion[update_inventory] = inv_action[update_inventory, 1:2]  # risk_aversion
         
         # Increment step counters
         self.step_counters += 1
@@ -144,11 +162,12 @@ class HierarchicalPolicy(nn.Module):
             temperature=temperature,
         )
         
-        # Combine into environment action format: [bid_spread, ask_spread, target_inventory]
+        # Combine into environment action format: [bid_spread, ask_spread, target_inventory, risk_aversion]
         action = torch.cat([
             mm_action[:, 0:1],  # bid_spread
             mm_action[:, 1:2],  # ask_spread
             self.current_targets,  # target_inventory
+            self.current_risk_aversion,  # risk_aversion
         ], dim=-1)
         
         log_probs = {
@@ -164,6 +183,7 @@ class HierarchicalPolicy(nn.Module):
         info = {
             'updated_inventory': update_inventory,
             'current_targets': self.current_targets.clone(),
+            'current_risk_aversion': self.current_risk_aversion.clone(),
         }
         
         return action, log_probs, values, info
@@ -198,6 +218,7 @@ class HierarchicalPolicy(nn.Module):
             'value_mm': values['mm'].cpu().numpy(),
             'updated_inventory': info['updated_inventory'],
             'targets': info['current_targets'].cpu().numpy(),
+            'risk_aversion': info['current_risk_aversion'].cpu().numpy(),
         }
     
     def evaluate_actions(
@@ -278,6 +299,7 @@ def create_hierarchical_policy(
     return HierarchicalPolicy(
         inventory_update_freq=inventory_update_freq,
         inventory_hidden=(64, 32),
+        inventory_lstm=32,
         mm_hidden=128,
         mm_lstm=64,
         target_range=target_range,

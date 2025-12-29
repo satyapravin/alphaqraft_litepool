@@ -19,6 +19,8 @@
 #include <cmath>
 #include <stdexcept>
 #include <iostream>
+#include <deque>
+#include <vector>
 #include "orderbook.h"
 
 using namespace RLTrader;
@@ -43,8 +45,9 @@ void Strategy::reset() {
     double initQty = 0;
     double avgPrice = 0;
     this->target_inventory_ema = 0;
-    this->prev_mid_price = 0;
-    this->realized_vol = 0;
+    this->risk_aversion_ema = 0.5;  // Reset to default [0, 1]
+    this->vol_2min_ = 0.0;
+    this->price_history_.clear();
     this->last_bid_price = 0;
     this->last_ask_price = 0;
     this->last_mid_price = 0;
@@ -81,30 +84,70 @@ void Strategy::reset() {
     }
 }
 
-void Strategy::updateTargetInventory(double target_inventory_action) {
-    // Action is in [-target_range, +target_range] (e.g., [-5, +5] if target_range=5.0)
+void Strategy::updateTargetInventory(double target_inventory_action, double risk_aversion_action) {
+    // Target inventory: Action is in [-target_range, +target_range]
     // Use action directly without scaling
     double target_raw = target_inventory_action;
     
     // Apply EMA smoothing to prevent flipping (TARGET_EMA_ALPHA = 0.0058 gives 120 step half-life = 60 sec)
-    // This smooths out noisy AMM signals while still allowing responsive updates
-    // With alpha=0.0058, it takes ~120 steps to move halfway from current to target
     target_inventory_ema = TARGET_EMA_ALPHA * target_raw + (1.0 - TARGET_EMA_ALPHA) * target_inventory_ema;
+    
+    // Risk aversion: Action is in [0, 1]
+    // Clamp to valid range and apply EMA smoothing
+    double risk_aversion_clamped = std::clamp(risk_aversion_action, 0.0, 1.0);
+    risk_aversion_ema = TARGET_EMA_ALPHA * risk_aversion_clamped + (1.0 - TARGET_EMA_ALPHA) * risk_aversion_ema;
 }
 
 void Strategy::updateVolatility(double mid_price) {
-    // Update realized volatility using EMA of squared returns
-    if (prev_mid_price > 0 && mid_price > 0) {
-        double ret = (mid_price - prev_mid_price) / prev_mid_price;
-        double squared_ret = ret * ret;
+    // Update 2-minute volatility using rolling window of price returns
+    if (mid_price > 0) {
+        // Add current price to history
+        price_history_.push_back(mid_price);
         
-        // EMA update: vol² = α * ret² + (1-α) * vol²
-        // realized_vol stores the square root (standard deviation)
-        double vol_sq = realized_vol * realized_vol;
-        vol_sq = VOL_EMA_ALPHA * squared_ret + (1.0 - VOL_EMA_ALPHA) * vol_sq;
-        realized_vol = std::sqrt(vol_sq);
+        // Keep only last VOL_WINDOW_STEPS prices (2 minutes)
+        if (price_history_.size() > VOL_WINDOW_STEPS) {
+            price_history_.pop_front();
+        }
+        
+        // Calculate volatility if we have enough data (need at least 2 prices for returns)
+        if (price_history_.size() >= 2) {
+            // Compute returns
+            std::vector<double> returns;
+            for (size_t i = 1; i < price_history_.size(); ++i) {
+                double prev_price = price_history_[i - 1];
+                double curr_price = price_history_[i];
+                if (prev_price > 0) {
+                    double ret = (curr_price - prev_price) / prev_price;
+                    returns.push_back(ret);
+                }
+            }
+            
+            if (returns.size() >= 2) {
+                // Calculate mean return
+                double mean_ret = 0.0;
+                for (double ret : returns) {
+                    mean_ret += ret;
+                }
+                mean_ret /= returns.size();
+                
+                // Calculate variance
+                double variance = 0.0;
+                for (double ret : returns) {
+                    double diff = ret - mean_ret;
+                    variance += diff * diff;
+                }
+                variance /= returns.size();
+                
+                // Volatility is standard deviation of returns, multiplied by mid_price to get absolute volatility
+                // This gives volatility in price units (same units as mid_price)
+                vol_2min_ = std::sqrt(std::max(0.0, variance)) * mid_price;
+            } else {
+                vol_2min_ = 0.0;
+            }
+        } else {
+            vol_2min_ = 0.0;
+        }
     }
-    prev_mid_price = mid_price;
 }
 
 std::pair<double, double> Strategy::computeQuotePrices(
@@ -114,150 +157,54 @@ std::pair<double, double> Strategy::computeQuotePrices(
     double tick_size) {
     
     // ============================================================================
-    // Direct Spread Control Model
+    // Avellaneda-Stoikov Model Implementation
     // ============================================================================
-    // Agent directly controls bid_spread and ask_spread (full spreads in bps).
-    // No reservation price - quotes are placed symmetrically around mid-price,
-    // with inventory skew applied by adjusting spreads directly.
+    // Uses A-S formulas:
+    //   Reservation price: r = s - (q - q_target) * γ * σ² * (T - t)
+    //   Optimal spread: δ = (1/γ) * log(1 + γ/k) + (q - q_target) * γ * σ² * (T - t)
+    // Where:
+    //   s = mid_price, q = leverage (inventory), q_target = target_inventory_ema,
+    //   (q - q_target) = inventory_error, γ = risk_aversion_ema,
+    //   σ² = variance (vol_2min_²), T - t = time remaining, k = order flow intensity
     // ============================================================================
     
-    // === Step 1: Compute base spread (in bps) ===
-    double base_spread_bps = config.base_spread_bps;
+    // Get risk aversion parameter (γ) from inventory agent
+    double gamma = risk_aversion_ema;
     
-    // === Step 2: Agent spread control (full spreads in bps) ===
-    // bid_spread/ask_spread actions: [0, 1] → directly multiplies base_spread_bps
-    // action=0 → 0 bps (no quote), action=1 → base_spread_bps (full base spread)
-    // Clamp actions to [0, 1] range
-    double bid_action = std::clamp(action.bid_spread, 0.0, 1.0);
-    double ask_action = std::clamp(action.ask_spread, 0.0, 1.0);
+    // Compute variance (σ²) from 2-minute volatility
+    double variance = vol_2min_ * vol_2min_;
     
-    // === Step 3: Compute base spreads (full spreads in bps) ===
-    // Direct multiplication: action * base_spread_bps
-    double bid_spread_bps = base_spread_bps * bid_action;
-    double ask_spread_bps = base_spread_bps * ask_action;
-    
-    // === Step 4: Apply inventory skew by adjusting spreads directly ===
-    // Goal: Push current leverage toward target leverage gradually (at least 5 minutes = 600 steps)
-    // If too long (leverage > target): widen bid, tighten ask → more likely to sell (reduce long)
-    // If too short (leverage < target): tighten bid, widen ask → more likely to buy (reduce short)
-    // target_inventory_ema is in [-target_range, +target_range] (e.g., [-5, +5] if target_range=5.0)
-    double target_leverage = target_inventory_ema;  // Already in leverage units
+    // Time remaining (T - t): use 1 hour as typical trading horizon
+    // This represents how long we expect to hold the position
+    constexpr double TIME_HORIZON_SEC = 1.0;  
+        
+    // Compute inventory error (difference between current leverage and target)
+    // This is what drives the A-S adjustments, not absolute inventory
+    double target_leverage = target_inventory_ema;
     double inventory_error = leverage - target_leverage;
     
-    // === Time-based urgency tracking ===
-    // Track how long we've been away from target (increases urgency over time)
-    if (std::abs(inventory_error) > URGENCY_TIME_THRESHOLD) {
-        // Still away from target - increment urgency counter
-        // Check if error sign changed (flipped direction) - reset if so
-        if (std::signbit(inventory_error) != std::signbit(prev_inventory_error_)) {
-            steps_away_from_target_ = 0;  // Reset if we flipped direction
-        } else {
-            steps_away_from_target_++;  // Increment if same direction
-        }
-    } else {
-        // Close to target - reset urgency
-        steps_away_from_target_ = 0;
-    }
-    prev_inventory_error_ = inventory_error;
+    // Inventory adjustment: positive inventory_error (too long) → widen bid, tighten ask
+    //                     negative inventory_error (too short) → tighten bid, widen ask
+    double inventory_adjustment = inventory_error * gamma * variance * TIME_HORIZON_SEC;
+    // Cap adjustment to reasonable range (1% of price max)
+    inventory_adjustment = std::clamp(inventory_adjustment, -mid_price * 0.01, mid_price * 0.01);
     
-    // === Adaptive skew multiplier based on volatility, urgency, and time ===
-    constexpr double MIN_RESET_TIME_STEPS = 120.0;  // 1 minutes = 120 steps at 0.5s per step
+    // Agent controls bid_spread and ask_spread in [0, 1] range
+    // These are base spreads, then we apply inventory adjustment for skewing
+    double bid_action = std::clamp(action.bid_spread, 0.0, 1.0) * vol_2min_;
+    double ask_action = std::clamp(action.ask_spread, 0.0, 1.0) * vol_2min_;
     
-    // 1. Error magnitude urgency: smooth tanh function (saturates for large errors)
-    //    tanh provides smooth response: small errors get linear scaling, large errors saturate
-    double error_magnitude = std::abs(inventory_error);
-    double error_urgency = std::tanh(error_magnitude * 5.0);  // Scale: 0.2 error → tanh(1) ≈ 0.76, saturates at 1.0
+    double bid_spread = bid_action + inventory_adjustment;  // Widen bid when positive error
+    double ask_spread = ask_action - inventory_adjustment;  // Tighten ask when positive error
     
-    // 2. Time-based urgency: increases with time away from target, but capped to respect 5-minute minimum
-    //    Scale urgency based on how much time has passed vs minimum reset time
-    //    Only increase urgency after we've given enough time (600 steps)
-    double time_urgency_base = 1.0;
-    if (steps_away_from_target_ > MIN_RESET_TIME_STEPS) {
-        // After 5 minutes, gradually increase urgency (up to 2x)
-        double excess_time = steps_away_from_target_ - MIN_RESET_TIME_STEPS;
-        double urgency_increase = std::tanh(excess_time / 300.0);  // Gradual increase over next 5 minutes
-        time_urgency_base = 1.0 + urgency_increase;  // 1.0 to 2.0
-    }
-    // Before 5 minutes: keep urgency at 1.0 (no rush, allow gradual movement)
+    // Ensure spreads are positive (can't be negative)
+    bid_spread = std::max(bid_spread, tick_size);
+    ask_spread = std::max(ask_spread, tick_size);
     
-    // 3. Volatility adjustment: higher vol → stronger skew (but risk-averse mode for extreme vol)
-    //    Moderate vol: increase skew (need to move faster)
-    //    Extreme vol: reduce skew (risk-averse: avoid adverse selection)
-    constexpr double VOL_THRESHOLD_MODERATE = 0.001;  // 0.1% per tick = moderate volatility
-    constexpr double VOL_THRESHOLD_EXTREME = 0.005;   // 0.5% per tick = extreme volatility
-    double vol_skew_mult;
-    if (realized_vol < VOL_THRESHOLD_MODERATE) {
-        // Low volatility: standard skew
-        vol_skew_mult = 1.0;
-    } else if (realized_vol < VOL_THRESHOLD_EXTREME) {
-        // Moderate volatility: increase skew strength (need to move inventory faster)
-        vol_skew_mult = 1.0 + (realized_vol - VOL_THRESHOLD_MODERATE) / (VOL_THRESHOLD_EXTREME - VOL_THRESHOLD_MODERATE);  // 1.0 to 2.0
-    } else {
-        // Extreme volatility: risk-averse mode (reduce skew to avoid adverse selection)
-        // Still allow some skew, but much weaker
-        double excess_vol = (realized_vol - VOL_THRESHOLD_EXTREME) / VOL_THRESHOLD_EXTREME;  // Normalized excess
-        vol_skew_mult = 2.0 * std::exp(-excess_vol * 2.0);  // Exponential decay: 2.0 → 0.27 at 2x threshold
-        vol_skew_mult = std::max(vol_skew_mult, 0.3);  // Floor at 0.3x (still some skew, but very weak)
-    }
-    
-    // Combined adaptive skew multiplier: base * error_urgency * time_urgency * vol_skew_mult
-    // This gives stronger skew when:
-    // - Error is large (error_urgency)
-    // - We've been away from target for more than 5 minutes (time_urgency)
-    // - Volatility is moderate (vol_skew_mult), but weak in extreme vol (risk-averse)
-    // INVENTORY_SKEW_MULT is now conservative (0.5) to preserve spread capture
-    // Scale down further to ensure at least 5 minutes to reach target
-    double base_skew_scale = 1.0 / (MIN_RESET_TIME_STEPS / 100.0);  // Scale to allow 600 steps for full error
-    double adaptive_skew_mult = INVENTORY_SKEW_MULT * base_skew_scale * error_urgency * time_urgency_base * vol_skew_mult;
-    
-    // Skew factor: positive when too long (need to sell), negative when too short (need to buy)
-    // inventory_error > 0 means too long → need to sell → positive skew (widen bid, tighten ask)
-    // inventory_error < 0 means too short → need to buy → negative skew (tighten bid, widen ask)
-    // So skew_factor should have the SAME sign as inventory_error
-    double skew_factor = inventory_error * adaptive_skew_mult;
-    
-    // Apply skew: adjust spreads to push toward target
-    // Positive skew_factor (too long, need to sell) → widen bid, tighten ask
-    // Negative skew_factor (too short, need to buy) → tighten bid, widen ask
-    // Use percentage of current spread (not base) so skew scales with wide spreads during volatility
-    double avg_spread_bps = (bid_spread_bps + ask_spread_bps) * 0.5;
-    
-    // Compute skew adjustment as percentage of average spread
-    // Cap at 50% to preserve spread capture opportunity (round-trips still possible)
-    double skew_adjustment_bps = std::abs(skew_factor) * avg_spread_bps;
-    double max_adjustment = avg_spread_bps * 0.5;  // Max 50% of spread can be adjusted
-    skew_adjustment_bps = std::min(skew_adjustment_bps, max_adjustment);
-    
-    // Apply opposite adjustments to create asymmetry:
-    // Positive skew_factor (too long, need to sell) → widen bid (+), tighten ask (-)
-    // Negative skew_factor (too short, need to buy) → tighten bid (-), widen ask (+)
-    // Since skew_factor has the same sign as inventory_error, we use it directly
-    if (skew_factor > 0) {
-        // Too long: widen bid, tighten ask
-        bid_spread_bps += skew_adjustment_bps;
-        ask_spread_bps -= skew_adjustment_bps;
-    } else if (skew_factor < 0) {
-        // Too short: tighten bid, widen ask
-        bid_spread_bps -= skew_adjustment_bps;
-        ask_spread_bps += skew_adjustment_bps;
-    }
-    // If skew_factor == 0, no adjustment needed
-
-    // Ensure minimum spreads (safety floor)
-    bid_spread_bps = std::max(bid_spread_bps, base_spread_bps * MIN_SPREAD_MULT);
-    ask_spread_bps = std::max(ask_spread_bps, base_spread_bps * MIN_SPREAD_MULT);
-    
-    // === Step 5: Convert spreads to price units and place quotes ===
-    // Agent controls FULL spreads (distance from mid to quote)
-    // No division by 2 - bid_spread_bps is already the full distance from mid
-    double bid_spread_price = mid_price * bid_spread_bps / 10000.0;
-    double ask_spread_price = mid_price * ask_spread_bps / 10000.0;
-    
-    double bid_price = mid_price - bid_spread_price;
-    double ask_price = mid_price + ask_spread_price;
-    
-    // === Step 6: Safety checks ===
-    // REMOVED: 1 bps minimum floor - let agent learn consequences of tight spreads
+    // Quotes are placed around mid price
+    double bid_price = mid_price - bid_spread;
+    double ask_price = mid_price + ask_spread;
+   
     // Agent will experience adverse selection if quoting too tight, which is the learning signal
     
     // Only ensure minimum spread of 1 tick between bid and ask (hard floor)
@@ -278,7 +225,7 @@ std::pair<double, double> Strategy::computeQuoteSizes(
     const RLAction& action,
     double init_balance) {
     
-    constexpr double SIZE_PER_LEVEL_PCT = 5;
+    constexpr double SIZE_PER_LEVEL_PCT = 1;
     double size_usd = SIZE_PER_LEVEL_PCT / 100.0 * init_balance;
     
     return {size_usd, size_usd};
@@ -329,17 +276,19 @@ void Strategy::quote(const RLAction& action,
     // Update volatility estimate for spread adjustment
     updateVolatility(mid_price);
     
-    // Compute base quote prices (for level 1)
+    // Compute base quote prices (for level 1) - A-S model returns quotes around reservation_price
     auto [base_bid_price, base_ask_price] = computeQuotePrices(action, mid_price, leverage, tick_size);
     auto [level_size, _] = computeQuoteSizes(action, initBalance);
     
-    // Calculate spreads from mid for ladder spacing
-    double bid_spread_from_mid = mid_price - base_bid_price;  // Positive value
-    double ask_spread_from_mid = base_ask_price - mid_price;  // Positive value
+    // A-S model places quotes around reservation_price, not mid_price
+    // Calculate spreads from reservation_price (center of A-S quotes) for ladder spacing
+    double reservation_price = (base_bid_price + base_ask_price) * 0.5;  // Center of A-S quotes
+    double bid_spread_from_res = reservation_price - base_bid_price;  // Positive value
+    double ask_spread_from_res = base_ask_price - reservation_price;  // Positive value
     
     // Ensure minimum spread of 1 tick
-    bid_spread_from_mid = std::max(bid_spread_from_mid, tick_size);
-    ask_spread_from_mid = std::max(ask_spread_from_mid, tick_size);
+    bid_spread_from_res = std::max(bid_spread_from_res, tick_size);
+    ask_spread_from_res = std::max(ask_spread_from_res, tick_size);
     
     // Cancel existing orders before placing new ones
     exchange.cancelOrders();
@@ -355,17 +304,17 @@ void Strategy::quote(const RLAction& action,
     
     // Store first level prices for diagnostics
     last_mid_price = mid_price;
-    last_bid_price = can_place_bids ? (mid_price - bid_spread_from_mid) : 0.0;
-    last_ask_price = can_place_asks ? (mid_price + ask_spread_from_mid) : 0.0;
+    last_bid_price = can_place_bids ? base_bid_price : 0.0;
+    last_ask_price = can_place_asks ? base_ask_price : 0.0;
     
-    // Place ladder of orders
+    // Place ladder of orders around reservation_price (A-S model center)
     for (int level = 1; level <= NUM_LEVELS; ++level) {
-        // Spread increases with level: 1x, 2x, 3x, 4x, 5x base spread
-        double level_bid_spread = bid_spread_from_mid * level;
-        double level_ask_spread = ask_spread_from_mid * level;
+        // Spread increases with level: 1x, 2x, 3x base spread from reservation_price
+        double level_bid_spread = bid_spread_from_res * level;
+        double level_ask_spread = ask_spread_from_res * level;
         
-        double bid_price = mid_price - level_bid_spread;
-        double ask_price = mid_price + level_ask_spread;
+        double bid_price = reservation_price - level_bid_spread;
+        double ask_price = reservation_price + level_ask_spread;
         
         // Round to tick size
         bid_price = std::floor(bid_price / tick_size) * tick_size;

@@ -16,6 +16,8 @@
 
 #include <memory>
 #include <cmath>
+#include <deque>
+#include <vector>
 
 #include "base_exchange.h"
 #include "orderbook.h"
@@ -31,18 +33,21 @@ namespace RLTrader {
         double base_spread_bps = 5.0;         // Base spread in basis points (5 bps = 0.05%)
     };
 
-    // RL action outputs - 4-action space (skew removed - determined automatically from inventory error)
+    // RL action outputs - 4-action space (bid_spread, ask_spread, target_inventory, risk_aversion)
     struct RLAction {
-        // Bid spread control: [-1, 1] → multiplier on base spread for bid side
-        double bid_spread = 0.0;             // Tighten (<0) or widen (>0) bid spread
+        // Bid spread control: [0, 1] → multiplier on base spread for bid side
+        double bid_spread = 0.0;
         
-        // Ask spread control: [-1, 1] → multiplier on base spread for ask side
-        double ask_spread = 0.0;             // Tighten (<0) or widen (>0) ask spread
+        // Ask spread control: [0, 1] → multiplier on base spread for ask side
+        double ask_spread = 0.0;
         
-        // Target inventory: [-1, 1] → scaled to ±10% target leverage
+        // Target inventory: [-1, 1] → scaled to ±target_range target leverage
         // Positive = target long position, Negative = target short position
-        // Skew is automatically computed from (current_leverage - target) to push toward target
         double target_inventory = 0.0;
+        
+        // Risk aversion parameter (γ) for Avellaneda-Stoikov model: [0, 1]
+        // Higher γ = more risk averse = wider spreads and stronger inventory adjustment
+        double risk_aversion = 0.5;
         
         // Requote decision: >0 means requote, <=0 means keep existing orders
         double should_requote = 0.0;
@@ -67,13 +72,14 @@ namespace RLTrader {
         double getLastBidPrice() const { return last_bid_price; }
         double getLastAskPrice() const { return last_ask_price; }
         double getLastMidPrice() const { return last_mid_price; }
-        double getVolatility() const { return realized_vol; }
+        double getVolatility() const { return vol_2min_; }
         double getTargetInventory() const { return target_inventory_ema; }
+        double getRiskAversion() const { return risk_aversion_ema; }
         bool hitLeverageLimit() const { return hit_leverage_limit_; }
         int getStepsSinceLastFill() const { return steps_since_last_fill_; }
         
-        // Update smoothed target inventory (EMA smoothing to prevent flickering)
-        void updateTargetInventory(double target_inventory_action);
+        // Update smoothed target inventory and risk aversion (EMA smoothing to prevent flickering)
+        void updateTargetInventory(double target_inventory_action, double risk_aversion_action);
         
         // Process fills from exchange
         void next();
@@ -110,16 +116,18 @@ namespace RLTrader {
         int max_ticks;
         
         // State variables
-        double target_inventory_ema = 0.0;    // Smoothed target inventory (clamped to [-0.1, +0.1])
+        double target_inventory_ema = 0.0;    // Smoothed target inventory (clamped to [-target_range, +target_range])
+        double risk_aversion_ema = 0.5;       // Smoothed risk aversion parameter (γ) for A-S model [0, 1]
         
         // Track last placed quote prices for diagnostics
         double last_bid_price = 0.0;
         double last_ask_price = 0.0;
         double last_mid_price = 0.0;
         
-        // Volatility tracking (EMA of squared returns)
-        double prev_mid_price = 0.0;
-        double realized_vol = 0.0;            // EMA volatility estimate
+        // Volatility tracking (2-minute window)
+        std::deque<double> price_history_;    // Price history for 2-minute volatility calculation
+        double vol_2min_ = 0.0;               // 2-minute volatility estimate
+        static constexpr int VOL_WINDOW_STEPS = 240;  // 2 minutes = 240 steps at 0.5s per step
         
         // Inventory skew urgency tracking (time-based)
         double prev_inventory_error_ = 0.0;   // Previous inventory error for tracking persistence
@@ -141,7 +149,6 @@ namespace RLTrader {
         // Model parameters
         static constexpr double TARGET_EMA_ALPHA = 0.0058;   // Target inventory smoothing (120 step half-life = 60 sec)
         // Alpha = 0.0058 gives half-life of ~120 steps: 0.5 = (1 - alpha)^n → n ≈ 120 
-        static constexpr double VOL_EMA_ALPHA = 0.01;        // Volatility EMA (~100 sample half-life)
         static constexpr double VOL_SPREAD_MULT = 50.0;      // How much volatility widens spread
         static constexpr double INVENTORY_SKEW_MULT = 0.5;  // Conservative skew: max 50% of spread can be adjusted (preserves spread capture)
         static constexpr double MAX_SPREAD_MULT = 50.0;      // Maximum spread multiplier from action (allows huge spreads for liquidity crunches)

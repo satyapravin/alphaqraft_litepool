@@ -178,10 +178,7 @@ class MMAgent(nn.Module):
             return action, log_prob, value, hidden
         
         # Sample spreads from Gaussian with temperature scaling
-        # Clamp log_std to prevent explosion: [-5, 2] → std range [0.0067, 7.39]
-        # Max clamp prevents std from exploding (which makes policy completely random)
-        log_std_clamped = torch.clamp(self.spread_log_std, min=-5.0, max=2.0)
-        spread_std = torch.exp(log_std_clamped).expand_as(spread_mean) * temperature
+        spread_std = torch.exp(self.spread_log_std).expand_as(spread_mean) * temperature
         spread_dist = torch.distributions.Normal(spread_mean, spread_std)
         action = spread_dist.sample()
         action = torch.clamp(action, 0, 1)  # Clamp to [0, 1] range
@@ -210,10 +207,7 @@ class MMAgent(nn.Module):
         """
         spread_mean, value, _ = self.forward(market_obs, hidden)
         
-        # Clamp log_std to prevent explosion: [-5, 2] → std range [0.0067, 7.39]
-        # Max clamp prevents std from exploding (which makes policy completely random)
-        log_std_clamped = torch.clamp(self.spread_log_std, min=-5.0, max=2.0)
-        spread_std = torch.exp(log_std_clamped).expand_as(spread_mean)
+        spread_std = torch.exp(self.spread_log_std).expand_as(spread_mean)
         spread_dist = torch.distributions.Normal(spread_mean, spread_std)
         log_prob = spread_dist.log_prob(actions).sum(dim=-1, keepdim=True)
         entropy = spread_dist.entropy().sum(dim=-1, keepdim=True)

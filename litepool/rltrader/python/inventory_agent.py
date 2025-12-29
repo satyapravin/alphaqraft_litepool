@@ -9,7 +9,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, Optional
 
 
 class InventoryAgent(nn.Module):
@@ -29,21 +29,24 @@ class InventoryAgent(nn.Module):
         - Trade signals: volume_imbalance, trade_intensity, buy_pressure, sell_pressure (4)
     
     Output:
-        - target_inventory: [-0.1, 0.1] (single continuous action)
+        - target_inventory: [-0.1, 0.1] (target leverage)
+        - risk_aversion: [0, 1] (risk aversion parameter γ for A-S model)
     """
     
     def __init__(
         self,
         obs_dim: int = 12,
         hidden_dims: Tuple[int, ...] = (64, 32),
+        lstm_hidden: int = 32,
         target_range: float = 0.1,  # Max leverage target
     ):
         super().__init__()
         
         self.obs_dim = obs_dim
         self.target_range = target_range
+        self.lstm_hidden = lstm_hidden
         
-        # Build MLP layers
+        # Build MLP encoder layers
         layers = []
         prev_dim = obs_dim
         for hidden_dim in hidden_dims:
@@ -56,12 +59,20 @@ class InventoryAgent(nn.Module):
         
         self.encoder = nn.Sequential(*layers)
         
-        # Actor head: outputs mean and log_std for target_inventory
-        self.actor_mean = nn.Linear(prev_dim, 1)
-        self.actor_log_std = nn.Parameter(torch.zeros(1))
+        # LSTM for temporal patterns (helps reduce flipping by learning sequences)
+        self.lstm = nn.LSTM(
+            input_size=prev_dim,  # Last hidden_dim from encoder
+            hidden_size=lstm_hidden,
+            num_layers=1,
+            batch_first=True,
+        )
+        
+        # Actor head: outputs mean for target_inventory and risk_aversion
+        self.actor_mean = nn.Linear(lstm_hidden, 2)  # [target_inventory, risk_aversion]
+        self.actor_log_std = nn.Parameter(torch.zeros(2))  # Separate log_std for each output
         
         # Critic head: outputs value estimate
-        self.critic = nn.Linear(prev_dim, 1)
+        self.critic = nn.Linear(lstm_hidden, 1)
         
         # Initialize weights
         self._init_weights()
@@ -77,98 +88,159 @@ class InventoryAgent(nn.Module):
                     # Hidden layers: use standard gain
                     nn.init.orthogonal_(m.weight, gain=1.0)
                 if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+                    if 'actor_mean' in name:
+                        # Initialize bias to output 0 for target_inventory (first output)
+                        # For tanh(0.3 * (Wx + b)) to be 0, we want b[0] ≈ 0
+                        # Since weights are small (gain=0.01), b[0] = 0 should give near-zero output
+                        # b[1] for risk_aversion: sigmoid(0) = 0.5, so keep at 0
+                        nn.init.zeros_(m.bias)
+                    else:
+                        nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LSTM):
+                # Initialize LSTM weights with standard gain
+                for name_param, param in m.named_parameters():
+                    if 'weight_ih' in name_param:
+                        nn.init.orthogonal_(param, gain=1.0)
+                    elif 'weight_hh' in name_param:
+                        nn.init.orthogonal_(param, gain=1.0)
+                    elif 'bias' in name_param:
+                        nn.init.zeros_(param)
+                        # Set forget gate bias to 1 (helps with gradient flow)
+                        n = param.size(0)
+                        param.data[n//4:n//2].fill_(1.0)
     
-    def forward(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, 
+        obs: torch.Tensor,
+        lstm_hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Forward pass.
         
         Args:
-            obs: Inventory observations [batch, obs_dim]
+            obs: Inventory observations [batch, obs_dim] or [batch, seq_len, obs_dim]
+            lstm_hidden: LSTM hidden state (h, c) tuple, or None for initial state
             
         Returns:
-            action_mean: Target inventory mean [batch, 1]
-            value: State value estimate [batch, 1]
+            action_mean: [target_inventory, risk_aversion] [batch, 2] or [batch, seq_len, 2]
+            value: State value estimate [batch, 1] or [batch, seq_len, 1]
+            lstm_hidden: Updated LSTM hidden state (h, c) tuple
         """
-        features = self.encoder(obs)
+        # Encode observations
+        features = self.encoder(obs)  # [batch, hidden_dim] or [batch, seq_len, hidden_dim]
         
-        # Actor: mean of target_inventory, scaled to [-target_range, target_range]
-        # Scale actor_mean output by 0.5 before tanh to prevent saturation and encourage smoother actions
-        # This allows the network to output intermediate values more easily
-        raw_mean = self.actor_mean(features) * 0.5
-        action_mean = torch.tanh(raw_mean) * self.target_range
+        # Add sequence dimension if needed (for single timestep)
+        if features.dim() == 2:
+            features = features.unsqueeze(1)  # [batch, 1, hidden_dim]
+            squeeze_output = True
+        else:
+            squeeze_output = False
+        
+        # LSTM forward pass
+        if lstm_hidden is None:
+            # Initialize hidden state if not provided
+            batch_size = features.shape[0]
+            lstm_hidden = self._init_hidden(batch_size, features.device)
+        
+        lstm_out, lstm_hidden = self.lstm(features, lstm_hidden)  # [batch, seq_len, lstm_hidden]
+        
+        # Remove sequence dimension if we added it
+        if squeeze_output:
+            lstm_out = lstm_out.squeeze(1)  # [batch, lstm_hidden]
+        
+        # Actor: outputs [target_inventory, risk_aversion]
+        # Use smaller scaling (0.3 instead of 0.5) to prevent saturation and encourage learning from 0
+        # With small weights (gain=0.01) and bias=0, initial output should be near 0
+        raw_mean = self.actor_mean(lstm_out) * 0.3
+        raw_mean = torch.tanh(raw_mean)
+        
+        # target_inventory: [-target_range, target_range]
+        # Initial output will be near 0 (neutral position), then learn from there
+        target_inv_mean = raw_mean[:, 0:1] * self.target_range
+        
+        # risk_aversion: [0, 1] using sigmoid (already in correct range)
+        risk_aversion_mean = torch.sigmoid(raw_mean[:, 1:2])
+        
+        action_mean = torch.cat([target_inv_mean, risk_aversion_mean], dim=-1)
         
         # Critic: value estimate
-        value = self.critic(features)
+        value = self.critic(lstm_out)
         
-        return action_mean, value
+        return action_mean, value, lstm_hidden
+    
+    def _init_hidden(self, batch_size: int, device: torch.device):
+        """Initialize LSTM hidden state."""
+        h = torch.zeros(1, batch_size, self.lstm_hidden, device=device)
+        c = torch.zeros(1, batch_size, self.lstm_hidden, device=device)
+        return (h, c)
     
     def get_action(
         self, 
         obs: torch.Tensor, 
+        lstm_hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         deterministic: bool = False,
         temperature: float = 1.0,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Sample action for execution.
         
         Args:
             obs: Observations [batch, obs_dim]
+            lstm_hidden: LSTM hidden state (h, c) tuple, or None for initial state
             deterministic: If True, return mean (no exploration)
             temperature: Scale exploration noise (0.0 = deterministic, 1.0 = full exploration)
             
         Returns:
-            action: Sampled target_inventory [batch, 1]
+            action: [target_inventory, risk_aversion] [batch, 2]
             log_prob: Log probability of action [batch, 1]
             value: State value [batch, 1]
+            lstm_hidden: Updated LSTM hidden state (h, c) tuple
         """
-        action_mean, value = self.forward(obs)
+        action_mean, value, lstm_hidden = self.forward(obs, lstm_hidden)
         
         if temperature == 0.0:
             # Fully deterministic: use means (regardless of deterministic flag)
-            return action_mean, torch.zeros_like(action_mean), value
+            return action_mean, torch.zeros_like(action_mean), value, lstm_hidden
         
         # Sample from Gaussian with temperature scaling
-        # Clamp log_std to prevent explosion: [-5, 1.5] → std range [0.0067, 4.48]
-        # Max clamp prevents std from exploding (which makes policy completely random)
-        log_std_clamped = torch.clamp(self.actor_log_std, min=-5.0, max=1.5)
-        std = torch.exp(log_std_clamped).expand_as(action_mean) * temperature
+        std = torch.exp(self.actor_log_std).expand_as(action_mean) * temperature
         dist = torch.distributions.Normal(action_mean, std)
         action = dist.sample()
-        log_prob = dist.log_prob(action)
+        log_prob = dist.log_prob(action).sum(dim=-1, keepdim=True)  # Sum log probs for both outputs
         
-        # Clamp action to valid range
-        action = torch.clamp(action, -self.target_range, self.target_range)
+        # Clamp actions to valid ranges
+        target_inv = torch.clamp(action[:, 0:1], -self.target_range, self.target_range)
+        risk_aversion = torch.clamp(action[:, 1:2], 0.0, 1.0)
+        action = torch.cat([target_inv, risk_aversion], dim=-1)
         
-        return action, log_prob, value
+        return action, log_prob, value, lstm_hidden
     
     def evaluate_actions(
         self, 
         obs: torch.Tensor, 
-        actions: torch.Tensor
+        actions: torch.Tensor,
+        lstm_hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Evaluate log probability and entropy of actions (for PPO update).
         
         Args:
-            obs: Observations [batch, obs_dim]
-            actions: Actions taken [batch, 1]
+            obs: Observations [batch, obs_dim] or [batch, seq_len, obs_dim]
+            actions: Actions taken [batch, 2] or [batch, seq_len, 2] - [target_inventory, risk_aversion]
+            lstm_hidden: LSTM hidden state (h, c) tuple, or None for initial state
             
         Returns:
-            log_prob: Log probability [batch, 1]
-            entropy: Action entropy [batch, 1]
-            value: State value [batch, 1]
+            log_prob: Log probability [batch, 1] or [batch, seq_len, 1]
+            entropy: Action entropy [batch, 1] or [batch, seq_len, 1]
+            value: State value [batch, 1] or [batch, seq_len, 1]
         """
-        action_mean, value = self.forward(obs)
+        action_mean, value, _ = self.forward(obs, lstm_hidden)
         
-        # Clamp log_std to prevent explosion: [-5, 1.5] → std range [0.0067, 4.48]
-        # Max clamp prevents std from exploding (which makes policy completely random)
-        log_std_clamped = torch.clamp(self.actor_log_std, min=-5.0, max=1.5)
-        std = torch.exp(log_std_clamped).expand_as(action_mean)
+        std = torch.exp(self.actor_log_std).expand_as(action_mean)
         dist = torch.distributions.Normal(action_mean, std)
         
-        log_prob = dist.log_prob(actions)
-        entropy = dist.entropy()
+        log_prob = dist.log_prob(actions).sum(dim=-1, keepdim=True)  # Sum log probs for both outputs
+        entropy = dist.entropy().sum(dim=-1, keepdim=True)  # Sum entropy for both outputs
         
         return log_prob, entropy, value
     

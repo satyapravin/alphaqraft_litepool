@@ -36,6 +36,13 @@
 namespace fs = std::filesystem;
 namespace rltrader {
 
+// Soft clipping function that preserves gradients
+// Linear within [-threshold, threshold], soft beyond
+inline double softsign_clip(double x, double threshold = 1.0) {
+    double scale = threshold;
+    return scale * (x / scale) / (1.0 + std::abs(x / scale));
+}
+
 class RlTraderEnvFns {
  public:
   static decltype(auto) DefaultConfig() {
@@ -68,6 +75,7 @@ class RlTraderEnvFns {
                     "info:realized_pnl"_.Bind(Spec<double>({-1})),
                     "info:leverage"_.Bind(Spec<double>({-1})),
                     "info:target_inventory"_.Bind(Spec<double>({-1})),  // Agent's desired inventory level (EMA smoothed)
+                    "info:risk_aversion"_.Bind(Spec<double>({-1})),  // Risk aversion parameter (γ) for A-S model
                     "info:trade_count"_.Bind(Spec<double>({-1})),
                     "info:buy_trades"_.Bind(Spec<double>({-1})),
                     "info:sell_trades"_.Bind(Spec<double>({-1})),
@@ -102,10 +110,10 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) ActionSpec(const Config& conf) {
-    // 3-action space: bid_spread, ask_spread, target_inventory
+    // 4-action space: bid_spread, ask_spread, target_inventory, risk_aversion
     // Note: requote removed - we use smart requote (only when prices change by >5 ticks)
-    return MakeDict("action"_.Bind(Spec<float>({3}, {{  0.,  0., -1. },
-                                                     {  1.,  1.,  1. }})));
+    return MakeDict("action"_.Bind(Spec<float>({4}, {{  0.,  0., -1.,  0.0 },
+                                                     {  1.,  1.,  1.,  1.0 }})));
   }
 };
 
@@ -142,9 +150,8 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   double prev_fees = 0.0;                 // For mm_reward (fee rebates)
   double prev_spread_capture = 0.0;       // For mm_reward (LIFO round-trip profit)
   double initial_balance_ = 0.0;          // Store initial balance for consistent reward scaling
-  double inv_reward_ema_ = 0.0;           // EMA of inventory reward for smoothing (reduces noise in strategic signal)
   double prev_flow_misalignment_ = 0.0;   // Flow misalignment tracking for delta penalty
-					  
+  
   // Terminal info cache (stores metrics before reset for episode logging)
   std::unordered_map<std::string, double> terminal_info_;
   bool has_terminal_info_ = false;
@@ -223,7 +230,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   }
 
   void Reset() override {
-    ResetInternal();
+        ResetInternal();
   }
   
   void ResetInternal() {
@@ -238,7 +245,6 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     prev_fees = 0.0;
     prev_spread_capture = 0.0;
     initial_balance_ = balance;  // Store initial balance for consistent reward scaling
-    inv_reward_ema_ = 0.0;       // Reset EMA smoothing
     prev_flow_misalignment_ = 0.0;  // Reset flow misalignment tracking
     steps = 0;
     had_fills_prev_step_ = false;  // Reset fill tracking
@@ -250,19 +256,19 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     long long book_start_timestamp = 0;
     
     // Reset exchange first (picks random starting row)
-    exchange_ptr->reset();
+        exchange_ptr->reset();
     
     // Get starting timestamp from book reader to sync trade reader
     if (!reset_failed) {
         RLTrader::SimExchange* sim_exch = dynamic_cast<RLTrader::SimExchange*>(exchange_ptr.get());
         if (sim_exch) {
-            // Peek at first timestamp without consuming the row
-            // CRITICAL: hasData() checks if dataReader.hasNext(), which ensures rows is populated
-            // Only call peekFirstTimestamp() if hasData() returns true
-            if (sim_exch->hasData()) {
-                book_start_timestamp = sim_exch->peekFirstTimestamp();
-            } else {
-                // No data available after reset - this should not happen if CSV has enough data
+                // Peek at first timestamp without consuming the row
+                // CRITICAL: hasData() checks if dataReader.hasNext(), which ensures rows is populated
+                // Only call peekFirstTimestamp() if hasData() returns true
+                if (sim_exch->hasData()) {
+                    book_start_timestamp = sim_exch->peekFirstTimestamp();
+                } else {
+                    // No data available after reset - this should not happen if CSV has enough data
                 reset_failed = true;
             }
         }
@@ -270,14 +276,14 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     
     // Reset adaptor (which will reset trade reader if present)
     if (!reset_failed) {
-        adaptor_ptr->reset();
-        
-        // Sync trade reader to book's starting timestamp
-        if (book_start_timestamp > 0) {
-            adaptor_ptr->syncTradeReader(book_start_timestamp);
-        }
-        
-        isDone = false;
+            adaptor_ptr->reset();
+            
+            // Sync trade reader to book's starting timestamp
+            if (book_start_timestamp > 0) {
+                adaptor_ptr->syncTradeReader(book_start_timestamp);
+            }
+            
+            isDone = false;
     }
     
     // CRITICAL: ALWAYS call WriteState at end of Reset
@@ -287,7 +293,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   }
 
   void Step(const Action& action_dict) override { 
-      StepInternal(action_dict);
+          StepInternal(action_dict);
   }
   
   void StepInternal(const Action& action_dict) {
@@ -299,15 +305,16 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
       
       ++step_count;  // Keep counter for potential future use 
       RLTrader::RLAction action;
-      // 3-action space: bid_spread, ask_spread, target_inventory
+      // 4-action space: bid_spread, ask_spread, target_inventory, risk_aversion
       // Requote is handled automatically (only when prices change by >5 ticks)
       action.bid_spread       = static_cast<double>(action_dict["action"_][0]);
       action.ask_spread       = static_cast<double>(action_dict["action"_][1]);
       action.target_inventory = static_cast<double>(action_dict["action"_][2]);
+      action.risk_aversion    = static_cast<double>(action_dict["action"_][3]);
       action.should_requote   = 0.0;  // Not used - smart requote logic handles this
       
-      // Update target inventory (direct assignment, no smoothing)
-      strategy_ptr->updateTargetInventory(action.target_inventory);
+      // Update target inventory and risk aversion (direct assignment, no smoothing)
+      strategy_ptr->updateTargetInventory(action.target_inventory, action.risk_aversion);
       
       // === SMART REQUOTE LOGIC ===
       // Requote is handled automatically (no agent action) to prevent gaming.
@@ -431,7 +438,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     State state = Allocate(1);
     
     std::array<double, RLTrader::OBS_DIM> data;
-    adaptor_ptr->getState(data);
+        adaptor_ptr->getState(data);
     
     std::unordered_map<std::string, double> info;
     adaptor_ptr->getInfo(info);
@@ -443,6 +450,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     state["info:realized_pnl"_] = info["realized_pnl"];
     state["info:leverage"_] = info["leverage"];
     state["info:target_inventory"_] = info["target_inventory"];  // Agent's desired inventory level (EMA smoothed)
+    state["info:risk_aversion"_] = info["risk_aversion"];  // Risk aversion parameter (γ) for A-S model
     state["info:trade_count"_] = info["trade_count"];
     state["info:buy_trades"_] = info["buy_trades"];
     state["info:sell_trades"_] = info["sell_trades"];
@@ -589,14 +597,8 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
         inv_reward_instant = inv_reward_raw;
     }
     
-    // EMA smoothing for inventory reward (reduces noise in strategic signal)
-    // Alpha = 0.3 gives ~2.3 step half-life, smoothing over ~5-10 steps
-    // This aligns with inventory agent's update frequency (every 5 steps)
-    // and reduces variance in the weak reward signal
-    constexpr double INV_REWARD_EMA_ALPHA = 0.3;
-    inv_reward_ema_ = INV_REWARD_EMA_ALPHA * inv_reward_instant + 
-                      (1.0 - INV_REWARD_EMA_ALPHA) * inv_reward_ema_;
-    double inv_reward = inv_reward_ema_;
+    // No EMA smoothing needed - inventory agent updates every step now
+    double inv_reward = inv_reward_instant;
    
     // Cumulative flow alignment penalty: guide inventory agent to follow flow direction
     double cumulative_flow_signal = data[16];  // Normalized cumulative flow [-1, 1] from observation
@@ -625,10 +627,11 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     // Apply penalties to inventory reward
     double inv_reward_with_penalties = inv_reward + flow_alignment_penalty;
     
-    // Clip final rewards to prevent extreme values from dominating learning
-    // Clipping to [-2, 2] ensures stable learning without outlier amplification
-    double mm_reward_clipped = std::clamp(mm_reward, -2.0, 2.0);
-    double inv_reward_clipped = std::clamp(inv_reward_with_penalties, -2.0, 2.0);
+    // Soft clip final rewards to prevent extreme values from dominating learning
+    // Soft clipping preserves gradients better than hard clipping
+    // Threshold of 2.0: linear within [-2, 2], soft beyond
+    double mm_reward_clipped = softsign_clip(mm_reward, 2.0);
+    double inv_reward_clipped = softsign_clip(inv_reward_with_penalties, 2.0);
     
     state["info:mm_reward"_] = mm_reward_clipped;
     state["info:inv_reward"_] = inv_reward_clipped;

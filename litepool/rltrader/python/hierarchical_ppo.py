@@ -28,6 +28,26 @@ import gc
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from collections import deque
+
+
+def robust_normalize(advantages):
+    """
+    Use median and IQR instead of mean/std.
+    Much more robust to outliers.
+    """
+    median = torch.median(advantages)
+    q75 = torch.quantile(advantages, 0.75)
+    q25 = torch.quantile(advantages, 0.25)
+    iqr = q75 - q25
+    
+    if iqr < 1e-8:
+        return advantages - median
+    
+    # Normalize by IQR (1.349 converts IQR to std for normal dist)
+    normalized = (advantages - median) / (iqr / 1.349)
+    
+    # Soft clip extreme values
+    return torch.tanh(normalized / 5.0) * 5.0
 import time
 from datetime import datetime
 
@@ -46,6 +66,31 @@ print(f"Using device: {device}")
 
 config = HierarchicalConfig()
 
+
+class ValueNormalizer:
+    """Normalizes values to help value function learn with high standard deviations."""
+    def __init__(self, shape, clip_range=10.0):
+        self.mean = torch.zeros(shape)
+        self.std = torch.ones(shape)
+        self.count = 0
+        self.clip_range = clip_range
+        
+    def normalize(self, values):
+        """Normalize values using running statistics."""
+        # Normalize
+        normalized = (values - self.mean.to(values.device)) / (self.std.to(values.device) + 1e-8)
+        # Clip
+        return torch.clamp(normalized, -self.clip_range, self.clip_range)
+    
+    def update(self, batch_values):
+        """Update running statistics with new batch."""
+        # Update running statistics
+        batch_mean = batch_values.mean().item()
+        batch_std = batch_values.std().item()
+        
+        self.mean = 0.99 * self.mean + 0.01 * batch_mean
+        self.std = 0.99 * self.std + 0.01 * batch_std
+        self.count += 1
 
 
 
@@ -75,7 +120,7 @@ class RolloutBuffer:
         return cls(
             observations=np.zeros((n_steps, num_envs, obs_dim), dtype=np.float32),
             actions=np.zeros((n_steps, num_envs, action_dim), dtype=np.float32),
-            inv_actions=np.zeros((n_steps, num_envs, 1), dtype=np.float32),
+            inv_actions=np.zeros((n_steps, num_envs, 2), dtype=np.float32),  # target_inventory, risk_aversion
             mm_rewards=np.zeros((n_steps, num_envs), dtype=np.float32),
             inv_rewards=np.zeros((n_steps, num_envs), dtype=np.float32),
             dones=np.zeros((n_steps, num_envs), dtype=np.float32),
@@ -88,12 +133,17 @@ class RolloutBuffer:
         )
     
     def compute_gae(self, last_values_mm: np.ndarray, last_values_inv: np.ndarray,
-                    gamma: float, gae_lambda: float, inventory_update_freq: int):
+                    gamma: float, gae_lambda: float, inventory_update_freq: int,
+                    clip_delta: float = 2.0, normalize_gae: bool = True):
         """
         Compute GAE for both agents.
         
         For inventory agent: Use effective gamma^update_freq to account for temporal mismatch.
         Decisions are made every update_freq steps, so rewards accumulate over that period.
+        
+        Args:
+            clip_delta: Clip TD errors (delta) to prevent extreme values
+            normalize_gae: Normalize advantages after computation
         """
         n_steps = self.mm_rewards.shape[0]
         num_envs = self.mm_rewards.shape[1]
@@ -108,8 +158,20 @@ class RolloutBuffer:
                 next_values = self.values_mm[t + 1]
             next_non_terminal = 1.0 - self.dones[t]
             delta = self.mm_rewards[t] + gamma * next_values * next_non_terminal - self.values_mm[t]
+            # Clip TD error to prevent extreme values
+            delta = np.clip(delta, -clip_delta, clip_delta)
             self.advantages_mm[t] = last_gae = delta + gamma * gae_lambda * next_non_terminal * last_gae
         self.returns_mm = self.advantages_mm + self.values_mm
+        
+        # Normalize MM advantages if enabled
+        if normalize_gae:
+            mm_advantages_flat = self.advantages_mm.flatten()
+            if len(mm_advantages_flat) > 0:
+                # Convert to torch tensor for robust_normalize
+                mm_advantages_tensor = torch.from_numpy(mm_advantages_flat).float()
+                mm_normalized = robust_normalize(mm_advantages_tensor)
+                # Reshape back to original shape
+                self.advantages_mm = mm_normalized.numpy().reshape(self.advantages_mm.shape)
         
         # GAE for Inventory agent (account for temporal mismatch)
         # Effective discount: gamma^update_freq because decisions happen every update_freq steps
@@ -158,6 +220,8 @@ class RolloutBuffer:
                 
                 # Compute delta and GAE
                 delta = reward_sum + effective_gamma * next_values * next_non_terminal - self.values_inv[t, env_id]
+                # Clip TD error to prevent extreme values
+                delta = np.clip(delta, -clip_delta, clip_delta)
                 gae = delta + effective_gamma * effective_gae_lambda * next_non_terminal * last_gae
                 self.advantages_inv[t, env_id] = gae
                 last_gae = gae
@@ -181,6 +245,33 @@ class RolloutBuffer:
                         self.advantages_inv[intermediate_t, env_id] = gae * decay_factor
         
         self.returns_inv = self.advantages_inv + self.values_inv
+        
+        # Normalize Inventory advantages if enabled
+        if normalize_gae:
+            # Only normalize over decision timesteps for inventory agent
+            inv_decision_advantages = []
+            for env_id in range(num_envs):
+                decision_timesteps = np.where(self.inv_decision_mask[:, env_id] > 0.5)[0]
+                if len(decision_timesteps) > 0:
+                    inv_decision_advantages.extend(self.advantages_inv[decision_timesteps, env_id])
+            
+            if len(inv_decision_advantages) > 0:
+                # Compute statistics on decision timesteps only
+                inv_decision_array = np.array(inv_decision_advantages)
+                inv_median = np.median(inv_decision_array)
+                inv_q75 = np.quantile(inv_decision_array, 0.75)
+                inv_q25 = np.quantile(inv_decision_array, 0.25)
+                inv_iqr = inv_q75 - inv_q25
+                
+                if inv_iqr < 1e-8:
+                    # If IQR is too small, just center by median
+                    self.advantages_inv = self.advantages_inv - inv_median
+                else:
+                    # Apply robust normalization to all advantages using decision timestep statistics
+                    # Normalize by IQR (1.349 converts IQR to std for normal dist)
+                    normalized_all = (self.advantages_inv - inv_median) / (inv_iqr / 1.349)
+                    # Soft clip extreme values
+                    self.advantages_inv = np.tanh(normalized_all / 5.0) * 5.0
 
 
 @dataclass
@@ -234,7 +325,7 @@ class HierarchicalPPOTrainer:
         
         # Rollout buffer
         obs_dim = 40  # 13 market + 4 AMM + 8 trade + 11 agent state + 1 previous spread + 2 bid/ask distances + 1 mid_change
-        action_dim = 3  # bid_spread, ask_spread, target_inventory (requote removed)
+        action_dim = 4  # bid_spread, ask_spread, target_inventory, risk_aversion
         self.buffer = RolloutBuffer.create(
             config.n_steps, config.num_envs, obs_dim, action_dim
         )
@@ -259,6 +350,10 @@ class HierarchicalPPOTrainer:
         self.tb_writer = SummaryWriter(log_dir=f"runs/{run_name}")
         print(f"TensorBoard logging to: runs/{run_name}")
         print("View with: tensorboard --logdir=runs/")
+        
+        # Value normalizers for both agents (helps value function learn with high std)
+        self.value_normalizer_mm = ValueNormalizer(shape=(), clip_range=10.0)
+        self.value_normalizer_inv = ValueNormalizer(shape=(), clip_range=10.0)
     
     def _get_entropy_coef_mm(self) -> float:
         """Get current entropy coefficient for MM agent with annealing."""
@@ -344,7 +439,14 @@ class HierarchicalPPOTrainer:
             # Store experience
             self.buffer.observations[step] = obs
             self.buffer.actions[step] = action
-            self.buffer.inv_actions[step] = info['targets']
+            # Store inventory agent actions: [target_inventory, risk_aversion]
+            targets = info['targets'].squeeze() if info['targets'].ndim > 1 else info['targets']
+            risk_aversion = info.get('risk_aversion', np.ones(self.config.num_envs) * 0.5)
+            if isinstance(risk_aversion, torch.Tensor):
+                risk_aversion = risk_aversion.cpu().numpy()
+            risk_aversion = risk_aversion.squeeze() if hasattr(risk_aversion, 'ndim') and risk_aversion.ndim > 1 else risk_aversion
+            inv_actions = np.column_stack([targets, risk_aversion])
+            self.buffer.inv_actions[step] = inv_actions
             self.buffer.log_probs_mm[step] = info['log_prob_mm'].squeeze()
             self.buffer.log_probs_inv[step] = info['log_prob_inv'].squeeze()
             self.buffer.values_mm[step] = info['value_mm'].squeeze()
@@ -431,7 +533,9 @@ class HierarchicalPPOTrainer:
         self.buffer.compute_gae(
             last_values_mm, last_values_inv,
             self.config.gamma, self.config.gae_lambda,
-            inventory_update_freq=self.config.inventory_update_freq)
+            inventory_update_freq=self.config.inventory_update_freq,
+            clip_delta=self.config.gae_clip_delta,
+            normalize_gae=self.config.normalize_gae)
         
         return last_values_mm, last_values_inv
     
@@ -455,15 +559,7 @@ class HierarchicalPPOTrainer:
         # Decision mask for inventory agent: only train on timesteps where decisions were made
         inv_decision_mask = self.buffer.inv_decision_mask.reshape(n_samples)
         
-        # Normalize advantages (optional - can disable if max >> mean suggests over-normalization)
-        if self.config.normalize_advantages:
-            advantages_mm = (advantages_mm - advantages_mm.mean()) / (advantages_mm.std() + 1e-8)
-            # Only normalize inventory advantages over decision timesteps
-            inv_decision_advantages = advantages_inv[inv_decision_mask > 0.5]
-            if len(inv_decision_advantages) > 0:
-                inv_mean = inv_decision_advantages.mean()
-                inv_std = inv_decision_advantages.std() + 1e-8
-                advantages_inv = (advantages_inv - inv_mean) / inv_std
+        # Advantages are already normalized in compute_gae() if normalize_gae=True
         
         # Convert to tensors
         obs_t = torch.as_tensor(obs_flat, dtype=torch.float32, device=device)
@@ -478,6 +574,10 @@ class HierarchicalPPOTrainer:
         returns_mm_t = torch.as_tensor(returns_mm, dtype=torch.float32, device=device)
         returns_inv_t = torch.as_tensor(returns_inv, dtype=torch.float32, device=device)
         inv_decision_mask_t = torch.as_tensor(inv_decision_mask, dtype=torch.float32, device=device)
+        
+        # Update value normalizers with full batch returns (before minibatching)
+        self.value_normalizer_mm.update(returns_mm_t)
+        self.value_normalizer_inv.update(returns_inv_t)
         
         losses = {'policy_loss_mm': 0, 'value_loss_mm': 0, 'entropy_mm': 0,
                   'policy_loss_inv': 0, 'value_loss_inv': 0, 'entropy_inv': 0,
@@ -534,8 +634,11 @@ class HierarchicalPPOTrainer:
                                        1 + self.config.clip_range) * advantages_mm_batch
                 policy_loss_mm = -torch.min(surr1_mm, surr2_mm).mean()
                 
-                # Value loss with clipping and L2 regularization
-                value_loss_mm = nn.functional.mse_loss(value_mm, returns_mm_batch)
+                # Value loss with normalization, clipping and L2 regularization
+                # Normalize returns to help value function learn with high std
+                returns_mm_normalized = self.value_normalizer_mm.normalize(returns_mm_batch)
+                value_mm_normalized = self.value_normalizer_mm.normalize(value_mm)
+                value_loss_mm = nn.functional.mse_loss(value_mm_normalized, returns_mm_normalized)
                 value_loss_mm = torch.clamp(value_loss_mm, max=self.config.value_loss_clip)
                 
                 # L2 regularization on value function parameters
@@ -554,12 +657,22 @@ class HierarchicalPPOTrainer:
                 
                 self.optimizer_mm.zero_grad()
                 loss_mm.backward()
-                grad_norm_mm = nn.utils.clip_grad_norm_(self.policy.mm_agent.parameters(), 
-                                                       self.config.max_grad_norm)
+                
+                # Clip value function gradients separately (max_norm=0.5)
+                value_grad_norm_mm = nn.utils.clip_grad_norm_(self.policy.mm_agent.critic.parameters(), 
+                                                               max_norm=0.5)
+                # Clip policy and shared network gradients
+                policy_params = list(self.policy.mm_agent.spread_mean.parameters()) + \
+                               list(self.policy.mm_agent.encoder.parameters()) + \
+                               list(self.policy.mm_agent.lstm.parameters())
+                policy_grad_norm_mm = nn.utils.clip_grad_norm_(policy_params, 
+                                                                self.config.max_grad_norm)
+                
+                grad_norm_mm = max(value_grad_norm_mm.item(), policy_grad_norm_mm.item())
                 self.optimizer_mm.step()
                 
                 # Track gradient norm
-                losses['grad_norm_mm'] += grad_norm_mm.item()
+                losses['grad_norm_mm'] += grad_norm_mm
                 
                 # === Update Inventory Agent ===
                 # Only update on timesteps where decisions were actually made
@@ -580,11 +693,11 @@ class HierarchicalPPOTrainer:
                                             1 + self.config.clip_range) * advantages_inv_batch
                     policy_loss_inv = -torch.min(surr1_inv[decision_mask], surr2_inv[decision_mask]).mean()
                     
-                    # Value loss with clipping and L2 regularization (only on decision timesteps)
-                    value_loss_inv = nn.functional.mse_loss(
-                        value_inv[decision_mask], 
-                        returns_inv_batch[decision_mask]
-                    )
+                    # Value loss with normalization, clipping and L2 regularization (only on decision timesteps)
+                    # Normalize returns to help value function learn with high std
+                    returns_inv_normalized = self.value_normalizer_inv.normalize(returns_inv_batch[decision_mask])
+                    value_inv_normalized = self.value_normalizer_inv.normalize(value_inv[decision_mask])
+                    value_loss_inv = nn.functional.mse_loss(value_inv_normalized, returns_inv_normalized)
                     value_loss_inv = torch.clamp(value_loss_inv, max=self.config.value_loss_clip)
                     
                     # L2 regularization on value function parameters
@@ -603,18 +716,27 @@ class HierarchicalPPOTrainer:
                     
                     self.optimizer_inv.zero_grad()
                     loss_inv.backward()
-                    grad_norm_inv = nn.utils.clip_grad_norm_(self.policy.inventory_agent.parameters(),
-                                                             self.config.max_grad_norm)
+                    
+                    # Clip value function gradients separately (max_norm=0.5)
+                    value_grad_norm_inv = nn.utils.clip_grad_norm_(self.policy.inventory_agent.critic.parameters(), 
+                                                                   max_norm=0.5)
+                    # Clip policy and shared network gradients
+                    policy_params_inv = list(self.policy.inventory_agent.actor_mean.parameters()) + \
+                                       list(self.policy.inventory_agent.encoder.parameters())
+                    policy_grad_norm_inv = nn.utils.clip_grad_norm_(policy_params_inv, 
+                                                                    self.config.max_grad_norm)
+                    
+                    grad_norm_inv = max(value_grad_norm_inv.item(), policy_grad_norm_inv.item())
                     self.optimizer_inv.step()
                 else:
                     # No decisions in this batch, skip update
                     policy_loss_inv = torch.tensor(0.0, device=device, requires_grad=False)
                     value_loss_inv = torch.tensor(0.0, device=device, requires_grad=False)
                     loss_inv = torch.tensor(0.0, device=device, requires_grad=False)
-                    grad_norm_inv = torch.tensor(0.0, device=device)
+                    grad_norm_inv = 0.0
                 
                 # Track gradient norm
-                losses['grad_norm_inv'] += grad_norm_inv.item()
+                losses['grad_norm_inv'] += grad_norm_inv
                 
                 # Track losses
                 losses['policy_loss_mm'] += policy_loss_mm.item()
@@ -659,8 +781,8 @@ class HierarchicalPPOTrainer:
                 val = last_info['trade_count']
                 total_trades = int(val.sum()) if isinstance(val, np.ndarray) else int(val)
         
-        # Compute action statistics (3-action space: bid_spread, ask_spread, target)
-        actions = self.buffer.actions.reshape(-1, 3)
+        # Compute action statistics (4-action space: bid_spread, ask_spread, target_inventory, risk_aversion)
+        actions = self.buffer.actions.reshape(-1, 4)
         avg_bid_spread = actions[:, 0].mean()
         avg_ask_spread = actions[:, 1].mean()
         avg_target = actions[:, 2].mean()

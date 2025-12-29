@@ -157,6 +157,7 @@ void EnvAdaptor::computeInfo(OrderBook &book) {
     info["spread_capture"] = posInfo.spreadCapture;  // LIFO spread capture from closed round-trips (for rewards)
     info["leverage"] = posInfo.leverage;
     info["target_inventory"] = strategy.getTargetInventory();  // Agent's desired inventory level
+    info["risk_aversion"] = strategy.getRiskAversion();  // Risk aversion parameter (γ) for A-S model
     info["trade_count"] = static_cast<double>(tradeInfo.buy_trades + tradeInfo.sell_trades);
     info["buy_trades"] = static_cast<double>(tradeInfo.buy_trades);
     info["sell_trades"] = static_cast<double>(tradeInfo.sell_trades);
