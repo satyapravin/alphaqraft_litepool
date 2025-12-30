@@ -189,8 +189,8 @@ std::pair<double, double> Strategy::computeQuotePrices(
     
     // Agent controls bid_spread and ask_spread in [0, 1] range
     // These are base spreads, then we apply inventory adjustment for skewing
-    double bid_action = std::clamp(action.bid_spread, 0.0, 1.0) * vol_2min_ * vol_2min_;
-    double ask_action = std::clamp(action.ask_spread, 0.0, 1.0) * vol_2min_ * vol_2min_;
+    double bid_action = std::clamp(action.bid_spread, 0.0, 1.0) * vol_2min_;
+    double ask_action = std::clamp(action.ask_spread, 0.0, 1.0) * vol_2min_;
     
 
     double bid_spread = bid_action + inventory_adjustment;  // Widen bid when positive error

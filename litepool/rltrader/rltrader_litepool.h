@@ -514,14 +514,17 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     constexpr double INV_REWARD_SCALE = 10000.0; // Scale before log transform (increased from 100.0 to match MM scale)
     constexpr bool USE_LOG_REWARDS = true;        // Use log transform for reward normalization
     
-    // 1. Spread capture delta (LIFO profit from round-trips)
+    // 1. Spread capture from latest fills (LIFO profit from round-trips completed this step)
+    // Use delta to get spread captured in this step only (not cumulative)
     double current_spread_capture = info["spread_capture"];
-    double spread_capture_delta = current_spread_capture - prev_spread_capture;
+    double spread_capture_from_fills = current_spread_capture - prev_spread_capture;
     prev_spread_capture = current_spread_capture;
+    
+    // Normalize by initial balance for reward scaling
     if (initial_balance_ > 1e-9) {
-        spread_capture_delta /= initial_balance_;
+        spread_capture_from_fills /= initial_balance_;
     } else {
-        spread_capture_delta = 0.0;
+        spread_capture_from_fills = 0.0;
     }
     
     // 2. Fee delta - positive when rebates earned (maker fees are negative)
@@ -565,10 +568,10 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     prev_realized_pnl = current_realized_pnl;
     
     // === MM Agent Reward: execution quality ===
-    // spread_capture: LIFO profit from completing round-trips
+    // spread_capture_from_fills: LIFO profit from round-trips completed this step (from latest fills)
     // fee_delta: maker rebates earned from providing liquidity
     // Both are directly controllable by the agent's quoting behavior
-    double mm_reward_raw = (spread_capture_delta + fee_delta) * MM_REWARD_SCALE;
+    double mm_reward_raw = spread_capture_from_fills * MM_REWARD_SCALE;
     
     // Apply log transform if enabled: sign(r) * log(1 + |r|)
     // This compresses large rewards while preserving sign and relative ordering
@@ -578,11 +581,11 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     
     // === Inventory Agent Reward: market direction ===
     // Rewards holding inventory in the right direction (total P&L = realized + unrealized)
-    // Total P&L delta = spread_capture_delta + lifo_unrealized_delta
+    // Total P&L delta = spread_capture_from_fills + lifo_unrealized_delta
     // This gives the inventory agent the full picture of market direction
     // The inventory agent controls WHAT position to hold, so it should see the total impact
-    double total_pnl_delta = spread_capture_delta + lifo_unrealized_delta;
-    double inv_reward_raw = total_pnl_delta * INV_REWARD_SCALE;
+    double total_pnl_delta = spread_capture_from_fills + lifo_unrealized_delta;
+    double inv_reward_raw = (total_pnl_delta + fee_delta) * INV_REWARD_SCALE;
     
     // Apply log transform if enabled
     // CRITICAL: Ensure log transform is actually applied to prevent extreme values

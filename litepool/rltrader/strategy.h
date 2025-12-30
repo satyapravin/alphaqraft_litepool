@@ -142,7 +142,7 @@ namespace RLTrader {
         bool first_call_ = true;               // First call flag (for detecting changes without fills)
         
         // Model parameters
-        static constexpr double TARGET_EMA_ALPHA = 0.00058;   // Target inventory smoothing (120 step half-life = 60 sec)
+        static constexpr double TARGET_EMA_ALPHA = 0.0058;   // Target inventory smoothing (120 step half-life = 60 sec)
         // Alpha = 0.0058 gives half-life of ~120 steps: 0.5 = (1 - alpha)^n → n ≈ 120
     };
 }

@@ -79,11 +79,7 @@ def main():
 
     # Load trained model
     results_dir = Path("results/hierarchical")
-    model_path = results_dir / "best_model.pt"
-    if not model_path.exists():
-        model_path = results_dir / "final_model.pt"
-    if not model_path.exists():
-        model_path = results_dir / "latest.pt"
+    model_path = results_dir / "latest.pt"
     if not model_path.exists():
         raise FileNotFoundError(f"No model found in {results_dir}")
     

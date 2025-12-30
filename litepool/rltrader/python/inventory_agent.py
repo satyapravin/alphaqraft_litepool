@@ -8,6 +8,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from typing import Tuple, Dict, Any, Optional
 from shared_encoder import SharedEncoder, AttentionModule
@@ -53,20 +54,38 @@ class InventoryAgent(nn.Module):
             self.shared_encoder = shared_encoder
             self.owns_encoder = False
         
+        # AMM-specific encoder for inventory agent (emphasizes AMM flow signals)
+        # AMM signals are at indices [13..16]: net_flow, flow_imbalance, inventory_delta, cumulative_flow
+        self.amm_encoder = nn.Sequential(
+            nn.Linear(4, hidden_dim // 2),  # Process 4 AMM signals
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+        )
+        
         # Attention mechanism for Inventory agent (focuses on flow, position, volatility)
-        self.attention = AttentionModule(hidden_dim, attention_heads)
+        # Input is concatenated shared + AMM features, so hidden_dim * 1.5
+        self.attention = AttentionModule(hidden_dim + hidden_dim // 2, attention_heads)
         
         # LSTM for temporal patterns (helps reduce flipping by learning sequences)
+        # Input size is now hidden_dim + hidden_dim//2 (shared + AMM features)
         self.lstm = nn.LSTM(
-            input_size=hidden_dim,
+            input_size=hidden_dim + hidden_dim // 2,
             hidden_size=lstm_hidden,
             num_layers=1,
             batch_first=True,
         )
         
-        # Actor head: outputs mean for target_inventory and risk_aversion
-        self.actor_mean = nn.Linear(lstm_hidden, 2)  # [target_inventory, risk_aversion]
-        self.actor_log_std = nn.Parameter(torch.zeros(2))  # Separate log_std for each output
+        # Actor head: outputs mean and concentration for Beta distribution
+        # Both outputs use Beta distribution (naturally bounded [0, 1])
+        # target_inventory will be transformed to [-target_range, target_range]
+        # risk_aversion stays in [0, 1]
+        self.target_inv_mean = nn.Linear(lstm_hidden, 1)  # Mean for target_inventory Beta
+        self.target_inv_concentration = nn.Linear(lstm_hidden, 1)  # Concentration for target_inventory Beta
+        self.risk_aversion_mean = nn.Linear(lstm_hidden, 1)  # Mean for risk_aversion Beta
+        self.risk_aversion_concentration = nn.Linear(lstm_hidden, 1)  # Concentration for risk_aversion Beta
         
         # Critic head: outputs value estimate
         self.critic = nn.Linear(lstm_hidden, 1)
@@ -75,23 +94,43 @@ class InventoryAgent(nn.Module):
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize weights: gain ~1.0 for hidden layers, 0.01 for output layers."""
+        """Initialize weights: gain ~1.0 for hidden layers, 1.0 for output layers."""
         for name, m in self.named_modules():
             if isinstance(m, nn.Linear):
-                # Output layers (actor_mean, actor_log_std, critic): use small gain
-                if 'actor_mean' in name or 'critic' in name:
+                # Output layers: use standard gain for Beta distribution
+                if 'target_inv_mean' in name:
+                    # Target inventory: initialize to encourage exploration around 0
+                    # Use small gain to start near 0.5 (neutral), but allow learning
+                    nn.init.orthogonal_(m.weight, gain=0.5)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)  # sigmoid(0) = 0.5 (neutral position)
+                elif 'risk_aversion_mean' in name:
+                    # Risk aversion: initialize to encourage exploration
+                    # Use small gain to start near 0.5, but allow learning
+                    nn.init.orthogonal_(m.weight, gain=0.5)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)  # sigmoid(0) = 0.5 (moderate risk)
+                elif 'target_inv_concentration' in name or 'risk_aversion_concentration' in name:
+                    # Lower initial concentration = higher variance = more exploration
+                    # Start with lower concentration to encourage exploration early
+                    nn.init.orthogonal_(m.weight, gain=0.5)
+                    if m.bias is not None:
+                        # softplus(x) + 1.0, want initial concentration ~1.5 (lower = more exploration)
+                        # softplus(0.4) ≈ 0.5, so softplus(0.4) + 1.0 ≈ 1.5
+                        nn.init.constant_(m.bias, 0.4)
+                elif 'amm_encoder' in name:
+                    # AMM encoder: standard initialization
+                    nn.init.orthogonal_(m.weight, gain=1.0)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+                elif 'critic' in name:
                     nn.init.orthogonal_(m.weight, gain=0.01)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
                 else:
                     # Hidden layers: use standard gain
                     nn.init.orthogonal_(m.weight, gain=1.0)
-                if m.bias is not None:
-                    if 'actor_mean' in name:
-                        # Initialize bias to output 0 for target_inventory (first output)
-                        # For tanh(0.3 * (Wx + b)) to be 0, we want b[0] ≈ 0
-                        # Since weights are small (gain=0.01), b[0] = 0 should give near-zero output
-                        # b[1] for risk_aversion: sigmoid(0) = 0.5, so keep at 0
-                        nn.init.zeros_(m.bias)
-                    else:
+                    if m.bias is not None:
                         nn.init.zeros_(m.bias)
             elif isinstance(m, nn.LSTM):
                 # Initialize LSTM weights with standard gain
@@ -119,7 +158,10 @@ class InventoryAgent(nn.Module):
             lstm_hidden: LSTM hidden state (h, c) tuple, or None for initial state
             
         Returns:
-            action_mean: [target_inventory, risk_aversion] [batch, 2] or [batch, seq_len, 2]
+            target_inv_mean: Beta mean for target_inventory [batch, 1] or [batch, seq_len, 1] (in [0, 1])
+            target_inv_concentration: Beta concentration [batch, 1] or [batch, seq_len, 1]
+            risk_aversion_mean: Beta mean for risk_aversion [batch, 1] or [batch, seq_len, 1] (in [0, 1])
+            risk_aversion_concentration: Beta concentration [batch, 1] or [batch, seq_len, 1]
             value: State value estimate [batch, 1] or [batch, seq_len, 1]
             lstm_hidden: Updated LSTM hidden state (h, c) tuple
         """
@@ -135,9 +177,19 @@ class InventoryAgent(nn.Module):
         # Shared encoder processes all observations
         encoded = self.shared_encoder(obs)  # [batch, seq_len, hidden_dim]
         
-        # Apply attention (allows focusing on relevant signals)
+        # Extract AMM signals [13..16]: net_flow, flow_imbalance, inventory_delta, cumulative_flow
+        amm_signals = obs[..., 13:17]  # [batch, seq_len, 4] or [batch, 4]
+        
+        # Process AMM signals separately (inventory agent should rely primarily on AMM)
+        amm_features = self.amm_encoder(amm_signals)  # [batch, seq_len, hidden_dim//2] or [batch, hidden_dim//2]
+        
+        # Concatenate shared encoder output with AMM features
+        # This gives inventory agent direct access to processed AMM signals
+        combined_features = torch.cat([encoded, amm_features], dim=-1)  # [batch, seq_len, hidden_dim + hidden_dim//2]
+        
+        # Apply attention (allows focusing on relevant signals, including AMM)
         # Don't clone here - let attention handle it internally if needed
-        attended = self.attention(encoded)  # [batch, seq_len, hidden_dim]
+        attended = self.attention(combined_features)  # [batch, seq_len, hidden_dim + hidden_dim//2]
         
         # LSTM forward pass
         if lstm_hidden is None:
@@ -156,26 +208,19 @@ class InventoryAgent(nn.Module):
         if add_seq_dim:
             lstm_out = lstm_out.squeeze(1)  # [batch, lstm_hidden]
         
-        # Actor: outputs [target_inventory, risk_aversion]
-        # Use very small scaling (0.05) to prevent saturation and encourage learning from 0
-        # With small weights (gain=0.01) and bias=0, initial output should be near 0
-        # This prevents the network from learning extreme actions too quickly
-        raw_mean = self.actor_mean(lstm_out) * 0.05
-        raw_mean = torch.tanh(raw_mean)
+        # Actor: Beta distribution parameters
+        # Mean via sigmoid (bounded [0, 1])
+        target_inv_mean = torch.sigmoid(self.target_inv_mean(lstm_out))  # [batch, 1] or [batch, seq_len, 1]
+        risk_aversion_mean = torch.sigmoid(self.risk_aversion_mean(lstm_out))  # [batch, 1] or [batch, seq_len, 1]
         
-        # target_inventory: [-target_range, target_range]
-        # Initial output will be near 0 (neutral position), then learn from there
-        target_inv_mean = raw_mean[:, 0:1] * self.target_range
-        
-        # risk_aversion: [0, 1] using sigmoid (already in correct range)
-        risk_aversion_mean = torch.sigmoid(raw_mean[:, 1:2])
-        
-        action_mean = torch.cat([target_inv_mean, risk_aversion_mean], dim=-1)
+        # Concentration via softplus + 1.0 (ensures >= 1.0 for numerical stability)
+        target_inv_concentration = F.softplus(self.target_inv_concentration(lstm_out)) + 1.0
+        risk_aversion_concentration = F.softplus(self.risk_aversion_concentration(lstm_out)) + 1.0
         
         # Critic: value estimate
         value = self.critic(lstm_out)
         
-        return action_mean, value, lstm_hidden
+        return target_inv_mean, target_inv_concentration, risk_aversion_mean, risk_aversion_concentration, value, lstm_hidden
     
     def _init_hidden(self, batch_size: int, device: torch.device):
         """Initialize LSTM hidden state."""
@@ -191,7 +236,7 @@ class InventoryAgent(nn.Module):
         temperature: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Sample action for execution.
+        Sample action for execution using Beta distribution.
         
         Args:
             obs: Observations [batch, obs_dim]
@@ -201,25 +246,62 @@ class InventoryAgent(nn.Module):
             
         Returns:
             action: [target_inventory, risk_aversion] [batch, 2]
+                - target_inventory: [-target_range, target_range] (transformed from Beta [0, 1])
+                - risk_aversion: [0, 1] (direct from Beta)
             log_prob: Log probability of action [batch, 1]
             value: State value [batch, 1]
             lstm_hidden: Updated LSTM hidden state (h, c) tuple
         """
-        action_mean, value, lstm_hidden = self.forward(obs, lstm_hidden)
+        target_inv_mean, target_inv_concentration, risk_aversion_mean, risk_aversion_concentration, value, lstm_hidden = self.forward(obs, lstm_hidden)
         
-        if temperature == 0.0:
-            # Fully deterministic: use means (regardless of deterministic flag)
-            return action_mean, torch.zeros_like(action_mean), value, lstm_hidden
+        if temperature == 0.0 or deterministic:
+            # Fully deterministic: use means
+            # Transform target_inventory: [0, 1] -> [-target_range, target_range]
+            target_inv_beta = target_inv_mean
+            risk_aversion_beta = risk_aversion_mean
+            # Deterministic: log_prob is 0 (no randomness)
+            log_prob = torch.zeros(obs.shape[0], 1, device=obs.device)
+        else:
+            # Beta distribution: alpha = mean * concentration, beta = (1 - mean) * concentration
+            # Scale concentration by temperature (higher temperature = more exploration)
+            effective_target_concentration = target_inv_concentration / (temperature + 1e-8)
+            effective_risk_concentration = risk_aversion_concentration / (temperature + 1e-8)
+            
+            target_alpha = target_inv_mean * effective_target_concentration
+            target_beta = (1.0 - target_inv_mean) * effective_target_concentration
+            
+            risk_alpha = risk_aversion_mean * effective_risk_concentration
+            risk_beta = (1.0 - risk_aversion_mean) * effective_risk_concentration
+            
+            # Ensure minimum values for numerical stability
+            target_alpha = torch.clamp(target_alpha, min=0.1)
+            target_beta = torch.clamp(target_beta, min=0.1)
+            risk_alpha = torch.clamp(risk_alpha, min=0.1)
+            risk_beta = torch.clamp(risk_beta, min=0.1)
+            
+            # Create Beta distributions and sample
+            target_dist = torch.distributions.Beta(target_alpha, target_beta)
+            risk_dist = torch.distributions.Beta(risk_alpha, risk_beta)
+            
+            target_inv_beta = target_dist.sample()
+            risk_aversion_beta = risk_dist.sample()
+            
+            # Compute log probabilities
+            target_log_prob = target_dist.log_prob(target_inv_beta)
+            risk_log_prob = risk_dist.log_prob(risk_aversion_beta)
+            log_prob = (target_log_prob + risk_log_prob).sum(dim=-1, keepdim=True)
         
-        # Sample from Gaussian with temperature scaling
-        std = torch.exp(self.actor_log_std).expand_as(action_mean) * temperature
-        dist = torch.distributions.Normal(action_mean, std)
-        action = dist.sample()
-        log_prob = dist.log_prob(action).sum(dim=-1, keepdim=True)  # Sum log probs for both outputs
+        # Transform target_inventory from [0, 1] to [-target_range, target_range]
+        # y = (x - 0.5) * 2 * target_range
+        # Jacobian: |dy/dx| = 2 * target_range
+        # log_prob_y = log_prob_x - log(2 * target_range)
+        target_inv = (target_inv_beta - 0.5) * 2.0 * self.target_range
+        risk_aversion = risk_aversion_beta  # Already in [0, 1]
         
-        # Clamp actions to valid ranges
-        target_inv = torch.clamp(action[:, 0:1], -self.target_range, self.target_range)
-        risk_aversion = torch.clamp(action[:, 1:2], 0.0, 1.0)
+        # Adjust log_prob for transformation (Jacobian correction)
+        if not (temperature == 0.0 or deterministic):
+            log_prob = log_prob - torch.log(torch.tensor(2.0 * self.target_range, device=obs.device))
+        
         action = torch.cat([target_inv, risk_aversion], dim=-1)
         
         return action, log_prob, value, lstm_hidden
@@ -236,6 +318,8 @@ class InventoryAgent(nn.Module):
         Args:
             obs: Observations [batch, obs_dim] or [batch, seq_len, obs_dim]
             actions: Actions taken [batch, 2] or [batch, seq_len, 2] - [target_inventory, risk_aversion]
+                - target_inventory: [-target_range, target_range]
+                - risk_aversion: [0, 1]
             lstm_hidden: LSTM hidden state (h, c) tuple, or None for initial state
             
         Returns:
@@ -243,13 +327,46 @@ class InventoryAgent(nn.Module):
             entropy: Action entropy [batch, 1] or [batch, seq_len, 1]
             value: State value [batch, 1] or [batch, seq_len, 1]
         """
-        action_mean, value, _ = self.forward(obs, lstm_hidden)
+        target_inv_mean, target_inv_concentration, risk_aversion_mean, risk_aversion_concentration, value, _ = self.forward(obs, lstm_hidden)
         
-        std = torch.exp(self.actor_log_std).expand_as(action_mean)
-        dist = torch.distributions.Normal(action_mean, std)
+        # Transform target_inventory back to [0, 1] for Beta distribution
+        # y = (x - 0.5) * 2 * target_range
+        # x = (y / (2 * target_range)) + 0.5
+        target_inv_beta = (actions[:, 0:1] / (2.0 * self.target_range)) + 0.5
+        risk_aversion_beta = actions[:, 1:2]  # Already in [0, 1]
         
-        log_prob = dist.log_prob(actions).sum(dim=-1, keepdim=True)  # Sum log probs for both outputs
-        entropy = dist.entropy().sum(dim=-1, keepdim=True)  # Sum entropy for both outputs
+        # Clamp to valid Beta range [0, 1] (shouldn't be needed, but safety check)
+        target_inv_beta = torch.clamp(target_inv_beta, min=1e-6, max=1.0 - 1e-6)
+        risk_aversion_beta = torch.clamp(risk_aversion_beta, min=1e-6, max=1.0 - 1e-6)
+        
+        # Beta distribution: alpha = mean * concentration, beta = (1 - mean) * concentration
+        target_alpha = target_inv_mean * target_inv_concentration
+        target_beta = (1.0 - target_inv_mean) * target_inv_concentration
+        
+        risk_alpha = risk_aversion_mean * risk_aversion_concentration
+        risk_beta = (1.0 - risk_aversion_mean) * risk_aversion_concentration
+        
+        # Ensure minimum values for numerical stability
+        target_alpha = torch.clamp(target_alpha, min=0.1)
+        target_beta = torch.clamp(target_beta, min=0.1)
+        risk_alpha = torch.clamp(risk_alpha, min=0.1)
+        risk_beta = torch.clamp(risk_beta, min=0.1)
+        
+        # Create Beta distributions and evaluate
+        target_dist = torch.distributions.Beta(target_alpha, target_beta)
+        risk_dist = torch.distributions.Beta(risk_alpha, risk_beta)
+        
+        target_log_prob = target_dist.log_prob(target_inv_beta)
+        risk_log_prob = risk_dist.log_prob(risk_aversion_beta)
+        
+        # Adjust log_prob for transformation (Jacobian correction)
+        # y = (x - 0.5) * 2 * target_range, so |dy/dx| = 2 * target_range
+        log_prob = (target_log_prob + risk_log_prob).sum(dim=-1, keepdim=True) - torch.log(torch.tensor(2.0 * self.target_range, device=obs.device))
+        
+        # Entropy (no transformation needed, entropy is invariant under linear transformations)
+        target_entropy = target_dist.entropy()
+        risk_entropy = risk_dist.entropy()
+        entropy = (target_entropy + risk_entropy).sum(dim=-1, keepdim=True)
         
         return log_prob, entropy, value
         """

@@ -234,7 +234,7 @@ class RolloutBuffer:
                         self.advantages_inv[t+1:next_t, env_id] = last_gae * discount_factors[::-1]
         
         self.returns_inv = self.advantages_inv + self.values_inv
-        
+
         # Normalize inventory advantages if enabled
         if normalize_gae:
             inv_advantages_flat = self.advantages_inv.flatten()
@@ -242,7 +242,7 @@ class RolloutBuffer:
                 inv_advantages_tensor = torch.from_numpy(inv_advantages_flat).float()
                 inv_normalized = robust_normalize(inv_advantages_tensor)
                 self.advantages_inv = inv_normalized.numpy().reshape(self.advantages_inv.shape)
-    
+
 class HierarchicalPPOTrainer:
     """Hierarchical PPO Trainer for Two-Agent Market Making."""
     
@@ -294,7 +294,7 @@ class HierarchicalPPOTrainer:
             taker_fee=0.0005,
             foldername="/home/pravin/dev/alphaqraft_litepool/data/training/",
             balance=config.balance,
-            start=0,
+            start=36000,
             max_episode_steps=config.max_episode_steps,
             base_spread_bps=config.base_spread_bps,
             min_size_pct=config.min_size_pct,
@@ -346,7 +346,10 @@ class HierarchicalPPOTrainer:
             
             # Store data
             self.buffer.actions[step] = action
-            self.buffer.inv_actions[step] = info['targets']  # target_inventory, risk_aversion
+            # Concatenate target_inventory and risk_aversion into [num_envs, 2]
+            targets = info['targets']  # [num_envs, 1]
+            risk_aversion = info['risk_aversion']  # [num_envs, 1]
+            self.buffer.inv_actions[step] = np.concatenate([targets, risk_aversion], axis=-1)  # [num_envs, 2]
             self.buffer.log_probs_mm[step] = info['log_prob_mm'].squeeze(-1)
             self.buffer.log_probs_inv[step] = info['log_prob_inv'].squeeze(-1)
             self.buffer.values_mm[step] = info['value_mm'].squeeze(-1)
@@ -355,41 +358,29 @@ class HierarchicalPPOTrainer:
             self.buffer.dones[step] = (done | truncated).astype(np.float32)
             
             # Extract rewards from env_info
-            # Environment provides separate rewards in info dict (vectorized: each key maps to array of shape (num_envs,))
-            mm_reward = env_info.get('mm_reward', np.zeros(self.config.num_envs))
-            inv_reward = env_info.get('inv_reward', np.zeros(self.config.num_envs))
-            
-            # Handle numpy array extraction (ensure it's 1D array)
-            if isinstance(mm_reward, np.ndarray):
-                mm_reward = mm_reward.flatten()
-            else:
-                mm_reward = np.array([mm_reward] * self.config.num_envs)
-            if isinstance(inv_reward, np.ndarray):
-                inv_reward = inv_reward.flatten()
-            else:
-                inv_reward = np.array([inv_reward] * self.config.num_envs)
-            
-            # Store rewards
-            self.buffer.mm_rewards[step] = mm_reward
-            self.buffer.inv_rewards[step] = inv_reward
-            
-            # Extract other info values (vectorized)
-            def _ensure_array(val, default=0.0):
-                """Ensure value is a 1D numpy array of shape (num_envs,)."""
+            # env_info is a dict where each key maps to array of shape (num_envs,)
+            def _extract_info_value(env_info: dict, key: str, default=0.0):
+                """Safely extract a value from env_info, returning array of shape (num_envs,)."""
+                val = env_info.get(key, default)
                 if isinstance(val, np.ndarray):
                     return val.flatten()
                 else:
                     return np.array([val] * self.config.num_envs)
             
-            realized_pnl = _ensure_array(env_info.get('realized_pnl', 0.0))
-            unrealized_pnl = _ensure_array(env_info.get('unrealized_pnl', 0.0))
-            spread_capture = _ensure_array(env_info.get('spread_capture', 0.0))
-            fees = _ensure_array(env_info.get('fees', 0.0))
-            trade_count = _ensure_array(env_info.get('trade_count', 0))
-            net_amount_btc = _ensure_array(env_info.get('net_amount_btc', 0.0))
+            mm_reward = _extract_info_value(env_info, 'mm_reward', 0.0)
+            inv_reward = _extract_info_value(env_info, 'inv_reward', 0.0)
+            realized_pnl = _extract_info_value(env_info, 'realized_pnl', 0.0)
+            unrealized_pnl = _extract_info_value(env_info, 'unrealized_pnl', 0.0)
+            spread_capture = _extract_info_value(env_info, 'spread_capture', 0.0)
+            fees = _extract_info_value(env_info, 'fees', 0.0)
+            trade_count = _extract_info_value(env_info, 'trade_count', 0)
+            net_amount_btc = _extract_info_value(env_info, 'net_amount_btc', 0.0)
             
-            # Accumulate episode info for each environment
             for env_id in range(self.config.num_envs):
+                self.buffer.mm_rewards[step, env_id] = mm_reward[env_id]
+                self.buffer.inv_rewards[step, env_id] = inv_reward[env_id]
+                
+                # Accumulate episode info
                 episode_infos[env_id]['mm_reward'] = episode_infos[env_id].get('mm_reward', 0.0) + mm_reward[env_id]
                 episode_infos[env_id]['inv_reward'] = episode_infos[env_id].get('inv_reward', 0.0) + inv_reward[env_id]
                 episode_infos[env_id]['realized_pnl'] = episode_infos[env_id].get('realized_pnl', 0.0) + realized_pnl[env_id]
@@ -402,9 +393,36 @@ class HierarchicalPPOTrainer:
             # Handle done environments
             new_done = (done | truncated) & ~done_mask
             for env_id in np.where(new_done)[0]:
-                self.completed_episodes.append(episode_infos[env_id])
+                # Use final episode metrics from terminal info if available (more accurate)
+                # Extract arrays and then index by env_id
+                final_realized_pnl_arr = _extract_info_value(env_info, 'final_realized_pnl', 0.0)
+                final_unrealized_pnl_arr = _extract_info_value(env_info, 'final_unrealized_pnl', 0.0)
+                final_spread_capture_arr = _extract_info_value(env_info, 'final_spread_capture', 0.0)
+                final_fees_arr = _extract_info_value(env_info, 'final_fees', 0.0)
+                final_trade_count_arr = _extract_info_value(env_info, 'final_trade_count', 0)
+                final_net_amount_btc_arr = _extract_info_value(env_info, 'final_net_amount_btc', 0.0)
+                
+                final_realized_pnl = float(final_realized_pnl_arr[env_id])
+                final_unrealized_pnl = float(final_unrealized_pnl_arr[env_id])
+                final_spread_capture = float(final_spread_capture_arr[env_id])
+                final_fees = float(final_fees_arr[env_id])
+                final_trade_count = int(final_trade_count_arr[env_id])
+                final_net_amount_btc = float(final_net_amount_btc_arr[env_id])
+                
+                # Create final episode summary (use final values if available, otherwise use accumulated)
+                episode_summary = episode_infos[env_id].copy()
+                if final_realized_pnl != 0.0 or final_unrealized_pnl != 0.0:
+                    # Use final values from terminal info (more accurate)
+                    episode_summary['realized_pnl'] = final_realized_pnl
+                    episode_summary['unrealized_pnl'] = final_unrealized_pnl
+                    episode_summary['spread_capture'] = final_spread_capture
+                    episode_summary['fees'] = final_fees
+                    episode_summary['trade_count'] = final_trade_count
+                    episode_summary['net_amount_btc'] = final_net_amount_btc
+                
+                self.completed_episodes.append(episode_summary)
                 self.episode_rewards.append(
-                    episode_infos[env_id]['mm_reward'] + episode_infos[env_id]['inv_reward']
+                    episode_summary['mm_reward'] + episode_summary['inv_reward']
                 )
                 # Reset episode info for this env
                 episode_infos[env_id] = {}
@@ -417,7 +435,7 @@ class HierarchicalPPOTrainer:
             obs = next_obs
             if step < self.config.n_steps - 1:
                 self.buffer.observations[step + 1] = obs
-            
+        
             # Store info for logging
             self.buffer.infos.append(env_info)
         
@@ -524,14 +542,20 @@ class HierarchicalPPOTrainer:
                     
                     # Regularization
                     value_l2_reg_inv = torch.mean(inv_value ** 2)
-                    log_std_l2_reg_inv = torch.mean(self.policy.inventory_agent.actor_log_std ** 2)
+                    # Inventory agent uses Beta distribution with concentration parameters, not log_std
+                    # Light regularization on concentration parameters to prevent extreme values
+                    concentration_l2_reg_inv = torch.sum(
+                        (self.policy.inventory_agent.target_inv_concentration.weight ** 2).sum(dim=1) +
+                        (self.policy.inventory_agent.risk_aversion_concentration.weight ** 2).sum(dim=1)
+                    )
+                    concentration_l2_reg_inv = 1e-4 * concentration_l2_reg_inv  # Light regularization
                     
                     loss_inv = (
                         policy_loss_inv +
                         self.config.value_coef * value_loss_inv -
                         self.config.entropy_coef_inv * entropy_inv +
                         self.config.value_l2_reg * value_l2_reg_inv +
-                        self.config.log_std_l2_reg * log_std_l2_reg_inv
+                        concentration_l2_reg_inv
                     )
                 
                 # MM agent
@@ -606,88 +630,92 @@ class HierarchicalPPOTrainer:
     
     def _log_epoch(self, epoch: int, losses: Dict[str, float]):
         """Log epoch statistics."""
+        # Rewards
+        avg_mm_reward = np.mean(self.buffer.mm_rewards)
+        avg_inv_reward = np.mean(self.buffer.inv_rewards)
+        
+        # P&L - env_info is a dict where each key maps to array of shape (num_envs,)
+        realized_pnl_list = []
+        unrealized_pnl_list = []
+        for env_info in (self.buffer.infos if self.buffer.infos else []):
+            rpnl = env_info.get('realized_pnl', np.zeros(self.config.num_envs))
+            upnl = env_info.get('unrealized_pnl', np.zeros(self.config.num_envs))
+            if isinstance(rpnl, np.ndarray):
+                realized_pnl_list.extend(rpnl.flatten().tolist())
+            else:
+                realized_pnl_list.append(float(rpnl))
+            if isinstance(upnl, np.ndarray):
+                unrealized_pnl_list.extend(upnl.flatten().tolist())
+            else:
+                unrealized_pnl_list.append(float(upnl))
+        avg_realized_pnl = np.mean(realized_pnl_list) if realized_pnl_list else 0.0
+        avg_unrealized_pnl = np.mean(unrealized_pnl_list) if unrealized_pnl_list else 0.0
+        
+        # Actions
+        bid_spreads = self.buffer.actions[:, :, 0].flatten()
+        ask_spreads = self.buffer.actions[:, :, 1].flatten()
+        targets = self.buffer.inv_actions[:, :, 0].flatten()
+        avg_bid_spread = np.mean(bid_spreads)
+        avg_ask_spread = np.mean(ask_spreads)
+        avg_target = np.mean(targets)
+        mm_spread_std = np.std(bid_spreads + ask_spreads)
+        inv_std = np.std(targets)
+        
+        # Trading stats - env_info is a dict where each key maps to array
+        total_trades = 0
+        buy_trades = 0
+        sell_trades = 0
+        for env_info in (self.buffer.infos if self.buffer.infos else []):
+            trade_count = env_info.get('trade_count', np.zeros(self.config.num_envs))
+            buy_count = env_info.get('buy_trades', np.zeros(self.config.num_envs))
+            sell_count = env_info.get('sell_trades', np.zeros(self.config.num_envs))
+            if isinstance(trade_count, np.ndarray):
+                total_trades += int(np.sum(trade_count))
+            else:
+                total_trades += int(trade_count)
+            
+            if isinstance(buy_count, np.ndarray):
+                buy_trades += int(np.sum(buy_count))
+            else:
+                buy_trades += int(buy_count)
+            
+            if isinstance(sell_count, np.ndarray):
+                sell_trades += int(np.sum(sell_count))
+            else:
+                sell_trades += int(sell_count)
+        
+        print(f"\nEpoch {epoch}/{self.config.total_epochs}")
+        print(f"MM Reward: {avg_mm_reward:.4f} | Inv Reward: {avg_inv_reward:.4f}")
+        print(f"Advantages MM: mean={losses['advantage_mm_mean']:.4f}, std={losses['advantage_mm_std']:.4f}, max={losses['advantage_mm_max']:.4f}")
+        print(f"Advantages Inv: mean={losses['advantage_inv_mean']:.4f}, std={losses['advantage_inv_std']:.4f}, max={losses['advantage_inv_max']:.4f}")
+        print(f"Policy Loss MM: {losses['policy_loss_mm']:.4f} | Value Loss MM: {losses['value_loss_mm']:.4f}")
+        print(f"Policy Loss Inv: {losses['policy_loss_inv']:.4f} | Value Loss Inv: {losses['value_loss_inv']:.4f}")
+        print(f"Entropy MM: {losses['entropy_mm']:.4f} | Entropy Inv: {losses['entropy_inv']:.4f}")
+        print(f"Grad Norm MM: {losses['grad_norm_mm']:.4f} | Grad Norm Inv: {losses['grad_norm_inv']:.4f}")
+        print(f"Avg Bid Spread: {avg_bid_spread:.4f} | Avg Ask Spread: {avg_ask_spread:.4f}")
+        print(f"Avg Target Inventory: {avg_target:.4f}")
+        print(f"Realized PnL: {avg_realized_pnl:.2f} | Unrealized PnL: {avg_unrealized_pnl:.2f}")
+        
+        # Log completed episodes
+        if self.completed_episodes:
+            print("\nCompleted Episodes:")
+            for i, ep in enumerate(self.completed_episodes, 1):
+                # Net PnL = Realized + Unrealized - Fees
+                # Fees are negative for maker rebates (we earn money), positive for taker fees (we pay)
+                true_net = ep['realized_pnl'] + ep['unrealized_pnl'] - ep.get('fees', 0.0)
+                print(f"Ep {i}: MM Rew {ep['mm_reward']:.2f} | Inv Rew {ep['inv_reward']:.2f} | "
+                      f"R.PnL ${ep['realized_pnl']:7.2f} | "
+                      f"SprdCap ${ep['spread_capture']:6.2f} | "
+                      f"U.PnL ${ep['unrealized_pnl']:7.2f} | "
+                      f"Net ${true_net:7.2f} | "
+                      f"Trades {ep['trade_count']:4d} | "
+                      f"Pos {ep['net_amount_btc']:+.5f} BTC")
+            print()
+        
+        # === TensorBoard Logging ===
+        step = self.global_step
+        
         try:
-            # Rewards
-            avg_mm_reward = np.mean(self.buffer.mm_rewards)
-            avg_inv_reward = np.mean(self.buffer.inv_rewards)
-            
-            # P&L - env_info is a dict where each key maps to array of shape (num_envs,)
-            realized_pnl_list = []
-            unrealized_pnl_list = []
-            for env_info in (self.buffer.infos if self.buffer.infos else []):
-                rpnl = env_info.get('realized_pnl', np.zeros(self.config.num_envs))
-                upnl = env_info.get('unrealized_pnl', np.zeros(self.config.num_envs))
-                if isinstance(rpnl, np.ndarray):
-                    realized_pnl_list.extend(rpnl.flatten().tolist())
-                else:
-                    realized_pnl_list.append(float(rpnl))
-                if isinstance(upnl, np.ndarray):
-                    unrealized_pnl_list.extend(upnl.flatten().tolist())
-                else:
-                    unrealized_pnl_list.append(float(upnl))
-            avg_realized_pnl = np.mean(realized_pnl_list) if realized_pnl_list else 0.0
-            avg_unrealized_pnl = np.mean(unrealized_pnl_list) if unrealized_pnl_list else 0.0
-            
-            # Actions
-            bid_spreads = self.buffer.actions[:, :, 0].flatten()
-            ask_spreads = self.buffer.actions[:, :, 1].flatten()
-            targets = self.buffer.inv_actions[:, :, 0].flatten()
-            avg_bid_spread = np.mean(bid_spreads)
-            avg_ask_spread = np.mean(ask_spreads)
-            avg_target = np.mean(targets)
-            mm_spread_std = np.std(bid_spreads + ask_spreads)
-            inv_std = np.std(targets)
-            
-            # Trading stats - env_info is a dict where each key maps to array
-            total_trades = 0
-            buy_trades = 0
-            sell_trades = 0
-            for env_info in (self.buffer.infos if self.buffer.infos else []):
-                trade_count = env_info.get('trade_count', np.zeros(self.config.num_envs))
-                buy_count = env_info.get('buy_trades', np.zeros(self.config.num_envs))
-                sell_count = env_info.get('sell_trades', np.zeros(self.config.num_envs))
-                if isinstance(trade_count, np.ndarray):
-                    total_trades += int(np.sum(trade_count))
-                else:
-                    total_trades += int(trade_count)
-                if isinstance(buy_count, np.ndarray):
-                    buy_trades += int(np.sum(buy_count))
-                else:
-                    buy_trades += int(buy_count)
-                if isinstance(sell_count, np.ndarray):
-                    sell_trades += int(np.sum(sell_count))
-                else:
-                    sell_trades += int(sell_count)
-            
-            print(f"\nEpoch {epoch}/{self.config.total_epochs}")
-            print(f"MM Reward: {avg_mm_reward:.4f} | Inv Reward: {avg_inv_reward:.4f}")
-            print(f"Advantages MM: mean={losses['advantage_mm_mean']:.4f}, std={losses['advantage_mm_std']:.4f}, max={losses['advantage_mm_max']:.4f}")
-            print(f"Advantages Inv: mean={losses['advantage_inv_mean']:.4f}, std={losses['advantage_inv_std']:.4f}, max={losses['advantage_inv_max']:.4f}")
-            print(f"Policy Loss MM: {losses['policy_loss_mm']:.4f} | Value Loss MM: {losses['value_loss_mm']:.4f}")
-            print(f"Policy Loss Inv: {losses['policy_loss_inv']:.4f} | Value Loss Inv: {losses['value_loss_inv']:.4f}")
-            print(f"Entropy MM: {losses['entropy_mm']:.4f} | Entropy Inv: {losses['entropy_inv']:.4f}")
-            print(f"Grad Norm MM: {losses['grad_norm_mm']:.4f} | Grad Norm Inv: {losses['grad_norm_inv']:.4f}")
-            print(f"Avg Bid Spread: {avg_bid_spread:.4f} | Avg Ask Spread: {avg_ask_spread:.4f}")
-            print(f"Avg Target Inventory: {avg_target:.4f}")
-            print(f"Realized PnL: {avg_realized_pnl:.2f} | Unrealized PnL: {avg_unrealized_pnl:.2f}")
-            
-            # Log completed episodes
-            if self.completed_episodes:
-                print("\nCompleted Episodes:")
-                for i, ep in enumerate(self.completed_episodes, 1):
-                    true_net = ep.get('realized_pnl', 0.0) + ep.get('unrealized_pnl', 0.0) + ep.get('fees', 0.0)
-                    print(f"Ep {i}: MM Rew {ep.get('mm_reward', 0.0):.2f} | Inv Rew {ep.get('inv_reward', 0.0):.2f} | "
-                          f"R.PnL ${ep.get('realized_pnl', 0.0):7.2f} | "
-                          f"SprdCap ${ep.get('spread_capture', 0.0):6.2f} | "
-                          f"U.PnL ${ep.get('unrealized_pnl', 0.0):7.2f} | "
-                          f"Net ${true_net:7.2f} | "
-                          f"Trades {ep.get('trade_count', 0):4d} | "
-                          f"Pos {ep.get('net_amount_btc', 0.0):+.5f} BTC")
-                print()
-            
-            # === TensorBoard Logging ===
-            step = self.global_step
-            
             # Rewards
             self.tb_writer.add_scalar('Reward/MM_Agent', avg_mm_reward, step)
             self.tb_writer.add_scalar('Reward/Inventory_Agent', avg_inv_reward, step)
@@ -736,14 +764,14 @@ class HierarchicalPPOTrainer:
             
             # Episode Statistics (if episodes completed)
             if self.completed_episodes:
-                avg_episode_mm_rew = np.mean([ep.get('mm_reward', 0.0) for ep in self.completed_episodes])
-                avg_episode_inv_rew = np.mean([ep.get('inv_reward', 0.0) for ep in self.completed_episodes])
-                avg_spread_capture = np.mean([ep.get('spread_capture', 0.0) for ep in self.completed_episodes])
-                avg_unrealized = np.mean([ep.get('unrealized_pnl', 0.0) for ep in self.completed_episodes])
-                avg_fees = np.mean([ep.get('fees', 0.0) for ep in self.completed_episodes])
-                avg_trades = np.mean([ep.get('trade_count', 0) for ep in self.completed_episodes])
-                avg_net = np.mean([ep.get('realized_pnl', 0.0) + ep.get('unrealized_pnl', 0.0) + ep.get('fees', 0.0)
-                                  for ep in self.completed_episodes])
+                avg_episode_mm_rew = np.mean([ep['mm_reward'] for ep in self.completed_episodes])
+                avg_episode_inv_rew = np.mean([ep['inv_reward'] for ep in self.completed_episodes])
+                avg_spread_capture = np.mean([ep['spread_capture'] for ep in self.completed_episodes])
+                avg_unrealized = np.mean([ep['unrealized_pnl'] for ep in self.completed_episodes])
+                avg_fees = np.mean([ep['fees'] for ep in self.completed_episodes])
+                avg_trades = np.mean([ep['trade_count'] for ep in self.completed_episodes])
+                avg_net = np.mean([ep['realized_pnl'] + ep['unrealized_pnl'] - ep.get('fees', 0.0) 
+                              for ep in self.completed_episodes])
                 
                 self.tb_writer.add_scalar('Episode/MM_Reward', avg_episode_mm_rew, step)
                 self.tb_writer.add_scalar('Episode/Inv_Reward', avg_episode_inv_rew, step)
@@ -753,11 +781,10 @@ class HierarchicalPPOTrainer:
                 self.tb_writer.add_scalar('Episode/Net_PnL', avg_net, step)
                 self.tb_writer.add_scalar('Episode/Trades', avg_trades, step)
             
-            # Flush TensorBoard to ensure data is written
+            # Flush TensorBoard to ensure data is written immediately
             self.tb_writer.flush()
-            
         except Exception as e:
-            print(f"Error in _log_epoch: {e}")
+            print(f"Warning: TensorBoard logging error: {e}")
             import traceback
             traceback.print_exc()
     
@@ -776,6 +803,8 @@ class HierarchicalPPOTrainer:
         print("="*80 + "\n")
         
         for epoch in range(self.config.total_epochs):
+            self.completed_episodes = []
+            self.episode_rewards = []
             epoch_start = time.time()
             
             # Collect rollout
