@@ -21,28 +21,29 @@ class HierarchicalPolicy(nn.Module):
     Hierarchical Policy combining Inventory and MM agents.
     
     Inventory Agent:
-        - Updates every `inventory_update_freq` steps (e.g., 100)
-        - Learns from unrealized P&L
-        - Outputs: target_inventory ∈ [-0.1, 0.1]
+        - Updates every `inventory_update_freq` steps (default: 1, smoothed by EMA in C++)
+        - Learns from total P&L (spread capture + unrealized)
+        - Outputs: target_inventory ∈ [-target_range, +target_range], risk_aversion ∈ [0, 1]
         
     MM Agent:
         - Updates every step
-        - Learns from spread capture + fee rebates
-        - Outputs: bid_spread, ask_spread
+        - Learns from spread capture (execution quality)
+        - Outputs: bid_spread ∈ [0, 1], ask_spread ∈ [0, 1]
         
-    Combined action sent to environment: [bid_spread, ask_spread, target_inventory]
+    Combined action sent to environment: [bid_spread, ask_spread, target_inventory, risk_aversion]
+    (4 dimensions total)
     
     Note: Requote is handled automatically by the environment (smart requote).
     """
     
     def __init__(
         self,
-        obs_dim: int = 40,  # Full observation dimension
-        inventory_update_freq: int = 100,
+        obs_dim: int = 40,  # Full observation dimension (must match environment)
+        inventory_update_freq: int = 1,  # Default: every step (smoothed by EMA in C++)
         inventory_lstm: int = 32,
         mm_lstm: int = 64,
         hidden_dim: int = 128,  # Shared encoder hidden dimension
-        target_range: float = 0.1,
+        target_range: float = 1.0,  # Default from hierarchical_config.py
         attention_heads: int = 4,
         device: str = 'cpu',
     ):
@@ -74,10 +75,10 @@ class HierarchicalPolicy(nn.Module):
             attention_heads=attention_heads,
         )
         
-        # State tracking (per environment)
+        # State tracking (per environment) - using torch tensors for device compatibility
         self.current_targets: Optional[torch.Tensor] = None
         self.current_risk_aversion: Optional[torch.Tensor] = None
-        self.step_counters: Optional[np.ndarray] = None
+        self.step_counters: Optional[torch.Tensor] = None  # Use torch instead of numpy for device compatibility
         self.mm_hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self.inv_hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         
@@ -88,7 +89,7 @@ class HierarchicalPolicy(nn.Module):
         """Reset state for new episodes (all environments)."""
         self.current_targets = torch.zeros(num_envs, 1, device=self.device)
         self.current_risk_aversion = torch.ones(num_envs, 1, device=self.device) * 0.5  # Default risk_aversion = 0.5 [0, 1]
-        self.step_counters = np.zeros(num_envs, dtype=np.int64)
+        self.step_counters = torch.zeros(num_envs, dtype=torch.int64, device=self.device)  # Use torch for device compatibility
         # Initialize LSTM hidden states for all environments (will be created on first forward pass)
         # Shape: (1, num_envs, lstm_hidden) for both h and c
         self.mm_hidden = None  # Will be initialized on first forward pass
@@ -140,12 +141,12 @@ class HierarchicalPolicy(nn.Module):
         Forward pass for both agents.
         
         Args:
-            obs: Full observations [batch, 36]
+            obs: Full observations [batch, 40]
             deterministic: If True, use mean actions (no exploration)
             temperature: Scale exploration noise (0.0 = deterministic, 1.0 = full exploration)
             
         Returns:
-            action: Combined action [batch, 3] for environment
+            action: Combined action [batch, 4] for environment (bid_spread, ask_spread, target_inventory, risk_aversion)
             log_probs: Dict with 'inventory' and 'mm' log probs
             values: Dict with 'inventory' and 'mm' values
         """
@@ -245,12 +246,12 @@ class HierarchicalPolicy(nn.Module):
         Get action for environment (numpy interface).
         
         Args:
-            obs: Full observations [batch, 36]
+            obs: Full observations [batch, 40]
             deterministic: If True, use mean actions (temperature=0.0 for fully deterministic)
             temperature: Scale exploration noise (0.0 = deterministic, 1.0 = full exploration)
             
         Returns:
-            action: Combined action [batch, 3]
+            action: Combined action [batch, 4] (bid_spread, ask_spread, target_inventory, risk_aversion)
             info: Additional info (log_probs, values, etc.)
         """
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
@@ -305,7 +306,8 @@ class HierarchicalPolicy(nn.Module):
     
     def _should_update_inventory(self) -> np.ndarray:
         """Check which environments should update inventory target."""
-        return (self.step_counters % self.inventory_update_freq) == 0
+        # Returns numpy array for compatibility with indexing operations
+        return ((self.step_counters % self.inventory_update_freq) == 0).cpu().numpy()
     
     # NOTE: Observation extraction removed - both agents now see all observations via shared encoder + attention
     # NOTE: Reward calculation methods removed - rewards come directly from environment
@@ -313,8 +315,9 @@ class HierarchicalPolicy(nn.Module):
     # These are extracted in hierarchical_ppo.py collect_rollout() method
     
     def save(self, path: str):
-        """Save both agents."""
+        """Save all components (shared encoder + both agents)."""
         torch.save({
+            'shared_encoder': self.shared_encoder.state_dict(),
             'inventory_agent': self.inventory_agent.state_dict(),
             'mm_agent': self.mm_agent.state_dict(),
             'inventory_update_freq': self.inventory_update_freq,
@@ -323,22 +326,24 @@ class HierarchicalPolicy(nn.Module):
     
     def load(self, path: str):
         """Load both agents."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        if 'shared_encoder' in checkpoint:
+            self.shared_encoder.load_state_dict(checkpoint['shared_encoder'])
         self.inventory_agent.load_state_dict(checkpoint['inventory_agent'])
         self.mm_agent.load_state_dict(checkpoint['mm_agent'])
-        self.inventory_update_freq = checkpoint.get('inventory_update_freq', 100)
-        self.target_range = checkpoint.get('target_range', 0.1)
+        self.inventory_update_freq = checkpoint.get('inventory_update_freq', 1)  # Default from config
+        self.target_range = checkpoint.get('target_range', 1.0)  # Default from config
 
 
 def create_hierarchical_policy(
-    obs_dim: int = 40,  # Full observation dimension
-    inventory_update_freq: int = 100,
+    obs_dim: int = 40,  # Full observation dimension (must match environment)
+    inventory_update_freq: int = 1,  # Default from config (1 = every step, smoothed by EMA in C++)
     device: str = 'cpu',
-    target_range: float = 0.2,  # Increased from 0.1 for more aggressive positioning
+    target_range: float = 1.0,  # Default from config (matches hierarchical_config.py)
     hidden_dim: int = 128,  # Shared encoder hidden dimension
     attention_heads: int = 4,
 ) -> HierarchicalPolicy:
-    """Factory function to create hierarchical policy with defaults."""
+    """Factory function to create hierarchical policy with defaults matching config."""
     return HierarchicalPolicy(
         obs_dim=obs_dim,
         inventory_update_freq=inventory_update_freq,
@@ -349,3 +354,4 @@ def create_hierarchical_policy(
         attention_heads=attention_heads,
         device=device,
     )
+

@@ -11,23 +11,19 @@ class HierarchicalConfig:
 
     # PPO hyperparameters
     learning_rate: float = 1e-4
-    inv_learning_rate: float = 1e-4  # Reduced from 4e-5 to stabilize (large gradients causing instability)
-    gamma: float = 0.995  # Lower gamma for more immediate rewards
-    gae_lambda: float = 0.95  # GAE lambda for advantage estimation (less bootstrap than usual 0.95)
+    inv_learning_rate: float = 1e-4  # Same as MM agent LR for consistency
+    gamma: float = 0.995  # Discount factor (high for long-term credit assignment)
+    gae_lambda: float = 0.95  # GAE lambda for advantage estimation
     gae_clip_delta: float = 2.0  # Clip TD errors in GAE computation
-    normalize_gae: bool = True  # Normalize advantages after GAE computation
-    clip_range: float = 0.2
-    entropy_coef: float = 0.5  # Base entropy coefficient (reduced to prevent std explosion)
-    entropy_coef_mm: float = 0.5  # Higher entropy for MM agent (encourages exploration, small policy loss suggests early convergence)
-    entropy_coef_inv: float = 1.0  # Higher entropy for inventory agent to encourage exploration (was 0.5, increased to break neutral initialization)
-    value_coef: float = 0.2
-    max_grad_norm: float = 0.5
-    value_loss_clip: float = 0.5  # Clip value loss to prevent overfitting (max MSE allowed)
-    value_l2_reg: float = 1e-4  # L2 regularization for value function (prevents overfitting)
-    log_std_l2_reg: float = 1e-3  # L2 regularization on log_std to prevent explosion
-    log_std_max: float = 2.0  # Maximum allowed log_std (caps std at ~7.4)
-    update_epochs: int = 4
-    minibatch_size: int = 256
+    normalize_gae: bool = True  # Normalize advantages after GAE computation (uses robust normalization)
+    clip_range: float = 0.2  # PPO clipping range
+    entropy_coef_mm: float = 0.5  # Entropy bonus for MM agent (encourages spread exploration)
+    entropy_coef_inv: float = 1.0  # Higher entropy for inventory agent (encourages position exploration)
+    value_coef: float = 0.2  # Value loss coefficient
+    max_grad_norm: float = 0.5  # Gradient clipping norm
+    value_l2_reg: float = 1e-4  # L2 regularization for value function
+    update_epochs: int = 4  # PPO update epochs per rollout
+    minibatch_size: int = 256  # Minibatch size for PPO updates
 
     # Trading parameters
     base_spread_bps: float = 1
@@ -38,6 +34,6 @@ class HierarchicalConfig:
 
     # Training
     total_epochs: int = 10000
-    save_interval: int = 500000
+    save_interval: int = 100  # Save checkpoint every 100 epochs (was 500000, never triggered)
     log_interval: int = 1
 

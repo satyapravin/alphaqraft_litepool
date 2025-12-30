@@ -9,7 +9,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 from typing import Tuple, Optional
 from shared_encoder import SharedEncoder, AttentionModule
 
@@ -256,12 +255,18 @@ class MMAgent(nn.Module):
         alpha = torch.clamp(alpha, min=0.1)
         beta = torch.clamp(beta, min=0.1)
         
+        # Clamp actions to valid Beta range [epsilon, 1-epsilon] to prevent NaN in log_prob
+        actions_clamped = torch.clamp(actions, min=1e-6, max=1.0 - 1e-6)
+        
         # Create Beta distribution and evaluate actions
         spread_dist = torch.distributions.Beta(alpha, beta)
-        log_prob = spread_dist.log_prob(actions).sum(dim=-1, keepdim=True)
-        entropy = spread_dist.entropy().sum(dim=-1, keepdim=True)
+        log_prob = spread_dist.log_prob(actions_clamped).sum(dim=-1, keepdim=True)
+        # Clamp to non-negative: Beta entropy can be negative for very small parameters due to numerical issues
+        entropy = torch.clamp(spread_dist.entropy(), min=0.0).sum(dim=-1, keepdim=True)
         
         return log_prob, entropy, value
     
-# MM agent now uses all 40 observation dimensions via shared encoder + attention
-# No need for observation extraction - both agents see everything  # 18
+# NOTE: MM agent uses all 40 observation dimensions via shared encoder + attention
+# The attention mechanism learns to focus on microstructure signals dynamically
+# No need for observation extraction - both agents see everything
+

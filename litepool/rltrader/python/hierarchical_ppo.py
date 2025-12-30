@@ -3,15 +3,17 @@
 # Hierarchical PPO Training for Two-Agent Market Making
 #
 # Architecture:
-# - Inventory Agent (slow, strategic): learns WHAT position to hold
-#   - Updates every 100 steps (50 seconds)
-#   - Reward: unrealized P&L delta (market direction)
-#   - Observations: AMM flow, volatility, position state
+# - Inventory Agent (strategic): learns WHAT position to hold
+#   - Updates every step (smoothed by 120-step EMA in C++ strategy)
+#   - Reward: total P&L delta (spread capture + unrealized)
+#   - Observations: All 40 signals via shared encoder + attention (focuses on AMM flow)
+#   - Outputs: target_inventory ∈ [-target_range, +target_range], risk_aversion ∈ [0, 1]
 #
-# - MM Agent (fast, tactical): learns HOW to execute toward target
+# - MM Agent (tactical): learns HOW to execute toward target
 #   - Updates every step (500ms)
-#   - Reward: realized P&L + spread capture + fees (execution quality)
-#   - Observations: market microstructure + target from Inventory Agent
+#   - Reward: spread capture (execution quality)
+#   - Observations: All 40 signals via shared encoder + attention (focuses on microstructure)
+#   - Outputs: bid_spread ∈ [0, 1], ask_spread ∈ [0, 1]
 
 # Ensure we use the local litepool, not system-installed version
 import sys
@@ -49,6 +51,8 @@ def robust_normalize(advantages):
     
     # Soft clip extreme values
     return torch.tanh(normalized / 5.0) * 5.0
+
+
 import time
 from datetime import datetime
 
@@ -64,33 +68,6 @@ print(f"Using device: {device}")
 
 
 config = HierarchicalConfig()
-
-
-class ValueNormalizer:
-    """Normalizes values to help value function learn with high standard deviations."""
-    def __init__(self, shape, clip_range=10.0):
-        self.mean = torch.zeros(shape)
-        self.std = torch.ones(shape)
-        self.count = 0
-        self.clip_range = clip_range
-        
-    def normalize(self, values):
-        """Normalize values using running statistics."""
-        # Normalize
-        normalized = (values - self.mean.to(values.device)) / (self.std.to(values.device) + 1e-8)
-        # Clip
-        return torch.clamp(normalized, -self.clip_range, self.clip_range)
-    
-    def update(self, batch_values):
-        """Update running statistics with new batch."""
-        # Update running statistics
-        batch_mean = batch_values.mean().item()
-        batch_std = batch_values.std().item()
-        
-        self.mean = 0.99 * self.mean + 0.01 * batch_mean
-        self.std = 0.99 * self.std + 0.01 * batch_std
-        self.count += 1
-
 
 
 @dataclass
@@ -243,6 +220,7 @@ class RolloutBuffer:
                 inv_normalized = robust_normalize(inv_advantages_tensor)
                 self.advantages_inv = inv_normalized.numpy().reshape(self.advantages_inv.shape)
 
+
 class HierarchicalPPOTrainer:
     """Hierarchical PPO Trainer for Two-Agent Market Making."""
     
@@ -316,10 +294,6 @@ class HierarchicalPPOTrainer:
         self.best_reward = float('-inf')
         self.episode_rewards = []
         self.completed_episodes = []
-        
-        # Value normalizers
-        self.value_norm_mm = ValueNormalizer((1,))
-        self.value_norm_inv = ValueNormalizer((1,))
     
     def collect_rollout(self):
         """Collect rollout data."""
@@ -474,6 +448,10 @@ class HierarchicalPPOTrainer:
         
         total_steps = flat_obs.shape[0]
         
+        # Compute advantage statistics with safety checks for empty arrays
+        inv_decision_advantages = flat_advantages_inv[flat_inv_mask > 0.5]
+        has_inv_decisions = len(inv_decision_advantages) > 0
+        
         losses = {
             'policy_loss_mm': 0.0,
             'value_loss_mm': 0.0,
@@ -483,12 +461,12 @@ class HierarchicalPPOTrainer:
             'entropy_inv': 0.0,
             'grad_norm_mm': 0.0,
             'grad_norm_inv': 0.0,
-            'advantage_mm_mean': np.mean(flat_advantages_mm),
-            'advantage_mm_std': np.std(flat_advantages_mm),
-            'advantage_mm_max': np.max(flat_advantages_mm),
-            'advantage_inv_mean': np.mean(flat_advantages_inv[flat_inv_mask > 0.5]),
-            'advantage_inv_std': np.std(flat_advantages_inv[flat_inv_mask > 0.5]),
-            'advantage_inv_max': np.max(flat_advantages_inv[flat_inv_mask > 0.5]),
+            'advantage_mm_mean': np.mean(flat_advantages_mm) if len(flat_advantages_mm) > 0 else 0.0,
+            'advantage_mm_std': np.std(flat_advantages_mm) if len(flat_advantages_mm) > 0 else 0.0,
+            'advantage_mm_max': np.max(flat_advantages_mm) if len(flat_advantages_mm) > 0 else 0.0,
+            'advantage_inv_mean': np.mean(inv_decision_advantages) if has_inv_decisions else 0.0,
+            'advantage_inv_std': np.std(inv_decision_advantages) if has_inv_decisions else 0.0,
+            'advantage_inv_max': np.max(inv_decision_advantages) if has_inv_decisions else 0.0,
         }
         
         num_updates = 0
@@ -592,7 +570,8 @@ class HierarchicalPPOTrainer:
                     loss_inv.backward()
                 loss_mm.backward()
                 
-                # Clip grads
+                # Clip grads for all components (shared encoder, inventory agent, MM agent)
+                grad_norm_shared = nn.utils.clip_grad_norm_(self.policy.shared_encoder.parameters(), self.config.max_grad_norm)
                 grad_norm_inv = nn.utils.clip_grad_norm_(self.policy.inventory_agent.parameters(), self.config.max_grad_norm)
                 grad_norm_mm = nn.utils.clip_grad_norm_(self.policy.mm_agent.parameters(), self.config.max_grad_norm)
                 
@@ -793,12 +772,12 @@ class HierarchicalPPOTrainer:
         print("\n" + "="*80)
         print("Hierarchical PPO Training - Two-Agent Market Making")
         print("="*80)
-        print(f"Inventory Agent: updates every {self.config.inventory_update_freq} steps (50 sec)")
+        print(f"Inventory Agent: updates every {self.config.inventory_update_freq} step(s), smoothed by EMA in C++")
         print(f"MM Agent: updates every step (500ms)")
         print(f"Steps per epoch: {self.config.n_steps}")
         print(f"Total epochs: {self.config.total_epochs}")
-        print(f"Observations: 40 signals (13 market + 4 AMM + 8 trade + 11 agent state + 1 previous spread + 2 bid/ask distances + 1 mid_change)")
-        print(f"Actions: 3 (bid_spread, ask_spread, target_inventory)")
+        print(f"Observations: 40 signals (13 market + 4 AMM + 8 trade + 11 agent state + 4 quote info)")
+        print(f"Actions: 4 (bid_spread, ask_spread, target_inventory, risk_aversion)")
         print(f"Smart requote: only when prices change by >2 ticks")
         print("="*80 + "\n")
         
@@ -866,21 +845,62 @@ class HierarchicalPPOTrainer:
         print(f"  Saved checkpoint: {path}")
     
     def load_checkpoint(self, path: str):
-        """Load training checkpoint."""
-        # weights_only=False needed for PyTorch 2.6+ (checkpoint contains config objects)
-        checkpoint = torch.load(path, map_location=device, weights_only=False)
-        if 'shared_encoder' in checkpoint:
-            self.policy.shared_encoder.load_state_dict(checkpoint['shared_encoder'])
-        self.policy.inventory_agent.load_state_dict(checkpoint['inventory_agent'])
-        self.policy.mm_agent.load_state_dict(checkpoint['mm_agent'])
-        self.optimizer_shared.load_state_dict(checkpoint['optimizer_shared'])
-        self.optimizer_inv.load_state_dict(checkpoint['optimizer_inv'])
-        self.optimizer_mm.load_state_dict(checkpoint['optimizer_mm'])
-        self.global_step = checkpoint['global_step']
-        self.epochs_completed = checkpoint['epochs_completed']
-        self.best_reward = checkpoint.get('best_reward', float('-inf'))
-        print(f"Loaded checkpoint from {path}")
-        print(f"  Resuming from epoch {self.epochs_completed}, step {self.global_step}")
+        """Load training checkpoint with error handling and fallbacks."""
+        try:
+            # weights_only=False needed for PyTorch 2.6+ (checkpoint contains config objects)
+            checkpoint = torch.load(path, map_location=device, weights_only=False)
+            
+            # Load model states with fallbacks for missing keys
+            if 'shared_encoder' in checkpoint:
+                try:
+                    self.policy.shared_encoder.load_state_dict(checkpoint['shared_encoder'])
+                except RuntimeError as e:
+                    print(f"  Warning: Could not load shared_encoder (architecture mismatch?): {e}")
+            
+            if 'inventory_agent' in checkpoint:
+                try:
+                    self.policy.inventory_agent.load_state_dict(checkpoint['inventory_agent'])
+                except RuntimeError as e:
+                    print(f"  Warning: Could not load inventory_agent (architecture mismatch?): {e}")
+            
+            if 'mm_agent' in checkpoint:
+                try:
+                    self.policy.mm_agent.load_state_dict(checkpoint['mm_agent'])
+                except RuntimeError as e:
+                    print(f"  Warning: Could not load mm_agent (architecture mismatch?): {e}")
+            
+            # Load optimizer states (optional, can fail if architecture changed)
+            if 'optimizer_shared' in checkpoint:
+                try:
+                    self.optimizer_shared.load_state_dict(checkpoint['optimizer_shared'])
+                except (ValueError, RuntimeError) as e:
+                    print(f"  Warning: Could not load optimizer_shared state: {e}")
+            
+            if 'optimizer_inv' in checkpoint:
+                try:
+                    self.optimizer_inv.load_state_dict(checkpoint['optimizer_inv'])
+                except (ValueError, RuntimeError) as e:
+                    print(f"  Warning: Could not load optimizer_inv state: {e}")
+            
+            if 'optimizer_mm' in checkpoint:
+                try:
+                    self.optimizer_mm.load_state_dict(checkpoint['optimizer_mm'])
+                except (ValueError, RuntimeError) as e:
+                    print(f"  Warning: Could not load optimizer_mm state: {e}")
+            
+            # Load training state
+            self.global_step = checkpoint.get('global_step', 0)
+            self.epochs_completed = checkpoint.get('epochs_completed', 0)
+            self.best_reward = checkpoint.get('best_reward', float('-inf'))
+            
+            print(f"Loaded checkpoint from {path}")
+            print(f"  Resuming from epoch {self.epochs_completed}, step {self.global_step}")
+            
+        except Exception as e:
+            print(f"Error loading checkpoint from {path}: {e}")
+            print("  Starting from scratch")
+            import traceback
+            traceback.print_exc()
 
 
 def main():
@@ -911,3 +931,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

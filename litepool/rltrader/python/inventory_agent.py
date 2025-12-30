@@ -4,13 +4,12 @@
 # 
 # This agent learns WHAT position to hold (strategic, slow decisions)
 # Uses shared encoder + attention to focus on relevant signals
-# Reward: Unrealized P&L changes (learns market direction)
+# Reward: Total P&L changes (spread capture + unrealized)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Optional
 from shared_encoder import SharedEncoder, AttentionModule
 
 
@@ -20,14 +19,14 @@ class InventoryAgent(nn.Module):
     
     Decides target_inventory based on market signals using shared encoder + attention.
     Attention mechanism allows focusing on flow, position, and volatility signals.
-    Learns from unrealized P&L (market direction).
+    Learns from total P&L (spread capture + unrealized).
     
-    Architecture: Shared Encoder + Attention + LSTM + Actor/Critic
+    Architecture: Shared Encoder + AMM Encoder + Attention + LSTM + Actor/Critic
     
     Input observations (40 dims): All observations (shared with MM agent)
     
     Output:
-        - target_inventory: [-0.1, 0.1] (target leverage)
+        - target_inventory: [-target_range, +target_range] (target leverage, default ±1.0)
         - risk_aversion: [0, 1] (risk aversion parameter γ for A-S model)
     """
     
@@ -363,64 +362,20 @@ class InventoryAgent(nn.Module):
         # y = (x - 0.5) * 2 * target_range, so |dy/dx| = 2 * target_range
         log_prob = (target_log_prob + risk_log_prob).sum(dim=-1, keepdim=True) - torch.log(torch.tensor(2.0 * self.target_range, device=obs.device))
         
-        # Entropy (no transformation needed, entropy is invariant under linear transformations)
-        target_entropy = target_dist.entropy()
-        risk_entropy = risk_dist.entropy()
-        entropy = (target_entropy + risk_entropy).sum(dim=-1, keepdim=True)
+        # Entropy: for transformed variable y = a*x + b, H(y) = H(x) + log|a|
+        # target_inventory is transformed: y = (x - 0.5) * 2 * target_range, so |a| = 2 * target_range
+        # Clamp to non-negative: Beta entropy can be negative for very small parameters due to numerical issues
+        target_entropy = torch.clamp(target_dist.entropy(), min=0.0)
+        risk_entropy = torch.clamp(risk_dist.entropy(), min=0.0)
+        # Add Jacobian correction for target_inventory transformation
+        jacobian_correction = torch.log(torch.tensor(2.0 * self.target_range, device=obs.device))
+        entropy = (target_entropy + risk_entropy).sum(dim=-1, keepdim=True) + jacobian_correction
         
         return log_prob, entropy, value
-        """
-        Extract inventory-relevant observations from full observation.
-        
-        Full observation (40 dims):
-            [0-12]: Market signals (13)
-            [13-16]: AMM flow signals (4)
-            [17-24]: Trade signals (8)
-            [25-35]: Agent state (11)
-            [36]: Previous actual bid/ask spread (1)
-            [37]: Bid distance from mid (1)
-            [38]: Ask distance from mid (1)
-            [39]: Mid price change (1)
-            
-        Inventory obs (12 dims):
-            - AMM: net_flow[13], cumulative_flow[16] (only stable signals, removed noisy flow_imbalance[14] and inventory_delta[15])
-            - Position: leverage[25], deviation[30], target_ema[32], entry_distance[33]
-            - Quote spreads: bid_distance[37], ask_distance[38], total_spread[36], mid_change[39]
-            - Trade: volume_imbalance[19], intensity[20], buy_pressure[22], sell_pressure[23]
-        """
-        # Select relevant indices (removed noisy AMM signals: flow_imbalance[14] and inventory_delta[15])
-        indices = [
-            13, 16,          # AMM signals (2): net_flow, cumulative_flow (stable signals only)
-            25,              # current_leverage (1)
-            30,              # deviation_from_target (1)
-            32,              # target_inventory_ema (1)
-            33,              # entry_price_distance (1)
-            37,              # bid_distance_from_mid (1)
-            38,              # ask_distance_from_mid (1)
-            36,              # total_spread (previous actual spread) (1)
-            39,              # mid_price_change (1)
-            19, 20, 22, 23,  # trade signals (4)
-        ]
-        
-        if full_obs.ndim == 1:
-            return full_obs[indices]
-        else:
-            return full_obs[:, indices]
 
 
-# Observation indices for inventory agent (from full 40-dim obs)
-# Removed noisy AMM signals: flow_imbalance[14] and inventory_delta[15]
-INVENTORY_OBS_INDICES = [
-    13, 16,          # AMM: net_flow, cumulative_flow (stable signals only)
-    25,              # current_leverage
-    30,              # deviation_from_target
-    32,              # target_inventory_ema (what agent asked for)
-    33,              # entry_price_distance (how far from entry)
-    37,              # bid_distance_from_mid (actual bid spread)
-    38,              # ask_distance_from_mid (actual ask spread)
-    36,              # total_spread (previous actual bid/ask spread)
-    39,              # mid_change (mid price change)
-    19, 20, 22, 23,  # trade: volume_imbalance, intensity, buy_pressure, sell_pressure
-]
-INVENTORY_OBS_DIM = len(INVENTORY_OBS_INDICES)  # 12 (removed noisy AMM signals)
+# NOTE: Observation extraction functions and constants below are DEPRECATED
+# Both agents now use the full 40-dim observation via shared encoder + attention
+# The attention mechanism learns to focus on relevant signals dynamically
+# These constants are kept for reference but are not used in the current architecture
 
