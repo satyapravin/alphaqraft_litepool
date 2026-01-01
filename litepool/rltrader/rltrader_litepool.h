@@ -59,7 +59,7 @@ class RlTraderEnvFns {
                     "foldername"_.Bind(std::string("./train_files/")),
                     "balance"_.Bind(1.0),
                     "start"_.Bind<int>(0),
-                    "ticks_per_step"_.Bind<int>(5),  // Advance 5 ticks per RL step
+                    "ticks_per_step"_.Bind<int>(10),  // Advance 10 ticks per RL step
                     "base_spread_bps"_.Bind<double>(1.0),  // Base spread in basis points
                     "min_size_pct"_.Bind<double>(0.5),      // Minimum order size as % of balance
                     "max_size_pct"_.Bind<double>(2.0));    // Maximum order size as % of balance
@@ -114,7 +114,7 @@ class RlTraderEnvFns {
     // MM agent: bid_spread [0,1], ask_spread [0,1], requote [0,1]
     // Inv agent: target_inventory [-1,1], risk_aversion [0,1]
     return MakeDict("action"_.Bind(Spec<float>({5}, {{  0.,  0.,  0., -1.,  0.0 },
-                                                     {  1.,  1.,  1.,  1.,  1.0 }})));
+                                                     {  1.,  1.,  1.,  1.,  0.1 }})));
   }
 };
 
@@ -138,7 +138,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   std::string foldername;
   double balance = 0;
   int start_read = 0;
-  int ticks_per_step = 5;
+  int ticks_per_step = 10;
   double base_spread_bps = 0.0;
   double min_size_pct = 0.5;
   double max_size_pct = 2.0;
@@ -223,6 +223,11 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     config.min_size_pct = min_size_pct;        // From Python config
     config.max_size_pct = max_size_pct;        // From Python config
     strategy_ptr = std::make_unique<RLTrader::Strategy>(*instr_ptr, *exchange_ptr, balance, 20, config);
+    
+    // Set step duration for time-based EMA computation (100ms per tick)
+    double step_duration_sec = ticks_per_step * 0.1;
+    strategy_ptr->setStepDuration(step_duration_sec);
+    
     adaptor_ptr = std::make_unique<RLTrader::EnvAdaptor>(*strategy_ptr, *exchange_ptr, trade_filename, ticks_per_step);
   }
 
@@ -545,11 +550,29 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     double current_realized_pnl = info["realized_pnl"];
     prev_realized_pnl = current_realized_pnl;
     
-    // === MM Agent Reward: execution quality ===
+    // === MM Agent Reward: execution quality + inventory tracking ===
     // spread_capture_from_fills: LIFO profit from round-trips completed this step (from latest fills)
     // fee_delta: maker rebates earned from providing liquidity
     // Both are directly controllable by the agent's quoting behavior
-    double mm_reward_raw = spread_capture_from_fills * MM_REWARD_SCALE;
+    double mm_reward_raw = (spread_capture_from_fills + fee_delta) * MM_REWARD_SCALE;
+    
+    // === Inventory Deviation Penalty ===
+    // MM agent is incentivized to skew quotes to track target inventory
+    // Penalty = -coefficient * |leverage - target_inventory|
+    // This replaces hardcoded inventory skew in strategy.cc
+    double current_leverage = info["leverage"];
+    double target_inventory = strategy_ptr->getTargetInventory();
+    double inventory_error = std::abs(current_leverage - target_inventory);
+    
+    // Penalty coefficient: should be small enough not to dominate spread_capture
+    // With ~180 steps/episode and typical spread_capture of ~$0.5, we want:
+    //   cumulative_penalty < spread_capture
+    //   0.002 * 0.5 * 180 = 0.18 (reasonable shaping vs $0.5 spread capture)
+    constexpr double INVENTORY_PENALTY_COEF = 0.0002;
+    double inventory_penalty = -INVENTORY_PENALTY_COEF * inventory_error;
+    
+    // Add penalty to raw reward (before log transform)
+    mm_reward_raw += inventory_penalty;
     
     // Apply log transform if enabled: sign(r) * log(1 + |r|)
     // This compresses large rewards while preserving sign and relative ordering
@@ -564,7 +587,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     // - MM agent: rewarded for spread_capture (execution quality, round-trip profits)
     // - Inv agent: rewarded for LIFO unrealized_pnl_delta (position direction) + fee_delta (rebates)
     // Both agents now use LIFO accounting for consistency
-    double inv_reward_raw = (unrealized_pnl_delta + fee_delta) * INV_REWARD_SCALE;
+    double inv_reward_raw = unrealized_pnl_delta * INV_REWARD_SCALE;
     
     // Apply log transform if enabled
     // CRITICAL: Ensure log transform is actually applied to prevent extreme values
@@ -589,8 +612,8 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     double mm_reward_clipped = softsign_clip(mm_reward, 2.0);
     double inv_reward_clipped = softsign_clip(inv_reward, 2.0);
     
-    state["info:mm_reward"_] = mm_reward_clipped;
-    state["info:inv_reward"_] = inv_reward_clipped;
+    state["info:mm_reward"_] = mm_reward_clipped; 
+    state["info:inv_reward"_] = inv_reward_clipped; 
     
     // === Combined Reward: for backwards compatibility ===
     // Use clipped rewards for combined reward (sum can exceed [-2, 2] but that's fine for combined)

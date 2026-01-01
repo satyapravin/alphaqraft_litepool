@@ -78,6 +78,10 @@ namespace RLTrader {
         bool hitLeverageLimit() const { return hit_leverage_limit_; }
         int getStepsSinceLastFill() const { return steps_since_last_fill_; }
         
+        // Set step duration for time-based EMA computation
+        // Should be called after construction with ticks_per_step * 0.1 (100ms per tick)
+        void setStepDuration(double step_duration_sec);
+        
         // Update smoothed target inventory and risk aversion (EMA smoothing to prevent flickering)
         void updateTargetInventory(double target_inventory_action, double risk_aversion_action);
         
@@ -147,11 +151,12 @@ namespace RLTrader {
         long last_trades_ = 0;                // Last trade count (for detecting changes without fills)
         bool first_call_ = true;               // First call flag (for detecting changes without fills)
         
-        // Model parameters
-        // TARGET_EMA_ALPHA controls how quickly target_inventory responds to agent actions
-        // Higher alpha = faster response, lower alpha = smoother but slower
-        // For market making with 500ms steps, we want reasonably fast response
-        // Alpha = 0.1 gives half-life of ~7 steps (3.5 sec): 0.5 = (1 - 0.1)^7 ≈ 0.478
-        static constexpr double TARGET_EMA_ALPHA = 0.01;
+        // Model parameters - TIME-BASED EMA
+        // Desired half-life in seconds (invariant to ticks_per_step)
+        static constexpr double TARGET_EMA_HALFLIFE_SEC = 60.0;  // 60 sec half-life for smooth target transitions
+        
+        // Computed alpha (set by setStepDuration based on step_duration_sec)
+        double step_duration_sec_ = 0.5;      // Default: 5 ticks × 100ms
+        double target_ema_alpha_ = 0.001;     // Will be recomputed based on step duration
     };
 }

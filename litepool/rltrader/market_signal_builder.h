@@ -26,8 +26,9 @@ namespace RLTrader {
 
     // Number of orderbook levels to use for signal computation
     constexpr int BOOK_DEPTH = 10;
-    // Number of snapshots to accumulate (5 snapshots = 500ms at 100ms intervals)
-    constexpr int SNAPSHOT_WINDOW = 5;
+    // Number of snapshots to accumulate (10 snapshots = 1 sec at 100ms intervals)
+    // Should match ticks_per_step for consistent step-level aggregation
+    constexpr int SNAPSHOT_WINDOW = 10;
     // Volatility windows (at ~10 updates/sec)
     constexpr int VOL_SHORT_WINDOW = 10;    // ~1 second
     constexpr int VOL_LONG_WINDOW = 600;    // ~1 minute

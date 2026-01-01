@@ -4,8 +4,8 @@ from dataclasses import dataclass
 class HierarchicalConfig:
     num_envs: int = 8
     num_threads: int = 8
-    n_steps: int = 18000  
-    max_episode_steps: int = 18000-1 
+    n_steps: int = 3600  
+    max_episode_steps: int = 3600-1 
 
     inventory_update_freq: int = 1  # Every step (target is smoothed by 120-step EMA in strategy)
 
@@ -29,7 +29,7 @@ class HierarchicalConfig:
     # Base spread in basis points (1 bps = 0.01% of mid price)
     # This is the MINIMUM spread - agent can only widen, not tighten below this
     # For BTC at $100k: 2 bps = $20 total spread
-    base_spread_bps: float = 2.0  # Wider spread to reduce adverse selection (was 1)
+    base_spread_bps: float = 1.50  # Wider spread to reduce adverse selection (was 1)
     min_size_pct: float = 1
     max_size_pct: float = 25.0
     balance: float = 10000.0

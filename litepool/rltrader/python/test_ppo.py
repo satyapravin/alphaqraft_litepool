@@ -24,7 +24,7 @@ print(f"Using device: {device}")
 
 # === Configuration ===
 NUM_ENVS = 1
-MAX_STEPS = 7200 * 20  # 100 hours of testing
+MAX_STEPS = 20 * 3600  # 20 hours of testing
 USE_DETERMINISTIC = True
 
 config = HierarchicalConfig()
@@ -133,10 +133,10 @@ def main():
     # Metrics tracking
     max_leverage = 0.0
     total_steps = 0
-    total_realized_pnl = 0.0  # LIFO-based
-    total_unrealized_pnl = 0.0  # LIFO-based
-    total_realized_pnl_avg = 0.0  # Average cost-based (for comparison)
-    total_unrealized_pnl_avg = 0.0  # Average cost-based (for comparison)
+    total_spread_capture = 0.0  # LIFO-based realized (from closed round-trips)
+    total_lifo_unrealized = 0.0  # LIFO-based unrealized
+    total_realized_pnl_avg = 0.0  # Average cost-based realized (balance - initial_balance)
+    total_unrealized_pnl_avg = 0.0  # Average cost-based unrealized
     total_trades = 0
     total_fees = 0.0
     last_env_info = None  # Store last env_info for final summary
@@ -155,9 +155,10 @@ def main():
     print(f"Mode: {'DETERMINISTIC' if USE_DETERMINISTIC else 'EXPLORATION'} (matches training)")
     print(f"Max steps: {MAX_STEPS}")
     print("="*80)
-    print(f"{'Step':>8} | {'MM.Rew':>8} | {'Inv.Rew':>8} | {'R.PnL':>10} | {'U.PnL':>10} | "
-          f"{'Fees':>8} | {'Lev':>6} | {'Trades':>6} | {'Target':>12} | {'RiskAv':>8} | {'AMM-Tgt':>8}")
-    print("-"*115)
+    # Header: all P&L values are LIFO-based to match summary
+    print(f"{'Step':>8} | {'MM.Rew':>8} | {'Inv.Rew':>8} | {'SprdCap':>12} | {'LifoU':>12} | {'Net':>12} | "
+          f"{'Lev':>6} | {'Trades':>5} | {'Target & Action':>22} | {'γ':>5} | {'Corr':>6}")
+    print("-"*135)
     
     try:
         while total_steps < MAX_STEPS:
@@ -214,8 +215,13 @@ def main():
 
             # Print progress
             if total_steps % 100 == 0:
-                realized_pnl = _extract_info_value(env_info, 'realized_pnl', 0, 0.0)
-                unrealized_pnl = _extract_info_value(env_info, 'lifo_unrealized_pnl', 0, 0.0)
+                # Show both LIFO (spread_capture) and Avg Cost (balance-based) for comparison
+                spread_capture = _extract_info_value(env_info, 'spread_capture', 0, 0.0)  # LIFO realized
+                lifo_unrealized = _extract_info_value(env_info, 'lifo_unrealized_pnl', 0, 0.0)  # LIFO unrealized
+                balance = _extract_info_value(env_info, 'balance', 0, 0.0)
+                initial_balance = _extract_info_value(env_info, 'initial_balance', 0, 0.0)
+                bal_chg = balance - initial_balance  # Avg cost realized
+                avg_unrealized = _extract_info_value(env_info, 'unrealized_pnl', 0, 0.0)  # Avg cost unrealized
                 fees = _extract_info_value(env_info, 'fees', 0, 0.0)
                 trade_count = int(_extract_info_value(env_info, 'trade_count', 0, 0.0))
                 
@@ -259,13 +265,14 @@ def main():
                     else:
                         corr_str = "0.000"
                 
-                # Display: Tgt = EMA-smoothed target from env (actual value used in strategy)
-                #         act = raw action (what C++ receives before EMA)
-                #         RiskAv = risk aversion parameter (γ) for A-S model
+                # Display: SprdCap = LIFO spread capture, LifoU = LIFO unrealized
+                #         Tgt = EMA-smoothed target from env, act = raw action
                 #         Corr = rolling correlation between AMM cumulative flow and target inventory
+                # Net PnL (LIFO) = SprdCap + LifoU
+                net_pnl_lifo = spread_capture + lifo_unrealized
                 print(f"{total_steps:8d} | {mm_r:+8.2f} | {inv_r:+8.2f} | "
-                      f"{realized_pnl:+10.4f} | {unrealized_pnl:+10.4f} | "
-                      f"{fees:8.4f} | {leverage:6.2f}x | {trade_count:6d} | "
+                      f"SprdCap:{spread_capture:+8.2f} | LifoU:{lifo_unrealized:+8.2f} | Net:{net_pnl_lifo:+8.2f} | "
+                      f"{leverage:6.2f}x | {trade_count:5d} | "
                       f"Tgt:{target_inventory:+.4f} (act:{scaled_action:+.4f}{'*' if updated else ''}) | "
                       f"γ:{risk_aversion:.3f} | Corr:{corr_str}")
             
@@ -295,36 +302,38 @@ def main():
             for env_id in range(NUM_ENVS):
                 if done[env_id]:
                     # Extract terminal info
-                    realized_pnl = _extract_info_value(env_info, 'final_realized_pnl', env_id, 0.0)  # LIFO
-                    unrealized_pnl = _extract_info_value(env_info, 'final_unrealized_pnl', env_id, 0.0)  # LIFO
+                    # LIFO: spread_capture (realized) + lifo_unrealized
                     spread_capture = _extract_info_value(env_info, 'final_spread_capture', env_id, 0.0)
+                    lifo_unrealized = _extract_info_value(env_info, 'lifo_unrealized_pnl', env_id, 0.0)
+                    # Avg Cost: (balance - initial_balance) + unrealized_pnl
+                    balance = _extract_info_value(env_info, 'balance', env_id, 0.0)
+                    initial_balance = _extract_info_value(env_info, 'initial_balance', env_id, 0.0)
+                    unrealized_pnl_avg = _extract_info_value(env_info, 'unrealized_pnl', env_id, 0.0)
+                    realized_pnl_avg = balance - initial_balance
+                    
                     fees = _extract_info_value(env_info, 'final_fees', env_id, 0.0)
                     trade_count = int(_extract_info_value(env_info, 'final_trade_count', env_id, 0.0))
                     net_amount_btc = _extract_info_value(env_info, 'final_net_amount_btc', env_id, 0.0)
                     
-                    # Calculate average cost-based PnL for comparison
-                    # Use regular info keys (balance and initial_balance are in current info, not final_* keys)
-                    balance = _extract_info_value(env_info, 'balance', env_id, 0.0)
-                    initial_balance = _extract_info_value(env_info, 'initial_balance', env_id, 0.0)
-                    unrealized_pnl_avg = _extract_info_value(env_info, 'unrealized_pnl', env_id, 0.0)  # Average cost
-                    realized_pnl_avg = balance - initial_balance  # Average cost-based realized
-                    
                     # Accumulate totals across all episodes
-                    total_realized_pnl += realized_pnl  # LIFO
-                    total_unrealized_pnl = unrealized_pnl  # LIFO (use final unrealized - current position)
-                    total_realized_pnl_avg += realized_pnl_avg  # Average cost
-                    total_unrealized_pnl_avg = unrealized_pnl_avg  # Average cost (use final - current position)
+                    total_spread_capture += spread_capture  # LIFO realized
+                    total_lifo_unrealized = lifo_unrealized  # LIFO unrealized (final state)
+                    total_realized_pnl_avg += realized_pnl_avg  # Avg cost realized
+                    total_unrealized_pnl_avg = unrealized_pnl_avg  # Avg cost unrealized (final state)
                     total_trades += trade_count
                     total_fees += fees
+                    
+                    # Net PnL using Avg Cost (= actual account value change)
+                    net_pnl = realized_pnl_avg + unrealized_pnl_avg
                     
                     print(f"\n[Episode End] Env {env_id} | "
                           f"Steps {int(episode_steps[env_id]):5d} | "
                           f"MM.Rew {float(episode_mm_total[env_id]):7.2f} | "
                           f"Inv.Rew {float(episode_inv_total[env_id]):7.2f} | "
-                          f"R.PnL ${realized_pnl:7.2f} | "
-                          f"SprdCap ${spread_capture:6.2f} | "
-                          f"U.PnL ${unrealized_pnl:7.2f} | "
-                          f"Net ${realized_pnl + unrealized_pnl:7.2f} | "
+                          f"SprdCap ${spread_capture:7.2f} | "
+                          f"Bal.Chg ${realized_pnl_avg:7.2f} | "
+                          f"U.PnL ${unrealized_pnl_avg:7.2f} | "
+                          f"Net ${net_pnl:7.2f} | "
                           f"Trades {trade_count:4d} | "
                           f"Pos {net_amount_btc:+.5f} BTC")
                     print("-"*80)
@@ -342,38 +351,43 @@ def main():
         print("\n\nEvaluation interrupted by user.")
 
     finally:
-        # Get final state metrics if evaluation ended mid-episode
+        # Always use CURRENT state for summary (not accumulated episode values)
+        # This ensures summary matches the last step output when user Ctrl+C's
         if total_steps > 0 and last_env_info is not None:
             # Get current state from last env_info
-            final_realized_pnl = _extract_info_value(last_env_info, 'realized_pnl', 0, 0.0)  # LIFO
-            final_unrealized_pnl = _extract_info_value(last_env_info, 'lifo_unrealized_pnl', 0, 0.0)  # LIFO
+            # LIFO: spread_capture + lifo_unrealized
+            final_spread_capture = _extract_info_value(last_env_info, 'spread_capture', 0, 0.0)
+            final_lifo_unrealized = _extract_info_value(last_env_info, 'lifo_unrealized_pnl', 0, 0.0)
+            # Avg Cost: (balance - initial_balance) + unrealized_pnl
+            final_balance = _extract_info_value(last_env_info, 'balance', 0, 0.0)
+            final_initial_balance = _extract_info_value(last_env_info, 'initial_balance', 0, 0.0)
+            final_unrealized_pnl_avg = _extract_info_value(last_env_info, 'unrealized_pnl', 0, 0.0)
+            final_realized_pnl_avg = final_balance - final_initial_balance
+            
             final_trade_count = int(_extract_info_value(last_env_info, 'trade_count', 0, 0.0))
             final_fees = _extract_info_value(last_env_info, 'fees', 0, 0.0)
             
-            # Calculate average cost-based PnL for comparison
-            final_balance = _extract_info_value(last_env_info, 'balance', 0, 0.0)
-            final_initial_balance = _extract_info_value(last_env_info, 'initial_balance', 0, 0.0)
-            final_unrealized_pnl_avg = _extract_info_value(last_env_info, 'unrealized_pnl', 0, 0.0)  # Average cost
-            final_realized_pnl_avg = final_balance - final_initial_balance  # Average cost-based
-            
-            # If we haven't completed any episodes, use current state
-            if total_trades == 0:
-                total_realized_pnl = final_realized_pnl  # LIFO
-                total_unrealized_pnl = final_unrealized_pnl  # LIFO
-                total_realized_pnl_avg = final_realized_pnl_avg  # Average cost
-                total_unrealized_pnl_avg = final_unrealized_pnl_avg  # Average cost
-                total_trades = final_trade_count
-                total_fees = final_fees
+            # Always use current state values for summary (matches last step output)
+            total_spread_capture = final_spread_capture
+            total_lifo_unrealized = final_lifo_unrealized
+            total_realized_pnl_avg = final_realized_pnl_avg
+            total_unrealized_pnl_avg = final_unrealized_pnl_avg
+            total_trades = final_trade_count
+            total_fees = final_fees
         
-        net_pnl = total_realized_pnl + total_unrealized_pnl  # LIFO
-        net_pnl_avg = total_realized_pnl_avg + total_unrealized_pnl_avg  # Average cost
+        # LIFO: spread_capture + lifo_unrealized
+        net_pnl_lifo = total_spread_capture + total_lifo_unrealized
+        # Avg Cost: (balance - initial_balance) + unrealized_pnl
+        # This is the TRUE P&L that matches account value
+        net_pnl_avg = total_realized_pnl_avg + total_unrealized_pnl_avg
         
         print("\n" + "="*80)
-        print("Evaluation Summary")
+        print("Evaluation Summary (Current State)")
         print("="*80)
         print(f"Total steps:        {total_steps}")
-        print(f"Net PnL (LIFO):     ${net_pnl:10.4f} (R: ${total_realized_pnl:10.4f} + U: ${total_unrealized_pnl:10.4f})")
-        print(f"Net PnL (Avg Cost): ${net_pnl_avg:10.4f} (R: ${total_realized_pnl_avg:10.4f} + U: ${total_unrealized_pnl_avg:10.4f})")
+        print(f"LIFO P&L:           ${net_pnl_lifo:10.4f} (SprdCap: ${total_spread_capture:10.4f} + LIFO U: ${total_lifo_unrealized:10.4f})")
+        print(f"Avg Cost P&L:       ${net_pnl_avg:10.4f} (Bal Chg: ${total_realized_pnl_avg:10.4f} + Avg U: ${total_unrealized_pnl_avg:10.4f})")
+        print(f"  Note: Avg Cost P&L = actual account value change")
         print(f"Total trades:       {total_trades}")
         print(f"Total fees:         ${total_fees:10.4f}")
         print(f"Max leverage:       {max_leverage:.2f}x")

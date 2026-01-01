@@ -51,7 +51,7 @@ private:
     double max_realized_pnl = 0;
     double drawdown = 0;
     double prev_mid_price_ = 0;
-    std::deque<double> mid_price_deque;
+    // (mid_price_deque removed - now using step_price_delta_ for step-level price change)
     std::unique_ptr<MarketSignalBuilder> market_builder;
     AmmV3Simulator amm_simulator;  // AMM flow signal generator
     std::unique_ptr<TradeReader> trade_reader;  // Optional trade reader
@@ -61,26 +61,45 @@ private:
     // EMA smoothing for noisy AMM signals (inventory_delta and flow_imbalance)
     double flow_imbalance_ema_ = 0.0;
     double inventory_delta_ema_ = 0.0;
-    static constexpr double AMM_SIGNAL_EMA_ALPHA = 0.1;  // ~7 step half-life for smoothing noisy signals
     
     // Rolling P&L momentum - EMA of per-step net P&L delta (using weighted avg unrealized)
     // Helps inventory agent see if it's on a winning or losing streak
     double prev_net_pnl_ = 0.0;           // Previous step's net P&L (realized + weighted avg unrealized)
     double rolling_pnl_momentum_ = 0.0;   // EMA of P&L deltas
     double rolling_pnl_var_ = 0.0;        // EMA of squared P&L deltas (for volatility)
-    static constexpr double PNL_MOMENTUM_ALPHA = 0.05;  // ~14 step half-life (~7 sec window)
     
     // Price trend signal using dual EMAs (fast vs slow)
     // Positive = price trending up, Negative = trending down
-    double price_ema_fast_ = 0.0;         // Fast EMA (~10 step half-life = 5 sec)
-    double price_ema_slow_ = 0.0;         // Slow EMA (~60 step half-life = 30 sec)
+    double price_ema_fast_ = 0.0;         // Fast EMA
+    double price_ema_slow_ = 0.0;         // Slow EMA
     bool price_emas_initialized_ = false;
-    static constexpr double PRICE_EMA_FAST_ALPHA = 0.07;   // ~10 step half-life
-    static constexpr double PRICE_EMA_SLOW_ALPHA = 0.012;  // ~60 step half-life
     
-    // Cached signals from last tick (updated in next() loop, used in computeState())
+    // =========================================================================
+    // TIME-BASED EMA ALPHAS (computed from half-life in seconds)
+    // These are computed in constructor based on step_duration_sec
+    // Formula: alpha = 1 - exp(-ln(2) * step_duration_sec / half_life_sec)
+    // =========================================================================
+    double step_duration_sec_ = 0.5;      // Default: 5 ticks × 100ms = 500ms
+    
+    // Desired half-lives in SECONDS (invariant to ticks_per_step)
+    static constexpr double AMM_SIGNAL_HALFLIFE_SEC = 3.5;    // 3.5 sec half-life for AMM signal smoothing
+    static constexpr double PNL_MOMENTUM_HALFLIFE_SEC = 7.0;  // 7 sec half-life for P&L momentum
+    static constexpr double PRICE_EMA_FAST_HALFLIFE_SEC = 5.0;   // 5 sec fast EMA
+    static constexpr double PRICE_EMA_SLOW_HALFLIFE_SEC = 30.0;  // 30 sec slow EMA
+    
+    // Computed alphas (set in constructor based on step_duration_sec)
+    double amm_signal_ema_alpha_ = 0.1;
+    double pnl_momentum_alpha_ = 0.05;
+    double price_ema_fast_alpha_ = 0.07;
+    double price_ema_slow_alpha_ = 0.012;
+    
+    // Step-level price delta (end_mid - start_mid over ticks_per_step window)
+    // Represents price change over the full RL step (e.g., 1 sec for ticks_per_step=10)
+    double step_price_delta_ = 0.0;
+    
+    // Cached signals from step (updated in next() loop, used in computeState())
     std::vector<double> last_market_signals_;
-    TradeSignals last_trade_signals_;
+    TradeSignals last_trade_signals_;  // Now accumulated over all ticks in step
     std::unordered_map<std::string, double> info;
     FixedVector<double, 20> bid_prices;
     FixedVector<double, 20> ask_prices;

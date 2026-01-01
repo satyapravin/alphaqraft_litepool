@@ -84,18 +84,33 @@ void Strategy::reset() {
     }
 }
 
+void Strategy::setStepDuration(double step_duration_sec) {
+    step_duration_sec_ = step_duration_sec;
+    
+    // Compute time-based EMA alpha from half-life
+    // Formula: alpha = 1 - exp(-ln(2) * step_duration / half_life)
+    if (TARGET_EMA_HALFLIFE_SEC > 0 && step_duration_sec > 0) {
+        target_ema_alpha_ = 1.0 - std::exp(-0.693147 * step_duration_sec / TARGET_EMA_HALFLIFE_SEC);
+    } else {
+        target_ema_alpha_ = 0.001;  // Fallback
+    }
+    
+    std::cout << "[Strategy] step_duration=" << step_duration_sec_ << "s, "
+              << "target_ema_alpha=" << target_ema_alpha_ << std::endl;
+}
+
 void Strategy::updateTargetInventory(double target_inventory_action, double risk_aversion_action) {
     // Target inventory: Action is in [-target_range, +target_range]
     // Use action directly without scaling
     double target_raw = target_inventory_action;
     
-    // Apply EMA smoothing to prevent flipping (TARGET_EMA_ALPHA = 0.0058 gives 120 step half-life = 60 sec)
-    target_inventory_ema = TARGET_EMA_ALPHA * target_raw + (1.0 - TARGET_EMA_ALPHA) * target_inventory_ema;
+    // Apply EMA smoothing using time-based alpha (60 sec half-life regardless of ticks_per_step)
+    target_inventory_ema = target_ema_alpha_ * target_raw + (1.0 - target_ema_alpha_) * target_inventory_ema;
     
     // Risk aversion: Action is in [0, 1]
     // Clamp to valid range and apply EMA smoothing
     double risk_aversion_clamped = std::clamp(risk_aversion_action, 0.0, 1.0);
-    risk_aversion_ema = TARGET_EMA_ALPHA * risk_aversion_clamped + (1.0 - TARGET_EMA_ALPHA) * risk_aversion_ema;
+    risk_aversion_ema = target_ema_alpha_ * risk_aversion_clamped + (1.0 - target_ema_alpha_) * risk_aversion_ema;
 }
 
 void Strategy::updateVolatility(double mid_price) {
@@ -157,61 +172,47 @@ std::pair<double, double> Strategy::computeQuotePrices(
     double tick_size) {
     
     // ============================================================================
-    // Avellaneda-Stoikov Model Implementation
+    // Avellaneda-Stoikov Model with Inventory Skew
     // ============================================================================
-    // Uses A-S formulas:
-    //   Reservation price: r = s - (q - q_target) * γ * σ² * (T - t)
-    //   Optimal spread: δ = (1/γ) * log(1 + γ/k) + (q - q_target) * γ * σ² * (T - t)
+    // Uses A-S formulas with inventory adjustment:
+    //   Inventory adjustment = (leverage - target_inventory) * γ * σ²
     // Where:
-    //   s = mid_price, q = leverage (inventory), q_target = target_inventory_ema,
-    //   (q - q_target) = inventory_error, γ = risk_aversion_ema,
-    //   σ² = variance (vol_2min_²), T - t = time remaining, k = order flow intensity
+    //   γ = risk_aversion_ema (controlled by inventory agent, range [0, 0.1])
+    //   σ² = variance (vol_2min_²)
+    // Positive inventory_error (too long) → widen bid, tighten ask
+    // Negative inventory_error (too short) → tighten bid, widen ask
     // ============================================================================
     
-    // Get risk aversion parameter (γ) from inventory agent
+    // Get risk aversion parameter (γ) from inventory agent - range [0, 0.1]
     double gamma = risk_aversion_ema;
     
     // Compute variance (σ²) from 2-minute volatility
     double variance = vol_2min_ * vol_2min_;
     
-    // Time remaining (T - t): use 1 hour as typical trading horizon
-    // This represents how long we expect to hold the position
-    constexpr double TIME_HORIZON_SEC = 1.0;  
-        
     // Compute inventory error (difference between current leverage and target)
-    // This is what drives the A-S adjustments, not absolute inventory
     double target_leverage = target_inventory_ema;
-    double inventory_error = leverage - target_leverage; // Positive = too long, Negative = too short
+    double inventory_error = leverage - target_leverage;  // Positive = too long
     
-    // Inventory adjustment: positive inventory_error (too long) → widen bid, tighten ask
-    //                     negative inventory_error (too short) → tighten bid, widen ask
-    // This helps the agent actually BUILD position when it wants to go long/short
-    // Without aggressive skewing, fills are too balanced and position stays near 0
-    double inventory_adjustment = inventory_error * gamma * variance / TIME_HORIZON_SEC;
-    // Cap adjustment to reasonable range (2% of price max - increased from 1%)
+    // Inventory adjustment based on A-S model
+    // Scale: inventory_error * gamma * variance gives reasonable skew
+    double inventory_adjustment = inventory_error * gamma * variance;
+    // Cap adjustment to reasonable range (2% of price max)
     inventory_adjustment = std::clamp(inventory_adjustment, -mid_price * 0.02, mid_price * 0.02);
     
-    // Agent controls bid_spread and ask_spread in [0, 1] range
-    // These ADD spread on top of the base_spread_bps minimum
-    // This prevents the agent from quoting too tight and getting adversely selected
-    
     // Base spread from config (in basis points, convert to price units)
-    // 1 bps = 0.01% = 0.0001, so base_spread_bps * mid_price / 10000
     double base_spread = mid_price * config.base_spread_bps / 10000.0;
     
     // Minimum spread: max of (base_spread, tick_size)
-    // This ensures even with action=0, we have meaningful spread to avoid adverse selection
     double min_spread = std::max(base_spread, tick_size);
     
     // Agent action [0, 1] ADDS more spread on top of minimum
-    // action=0 → minimum spread (base_spread_bps) - tightest possible
-    // action=1 → minimum + volatility extra - widest
-    double vol_extra = std::max(vol_2min_, tick_size);  // Extra spread range based on volatility
+    double vol_extra = std::max(vol_2min_, tick_size);
     double bid_action = min_spread + std::clamp(action.bid_spread, 0.0, 1.0) * vol_extra;
     double ask_action = min_spread + std::clamp(action.ask_spread, 0.0, 1.0) * vol_extra;
     
-    double bid_spread = bid_action + inventory_adjustment;  // Widen bid when positive error
-    double ask_spread = ask_action - inventory_adjustment;  // Tighten ask when positive error
+    // Apply inventory skew: widen bid when too long, tighten ask (and vice versa)
+    double bid_spread = bid_action + inventory_adjustment;
+    double ask_spread = ask_action - inventory_adjustment;
     
     // Asymmetric floor: only protect the position-INCREASING side
     // Allow the position-REDUCING side to go tight for faster offloading
@@ -255,7 +256,7 @@ std::pair<double, double> Strategy::computeQuoteSizes(
     const RLAction& action,
     double init_balance) {
     
-    constexpr double SIZE_PER_LEVEL_PCT = 1;
+    constexpr double SIZE_PER_LEVEL_PCT = 0.5;
     double size_usd = SIZE_PER_LEVEL_PCT / 100.0 * init_balance;
     
     return {size_usd, size_usd};
@@ -317,7 +318,7 @@ void Strategy::quote(const RLAction& action,
     // This gives the agent explicit control over quote update timing
     // Skip quoting if agent says no requote (keep existing orders in the book)
     // BUT always requote if forced (first call, no orders, or stale quotes)
-    if (!force_requote && action.should_requote <= 0.3) {
+    if (!force_requote && action.should_requote <= 0.8) {
         // Still update volatility even when not requoting
         updateVolatility(mid_price);
         return;

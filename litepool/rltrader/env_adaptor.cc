@@ -15,8 +15,16 @@
 #include "env_adaptor.h"
 #include <algorithm>
 #include <iostream>
+#include <cmath>
 
 using namespace RLTrader;
+
+// Helper function to compute EMA alpha from half-life
+// alpha = 1 - exp(-ln(2) * step_duration / half_life)
+static double computeEmaAlpha(double half_life_sec, double step_duration_sec) {
+    if (half_life_sec <= 0 || step_duration_sec <= 0) return 0.1;  // Fallback
+    return 1.0 - std::exp(-0.693147 * step_duration_sec / half_life_sec);
+}
 
 EnvAdaptor::EnvAdaptor(Strategy& strat, BaseExchange& exch, const std::string& trade_filename, int ticks_per_step):
             strategy(strat),
@@ -27,12 +35,48 @@ EnvAdaptor::EnvAdaptor(Strategy& strat, BaseExchange& exch, const std::string& t
                          std::make_unique<TradeReader>(trade_filename, 0)),
             trade_signal_builder(std::make_unique<TradeSignalBuilder>()),
             bid_prices(), ask_prices(), bid_sizes(), ask_sizes() {
+    
+    // Compute step duration: each tick is ~100ms, so step_duration = ticks_per_step * 0.1 sec
+    step_duration_sec_ = ticks_per_step * 0.1;
+    
+    // Compute time-based EMA alphas (invariant to ticks_per_step)
+    amm_signal_ema_alpha_ = computeEmaAlpha(AMM_SIGNAL_HALFLIFE_SEC, step_duration_sec_);
+    pnl_momentum_alpha_ = computeEmaAlpha(PNL_MOMENTUM_HALFLIFE_SEC, step_duration_sec_);
+    price_ema_fast_alpha_ = computeEmaAlpha(PRICE_EMA_FAST_HALFLIFE_SEC, step_duration_sec_);
+    price_ema_slow_alpha_ = computeEmaAlpha(PRICE_EMA_SLOW_HALFLIFE_SEC, step_duration_sec_);
+    
+    // Log computed alphas for debugging
+    std::cout << "[EnvAdaptor] ticks_per_step=" << ticks_per_step 
+              << ", step_duration=" << step_duration_sec_ << "s" << std::endl;
+    std::cout << "[EnvAdaptor] EMA alphas: amm_signal=" << amm_signal_ema_alpha_
+              << ", pnl_momentum=" << pnl_momentum_alpha_
+              << ", price_fast=" << price_ema_fast_alpha_
+              << ", price_slow=" << price_ema_slow_alpha_ << std::endl;
 }
 
 bool EnvAdaptor::next() {
     std::fill_n(state.begin(), state.size(), 0);
     OrderBook book;
     size_t read_slot;
+    
+    // =========================================================================
+    // ACCUMULATE signals across ticks for proper step-level aggregation
+    // With ticks_per_step=10, we want signals to represent change over 1 second
+    // =========================================================================
+    double step_start_mid = 0.0;    // First tick's mid price
+    double step_end_mid = 0.0;      // Last tick's mid price
+    
+    // Accumulated trade signals over the step window
+    TradeSignals accumulated_trades;
+    accumulated_trades.buy_volume = 0.0;
+    accumulated_trades.sell_volume = 0.0;
+    accumulated_trades.volume_imbalance = 0.0;
+    accumulated_trades.trade_intensity = 0.0;
+    accumulated_trades.price_impact = 0.0;
+    accumulated_trades.buy_pressure = 0.0;
+    accumulated_trades.sell_pressure = 0.0;
+    accumulated_trades.time_since_last_trade = 0.0;
+    int trade_tick_count = 0;  // For averaging rate-based signals
     
     // Advance multiple ticks per RL step to let orders persist
     // IMPORTANT: Process AMM for EACH tick to capture all price movements
@@ -48,8 +92,13 @@ bool EnvAdaptor::next() {
         this->strategy.next();  // Process any fills from this tick
         
         // Process ALL signal builders for EACH tick to capture full temporal dynamics
-        // This ensures we don't lose 80% of information (5 ticks per RL step at 100ms each)
         double mid_price = (book.bid_prices[0] + book.ask_prices[0]) * 0.5;
+        
+        // Track first and last mid price for step-level price delta
+        if (tick == 0) {
+            step_start_mid = mid_price;
+        }
+        step_end_mid = mid_price;  // Always update to get last tick's price
         
         // 1. AMM flow signals - captures price movements for inventory simulation
         if (mid_price > 0) {
@@ -60,17 +109,53 @@ bool EnvAdaptor::next() {
         // Store last tick's signals for use in computeState()
         last_market_signals_ = market_builder->add_book(book);
         
-        // 3. Trade signals - update EMA with trades from this tick's timestamp
+        // 3. Trade signals - ACCUMULATE across ticks for step-level aggregation
         if (trade_reader && trade_signal_builder) {
             SimExchange* sim_exch = dynamic_cast<SimExchange*>(&exchange);
             if (sim_exch) {
                 long long book_timestamp = sim_exch->getCurrentTimestamp();
                 std::vector<Trade> recent_trades = trade_reader->getRecentTrades(book_timestamp);
-                last_trade_signals_ = trade_signal_builder->add_trades(recent_trades, mid_price, book_timestamp);
+                TradeSignals tick_signals = trade_signal_builder->add_trades(recent_trades, mid_price, book_timestamp);
+                
+                // ACCUMULATE volume-based signals (sum over step window)
+                accumulated_trades.buy_volume += tick_signals.buy_volume;
+                accumulated_trades.sell_volume += tick_signals.sell_volume;
+                accumulated_trades.price_impact += tick_signals.price_impact;  // Sum impacts
+                accumulated_trades.buy_pressure += tick_signals.buy_pressure;
+                accumulated_trades.sell_pressure += tick_signals.sell_pressure;
+                
+                // For rate-based signals, we'll average at the end
+                accumulated_trades.trade_intensity += tick_signals.trade_intensity;
+                accumulated_trades.time_since_last_trade = tick_signals.time_since_last_trade;  // Use latest
+                trade_tick_count++;
             }
         }
         
         this->exchange.done_read(read_slot);
+    }
+    
+    // =========================================================================
+    // FINALIZE step-level signals after processing all ticks
+    // =========================================================================
+    
+    // Compute step-level price delta (change over the full step window)
+    step_price_delta_ = step_end_mid - step_start_mid;
+    
+    // Finalize accumulated trade signals
+    if (trade_tick_count > 0) {
+        // Average rate-based signals
+        accumulated_trades.trade_intensity /= trade_tick_count;
+        
+        // Compute step-level volume imbalance from accumulated volumes
+        double total_vol = accumulated_trades.buy_volume + accumulated_trades.sell_volume;
+        if (total_vol > 1e-9) {
+            accumulated_trades.volume_imbalance = (accumulated_trades.buy_volume - accumulated_trades.sell_volume) / total_vol;
+        } else {
+            accumulated_trades.volume_imbalance = 0.0;
+        }
+        
+        // Store as final trade signals for this step
+        last_trade_signals_ = accumulated_trades;
     }
     
     // Compute final state from the last tick
@@ -100,7 +185,6 @@ void EnvAdaptor::reset() {
     market_builder = std::move(market_ptr);
     this->strategy.reset();
     std::fill_n(state.begin(), state.size(), 0);
-    mid_price_deque.clear();
     prev_mid_price_ = 0.0;  // Reset previous mid price
     // Reset AMM simulator so it auto-initializes on first step with valid price
     amm_simulator.clear();
@@ -118,6 +202,9 @@ void EnvAdaptor::reset() {
     price_ema_fast_ = 0.0;
     price_ema_slow_ = 0.0;
     price_emas_initialized_ = false;
+    
+    // Reset step-level price delta
+    step_price_delta_ = 0.0;
     
     // Reset trade signal builder
     if (trade_signal_builder) {
@@ -151,10 +238,9 @@ void EnvAdaptor::computeInfo(OrderBook &book) {
     info.clear();
     auto mid = (bid_price + ask_price) * 0.5;
     info["mid_price"] = mid;
-    mid_price_deque.push_back(mid);
-    mid -= mid_price_deque.front(); 
-    if (mid_price_deque.size() > 1) { mid_price_deque.pop_front(); }
-    info["mid_diff"] = mid;
+    // Use step-level price delta (difference between t and t-ticks_per_step)
+    // This captures the full price change over the RL step window
+    info["mid_diff"] = step_price_delta_;
     info["balance"] = posInfo.balance;
     info["initial_balance"] = strategy.getPosition().getInitialBalance();  // For average cost realized PnL calculation
     info["unrealized_pnl"] = posInfo.inventoryPnL;           // Weighted-average unrealized PnL (for logging, matches balance cash flow)
@@ -205,12 +291,13 @@ void EnvAdaptor::computeState(OrderBook& book)
         state[13] = amm_signals.net_flow;        // EMA-based flow momentum (already smooth)
         
         // Apply EMA smoothing to noisy signals before storing in state
-        flow_imbalance_ema_ = AMM_SIGNAL_EMA_ALPHA * amm_signals.flow_imbalance + 
-                             (1.0 - AMM_SIGNAL_EMA_ALPHA) * flow_imbalance_ema_;
+        // Uses time-based alpha computed from AMM_SIGNAL_HALFLIFE_SEC
+        flow_imbalance_ema_ = amm_signal_ema_alpha_ * amm_signals.flow_imbalance + 
+                             (1.0 - amm_signal_ema_alpha_) * flow_imbalance_ema_;
         state[14] = flow_imbalance_ema_;  // Smoothed buy/sell imbalance
         
-        inventory_delta_ema_ = AMM_SIGNAL_EMA_ALPHA * amm_signals.inventory_delta + 
-                              (1.0 - AMM_SIGNAL_EMA_ALPHA) * inventory_delta_ema_;
+        inventory_delta_ema_ = amm_signal_ema_alpha_ * amm_signals.inventory_delta + 
+                              (1.0 - amm_signal_ema_alpha_) * inventory_delta_ema_;
         state[15] = inventory_delta_ema_;  // Smoothed LP inventory change
         
         // [16] Cumulative flow / balance: trend indicator for target inventory
@@ -364,9 +451,9 @@ void EnvAdaptor::computeState(OrderBook& book)
             price_emas_initialized_ = true;
             state[39] = 0.0;  // No trend signal on first step
         } else {
-            // Update EMAs
-            price_ema_fast_ = PRICE_EMA_FAST_ALPHA * mid + (1.0 - PRICE_EMA_FAST_ALPHA) * price_ema_fast_;
-            price_ema_slow_ = PRICE_EMA_SLOW_ALPHA * mid + (1.0 - PRICE_EMA_SLOW_ALPHA) * price_ema_slow_;
+            // Update EMAs using time-based alphas
+            price_ema_fast_ = price_ema_fast_alpha_ * mid + (1.0 - price_ema_fast_alpha_) * price_ema_fast_;
+            price_ema_slow_ = price_ema_slow_alpha_ * mid + (1.0 - price_ema_slow_alpha_) * price_ema_slow_;
             
             // Trend signal: (fast - slow) / slow, normalized
             // Positive = price is trending up, Negative = trending down
@@ -397,14 +484,14 @@ void EnvAdaptor::computeState(OrderBook& book)
             // Normalize by initial balance before computing EMA
             double pnl_delta_normalized = pnl_delta / initBal;
             
-            // Update EMA of P&L momentum
-            rolling_pnl_momentum_ = PNL_MOMENTUM_ALPHA * pnl_delta_normalized + 
-                                   (1.0 - PNL_MOMENTUM_ALPHA) * rolling_pnl_momentum_;
+            // Update EMA of P&L momentum using time-based alpha
+            rolling_pnl_momentum_ = pnl_momentum_alpha_ * pnl_delta_normalized + 
+                                   (1.0 - pnl_momentum_alpha_) * rolling_pnl_momentum_;
             
             // Update EMA of squared P&L deltas (for volatility)
             double delta_squared = pnl_delta_normalized * pnl_delta_normalized;
-            rolling_pnl_var_ = PNL_MOMENTUM_ALPHA * delta_squared + 
-                              (1.0 - PNL_MOMENTUM_ALPHA) * rolling_pnl_var_;
+            rolling_pnl_var_ = pnl_momentum_alpha_ * delta_squared + 
+                              (1.0 - pnl_momentum_alpha_) * rolling_pnl_var_;
             
             // [40] P&L momentum: ±0.1% of balance per step = ±tanh(1)
             state[40] = std::tanh(rolling_pnl_momentum_ * 1000.0);

@@ -296,11 +296,16 @@ class InventoryAgent(nn.Module):
         # Jacobian: |dy/dx| = 2 * target_range
         # log_prob_y = log_prob_x - log(2 * target_range)
         target_inv = (target_inv_beta - 0.5) * 2.0 * self.target_range
-        risk_aversion = risk_aversion_beta  # Already in [0, 1]
+        # Transform risk_aversion from [0, 1] to [0, 0.1] for A-S model
+        # Lower gamma = more aggressive inventory management
+        risk_aversion = risk_aversion_beta * 0.1
         
         # Adjust log_prob for transformation (Jacobian correction)
+        # target_inv: y = (x - 0.5) * 2 * target_range, |dy/dx| = 2 * target_range
+        # risk_aversion: y = x * 0.1, |dy/dx| = 0.1
+        # Total Jacobian = 2 * target_range * 0.1 = 0.2 * target_range
         if not (temperature == 0.0 or deterministic):
-            log_prob = log_prob - torch.log(torch.tensor(2.0 * self.target_range, device=obs.device))
+            log_prob = log_prob - torch.log(torch.tensor(0.2 * self.target_range, device=obs.device))
         
         action = torch.cat([target_inv, risk_aversion], dim=-1)
         
@@ -333,7 +338,8 @@ class InventoryAgent(nn.Module):
         # y = (x - 0.5) * 2 * target_range
         # x = (y / (2 * target_range)) + 0.5
         target_inv_beta = (actions[:, 0:1] / (2.0 * self.target_range)) + 0.5
-        risk_aversion_beta = actions[:, 1:2]  # Already in [0, 1]
+        # Transform risk_aversion back from [0, 0.1] to [0, 1] for Beta distribution
+        risk_aversion_beta = actions[:, 1:2] / 0.1
         
         # Clamp to valid Beta range [0, 1] (shouldn't be needed, but safety check)
         target_inv_beta = torch.clamp(target_inv_beta, min=1e-6, max=1.0 - 1e-6)
@@ -360,16 +366,21 @@ class InventoryAgent(nn.Module):
         risk_log_prob = risk_dist.log_prob(risk_aversion_beta)
         
         # Adjust log_prob for transformation (Jacobian correction)
-        # y = (x - 0.5) * 2 * target_range, so |dy/dx| = 2 * target_range
-        log_prob = (target_log_prob + risk_log_prob).sum(dim=-1, keepdim=True) - torch.log(torch.tensor(2.0 * self.target_range, device=obs.device))
+        # target_inv: y = (x - 0.5) * 2 * target_range, |dy/dx| = 2 * target_range
+        # risk_aversion: y = x * 0.1, |dy/dx| = 0.1
+        # Total Jacobian = 2 * target_range * 0.1 = 0.2 * target_range
+        log_prob = (target_log_prob + risk_log_prob).sum(dim=-1, keepdim=True) - torch.log(torch.tensor(0.2 * self.target_range, device=obs.device))
         
         # Entropy: for transformed variable y = a*x + b, H(y) = H(x) + log|a|
-        # target_inventory is transformed: y = (x - 0.5) * 2 * target_range, so |a| = 2 * target_range
+        # target_inventory: |a| = 2 * target_range
+        # risk_aversion: |a| = 0.1
+        # Total Jacobian correction = log(2 * target_range) + log(0.1) = log(0.2 * target_range)
         # Beta entropy CAN be negative for concentrated distributions - don't clamp, keep gradient signal
         target_entropy = target_dist.entropy()
         risk_entropy = risk_dist.entropy()
-        # Add Jacobian correction for target_inventory transformation
-        jacobian_correction = torch.log(torch.tensor(2.0 * self.target_range, device=obs.device))
+        # Add Jacobian correction for both transformations
+        # log(2 * target_range) + log(0.1) = log(0.2 * target_range)
+        jacobian_correction = torch.log(torch.tensor(0.2 * self.target_range, device=obs.device))
         entropy = (target_entropy + risk_entropy).sum(dim=-1, keepdim=True) + jacobian_correction
         
         return log_prob, entropy, value

@@ -396,9 +396,9 @@ class HierarchicalPPOTrainer:
             
             mm_reward = _extract_info_value(env_info, 'mm_reward', 0.0)
             inv_reward = _extract_info_value(env_info, 'inv_reward', 0.0)
-            realized_pnl = _extract_info_value(env_info, 'realized_pnl', 0.0)  # LIFO realized
-            unrealized_pnl = _extract_info_value(env_info, 'unrealized_pnl', 0.0)  # Weighted avg unrealized
-            spread_capture = _extract_info_value(env_info, 'spread_capture', 0.0)  # LIFO spread capture
+            realized_pnl = _extract_info_value(env_info, 'realized_pnl', 0.0)  # Avg cost realized (matches balance change)
+            unrealized_pnl = _extract_info_value(env_info, 'unrealized_pnl', 0.0)  # Avg cost unrealized
+            spread_capture = _extract_info_value(env_info, 'spread_capture', 0.0)  # LIFO spread capture (round-trip profits)
             fees = _extract_info_value(env_info, 'fees', 0.0)
             trade_count = _extract_info_value(env_info, 'trade_count', 0)
             net_amount_btc = _extract_info_value(env_info, 'net_amount_btc', 0.0)
