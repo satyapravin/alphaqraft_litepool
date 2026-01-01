@@ -50,7 +50,7 @@ public:
     // Half-life formula: decay = 0.5^(1/steps), where steps = seconds * 2
     static constexpr int FLOW_WINDOW = 240;              // 120 sec window for flow_imbalance
     static constexpr double NET_FLOW_DECAY = 0.99505;    // 70 sec half-life (140 steps)
-    static constexpr double CUMULATIVE_FLOW_DECAY = 0.99885;  // 300 sec half-life (600 steps)
+    static constexpr double CUMULATIVE_FLOW_DECAY = 0.99424;  // 60 sec half-life (120 steps) - balanced responsiveness
     
     AmmV3Simulator() : initialized_(false) {}
     

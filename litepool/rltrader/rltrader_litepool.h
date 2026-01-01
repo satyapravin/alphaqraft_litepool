@@ -81,7 +81,7 @@ class RlTraderEnvFns {
                     "info:sell_trades"_.Bind(Spec<double>({-1})),
                     "info:buy_amount"_.Bind(Spec<double>({-1})),
                     "info:sell_amount"_.Bind(Spec<double>({-1})),
-                    "info:drawdown"_.Bind(Spec<double>({-1})),
+                    "info:initial_balance"_.Bind(Spec<double>({-1})),
                     "info:fees"_.Bind((Spec<double>({-1}))),
                     "info:mid_diff"_.Bind((Spec<double>({-1}))),
                     "info:done"_.Bind((Spec<bool>({-1}))),
@@ -110,10 +110,11 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) ActionSpec(const Config& conf) {
-    // 4-action space: bid_spread, ask_spread, target_inventory, risk_aversion
-    // Note: requote removed - we use smart requote (only when prices change by >5 ticks)
-    return MakeDict("action"_.Bind(Spec<float>({4}, {{  0.,  0., -1.,  0.0 },
-                                                     {  1.,  1.,  1.,  1.0 }})));
+    // 5-action space: bid_spread, ask_spread, requote, target_inventory, risk_aversion
+    // MM agent: bid_spread [0,1], ask_spread [0,1], requote [0,1]
+    // Inv agent: target_inventory [-1,1], risk_aversion [0,1]
+    return MakeDict("action"_.Bind(Spec<float>({5}, {{  0.,  0.,  0., -1.,  0.0 },
+                                                     {  1.,  1.,  1.,  1.,  1.0 }})));
   }
 };
 
@@ -150,7 +151,10 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   double prev_fees = 0.0;                 // For mm_reward (fee rebates)
   double prev_spread_capture = 0.0;       // For mm_reward (LIFO round-trip profit)
   double initial_balance_ = 0.0;          // Store initial balance for consistent reward scaling
-  double prev_flow_misalignment_ = 0.0;   // Flow misalignment tracking for delta penalty
+  
+  // Spread action tracking (for stability penalty)
+  double prev_bid_spread_action_ = 0.5;   // Previous bid spread action [0, 1]
+  double prev_ask_spread_action_ = 0.5;   // Previous ask spread action [0, 1]
   
   // Terminal info cache (stores metrics before reset for episode logging)
   std::unordered_map<std::string, double> terminal_info_;
@@ -159,13 +163,6 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
   // Track fills from previous step to force requote if orders were filled
   bool had_fills_prev_step_ = false;
   
-  // Track last quoted prices - only requote if prices change significantly
-  double prev_quoted_bid_ = 0.0;
-  double prev_quoted_ask_ = 0.0;
-  // Price change threshold: 2 ticks minimum to trigger requote
-  // Lower threshold = quotes track market better, more fills
-  static constexpr double REQUOTE_TICK_THRESHOLD = 2.0;
-
   std::unique_ptr<RLTrader::BaseInstrument> instr_ptr;
   std::unique_ptr<RLTrader::BaseExchange> exchange_ptr;
   std::unique_ptr<RLTrader::Strategy> strategy_ptr;
@@ -244,12 +241,11 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     prev_lifo_unrealized_pnl = 0.0;
     prev_fees = 0.0;
     prev_spread_capture = 0.0;
+    prev_bid_spread_action_ = 0.5;  // Reset spread action tracking
+    prev_ask_spread_action_ = 0.5;
     initial_balance_ = balance;  // Store initial balance for consistent reward scaling
-    prev_flow_misalignment_ = 0.0;  // Reset flow misalignment tracking
     steps = 0;
     had_fills_prev_step_ = false;  // Reset fill tracking
-    prev_quoted_bid_ = 0.0;       // Reset quote tracking
-    prev_quoted_ask_ = 0.0;
     
     // Track if any reset step fails - we still need to call WriteState!
     bool reset_failed = false;
@@ -305,13 +301,14 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
       
       ++step_count;  // Keep counter for potential future use 
       RLTrader::RLAction action;
-      // 4-action space: bid_spread, ask_spread, target_inventory, risk_aversion
-      // Requote is handled automatically (only when prices change by >5 ticks)
+      // 5-action space: bid_spread, ask_spread, requote, target_inventory, risk_aversion
+      // MM agent controls: bid_spread [0,1], ask_spread [0,1], requote [0,1]
+      // Inv agent controls: target_inventory [-1,1], risk_aversion [0,1]
       action.bid_spread       = static_cast<double>(action_dict["action"_][0]);
       action.ask_spread       = static_cast<double>(action_dict["action"_][1]);
-      action.target_inventory = static_cast<double>(action_dict["action"_][2]);
-      action.risk_aversion    = static_cast<double>(action_dict["action"_][3]);
-      action.should_requote   = 0.0;  // Not used - smart requote logic handles this
+      action.should_requote   = static_cast<double>(action_dict["action"_][2]);  // >0.5 = requote
+      action.target_inventory = static_cast<double>(action_dict["action"_][3]);
+      action.risk_aversion    = static_cast<double>(action_dict["action"_][4]);
       
       // Update target inventory and risk aversion (direct assignment, no smoothing)
       strategy_ptr->updateTargetInventory(action.target_inventory, action.risk_aversion);
@@ -321,27 +318,10 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
       // We only requote when:
       // 1. First step (no orders exist after reset)
       // 2. No active orders in the market
-      // 3. Previous step had fills (need to replace filled orders)
-      // 4. Proposed quote prices differ from current quotes by more than 5 ticks
-      //
-      // This reduces order churn while still allowing price adjustments.
-      
-      bool has_active_orders = !exchange_ptr->getBidOrders().empty() || 
-                               !exchange_ptr->getAskOrders().empty();
-      bool forced_requote = (steps == 0) || !has_active_orders || had_fills_prev_step_;
-      
-      // Check if prices changed enough to warrant requote (2 tick threshold)
-      bool prices_changed = adaptor_ptr->shouldRequote(action, REQUOTE_TICK_THRESHOLD);
-      
-      // Requote if forced OR prices changed significantly
-      bool should_requote = forced_requote || prices_changed;
-      
-      if (should_requote) {
-          adaptor_ptr->quote(action);
-          // Update tracked quote prices
-          prev_quoted_bid_ = strategy_ptr->getLastBidPrice();
-          prev_quoted_ask_ = strategy_ptr->getLastAskPrice();
-      }
+      // Agent controls requote decision via action.should_requote
+      // quote() will check this flag and skip placing orders if agent says no
+      // This gives the agent explicit control over quote update timing
+      adaptor_ptr->quote(action);
       
       // Get trade count before advancing time to detect new fills
       double trade_count_before = strategy_ptr->getPosition().getNumberOfTrades();
@@ -445,6 +425,7 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     
     state["info:mid_price"_] = info["mid_price"];
     state["info:balance"_] = info["balance"];
+    state["info:initial_balance"_] = info["initial_balance"];  // For weighted avg realized P&L calculation
     state["info:unrealized_pnl"_] = info["unrealized_pnl"];
     state["info:lifo_unrealized_pnl"_] = info["lifo_unrealized_pnl"];
     state["info:realized_pnl"_] = info["realized_pnl"];
@@ -456,7 +437,6 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
     state["info:sell_trades"_] = info["sell_trades"];
     state["info:buy_amount"_] = info["buy_amount"];
     state["info:sell_amount"_] = info["sell_amount"];
-    state["info:drawdown"_] = info["drawdown"];
     state["info:fees"_] = info["fees"];
     state["info:mid_diff"_] = info["mid_diff"];
     state["info:done"_] = isDone;
@@ -537,33 +517,31 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
         fee_delta = 0.0;
     }
     
-    // 3. LIFO Unrealized P&L delta (for inv_reward)
-    // Use LIFO unrealized to be consistent with spread_capture accounting
-    // This ensures: spread_capture + lifo_unrealized = total P&L
+    // 3. Unrealized P&L delta (for inv_reward)
+    // Use LIFO unrealized PnL for consistency with MM agent's spread_capture (also LIFO)
+    // This gives cleaner credit assignment - both agents use same accounting basis
     double current_lifo_unrealized = info["lifo_unrealized_pnl"];
-    double lifo_unrealized_delta = current_lifo_unrealized - prev_lifo_unrealized_pnl;
+    double unrealized_pnl_delta = current_lifo_unrealized - prev_lifo_unrealized_pnl;
     
-    // CRITICAL: On first step after reset, prev_lifo_unrealized_pnl is 0, so delta = current value
+    // CRITICAL: On first step after reset, prev is 0, so delta = current value
     // This can cause a huge first-step reward if position is already underwater
     // Skip first step delta to prevent this (steps == 0 means first step after reset)
     if (steps == 0) {
-        lifo_unrealized_delta = 0.0;  // Skip first step to prevent huge initial delta
+        unrealized_pnl_delta = 0.0;  // Skip first step to prevent huge initial delta
     }
     
     prev_lifo_unrealized_pnl = current_lifo_unrealized;
     if (initial_balance_ > 1e-9) {
-        lifo_unrealized_delta /= initial_balance_;
+        unrealized_pnl_delta /= initial_balance_;
     } else {
-        lifo_unrealized_delta = 0.0;
+        unrealized_pnl_delta = 0.0;
     }
     
-    // Also track weighted-average unrealized for display/penalties (not used in reward)
-    // This is weighted-average (matches balance cash flow), not LIFO
+    // Track weighted-average unrealized for logging only (matches balance cash flow)
     double current_unrealized_pnl = info["unrealized_pnl"];
     prev_unrealized_pnl = current_unrealized_pnl;
     
     // Track realized P&L for logging only (not used in reward)
-    // This is weighted-average realized PnL (matches balance cash flow), not LIFO spreadCapture
     double current_realized_pnl = info["realized_pnl"];
     prev_realized_pnl = current_realized_pnl;
     
@@ -580,12 +558,13 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
         : mm_reward_raw;
     
     // === Inventory Agent Reward: market direction ===
-    // Rewards holding inventory in the right direction (total P&L = realized + unrealized)
-    // Total P&L delta = spread_capture_from_fills + lifo_unrealized_delta
-    // This gives the inventory agent the full picture of market direction
-    // The inventory agent controls WHAT position to hold, so it should see the total impact
-    double total_pnl_delta = spread_capture_from_fills + lifo_unrealized_delta;
-    double inv_reward_raw = (total_pnl_delta + fee_delta) * INV_REWARD_SCALE;
+    // Rewards holding inventory in the right direction based on LIFO unrealized P&L
+    // IMPORTANT: Do NOT include spread_capture here - that's the MM agent's job
+    // Including spread_capture in both rewards confuses credit assignment:
+    // - MM agent: rewarded for spread_capture (execution quality, round-trip profits)
+    // - Inv agent: rewarded for LIFO unrealized_pnl_delta (position direction) + fee_delta (rebates)
+    // Both agents now use LIFO accounting for consistency
+    double inv_reward_raw = (unrealized_pnl_delta + fee_delta) * INV_REWARD_SCALE;
     
     // Apply log transform if enabled
     // CRITICAL: Ensure log transform is actually applied to prevent extreme values
@@ -600,41 +579,15 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
         inv_reward_instant = inv_reward_raw;
     }
     
-    // No EMA smoothing needed - inventory agent updates every step now
+    // Add flow alignment bonus AFTER log transform (small additive, doesn't dominate)
     double inv_reward = inv_reward_instant;
-   
-    // Cumulative flow alignment penalty: guide inventory agent to follow flow direction
-    double cumulative_flow_signal = data[16];  // Normalized cumulative flow [-1, 1] from observation
-    double target_inventory_signal = info["target_inventory"];  // Current target inventory (EMA smoothed)
     
-    // Calculate misalignment: penalty when signs are opposite
-    constexpr double TYPICAL_TARGET_RANGE = 2.0;  // Match config.target_range
-    double target_normalized = target_inventory_signal / TYPICAL_TARGET_RANGE;  // Normalize to [-1, 1] range
-    double flow_alignment = cumulative_flow_signal * target_normalized;  // Product in [-1, 1]
-    double flow_misalignment = std::max(0.0, -flow_alignment);  // Positive when misaligned (opposite signs), in [0, 1]
-    
-    // Calculate DELTA: only penalize when misalignment INCREASES (agent is getting worse)
-    double flow_misalignment_delta = flow_misalignment - prev_flow_misalignment_;
-    prev_flow_misalignment_ = flow_misalignment;
-    
-    // Only penalize increases in misalignment (positive delta)
-    double misalignment_increase = std::max(0.0, flow_misalignment_delta);
-    
-    // Scale penalty: use very small scale since this is a delta (not persistent)
-    constexpr double FLOW_ALIGNMENT_PENALTY_SCALE = 10.0;  // Scale for delta penalty
-    double flow_penalty_raw = -misalignment_increase * FLOW_ALIGNMENT_PENALTY_SCALE;
-    double flow_alignment_penalty = USE_LOG_REWARDS
-        ? (flow_penalty_raw >= 0 ? 1.0 : -1.0) * std::log(1.0 + std::abs(flow_penalty_raw))
-        : flow_penalty_raw;
-
-    // Apply penalties to inventory reward
-    double inv_reward_with_penalties = inv_reward + flow_alignment_penalty;
     
     // Soft clip final rewards to prevent extreme values from dominating learning
     // Soft clipping preserves gradients better than hard clipping
     // Threshold of 2.0: linear within [-2, 2], soft beyond
     double mm_reward_clipped = softsign_clip(mm_reward, 2.0);
-    double inv_reward_clipped = softsign_clip(inv_reward_with_penalties, 2.0);
+    double inv_reward_clipped = softsign_clip(inv_reward, 2.0);
     
     state["info:mm_reward"_] = mm_reward_clipped;
     state["info:inv_reward"_] = inv_reward_clipped;

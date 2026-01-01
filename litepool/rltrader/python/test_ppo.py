@@ -68,7 +68,7 @@ def main():
     env.spec.id = "RlTrader-v0"
 
     # Create hierarchical policy (matching training config)
-    obs_dim = 40  # Full observation dimension
+    obs_dim = 42  # Full observation dimension
     policy = create_hierarchical_policy(
         obs_dim=obs_dim,
         inventory_update_freq=config.inventory_update_freq,
@@ -79,21 +79,47 @@ def main():
 
     # Load trained model
     results_dir = Path("results/hierarchical")
-    model_path = results_dir / "latest.pt"
-    if not model_path.exists():
+    
+    # Check for model checkpoint (prefer best_model, then latest)
+    model_path = None
+    if (results_dir / "best_model.pt").exists():
+        model_path = results_dir / "best_model.pt"
+    elif (results_dir / "latest.pt").exists():
+        model_path = results_dir / "latest.pt"
+    
+    if model_path is None:
         raise FileNotFoundError(f"No model found in {results_dir}")
+    
+    print(f"[Model] Loading checkpoint from {model_path}")
     
     # weights_only=False needed for PyTorch 2.6+ (checkpoint contains config objects)
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     
     # Load shared encoder if present (for new architecture)
     if 'shared_encoder' in checkpoint:
-        policy.shared_encoder.load_state_dict(checkpoint['shared_encoder'])
-        print(f"[Model] Loaded shared encoder from {model_path}")
+        try:
+            policy.shared_encoder.load_state_dict(checkpoint['shared_encoder'])
+            print(f"[Model] Loaded shared encoder")
+        except RuntimeError as e:
+            print(f"[Model] Warning: Could not load shared_encoder (architecture mismatch?): {e}")
     
-    policy.inventory_agent.load_state_dict(checkpoint['inventory_agent'])
-    policy.mm_agent.load_state_dict(checkpoint['mm_agent'])
-    print(f"[Model] Loaded hierarchical policy from {model_path}")
+    # Load inventory agent
+    if 'inventory_agent' in checkpoint:
+        try:
+            policy.inventory_agent.load_state_dict(checkpoint['inventory_agent'])
+            print(f"[Model] Loaded inventory agent")
+        except RuntimeError as e:
+            print(f"[Model] Warning: Could not load inventory_agent (architecture mismatch?): {e}")
+    
+    # Load MM agent
+    if 'mm_agent' in checkpoint:
+        try:
+            policy.mm_agent.load_state_dict(checkpoint['mm_agent'])
+            print(f"[Model] Loaded MM agent")
+        except RuntimeError as e:
+            print(f"[Model] Warning: Could not load mm_agent (architecture mismatch?): {e}")
+    
+    print(f"[Model] Hierarchical policy loaded successfully")
 
     # Initialize
     obs, _ = env.reset()
@@ -117,6 +143,12 @@ def main():
     last_target_inventory = None  # Track target inventory changes
     target_change_count = 0  # Count how many times target changes
     
+    # Rolling correlation tracking: AMM cumulative flow vs target inventory
+    AMM_CUMFLOW_IDX = 16  # Observation index for cumulative flow
+    amm_flow_history = []  # Rolling window of AMM cumulative flow
+    target_inv_history = []  # Rolling window of target inventory
+    CORR_WINDOW = 100  # Window size for correlation
+    
     print("\n" + "="*80)
     print("Hierarchical PPO Model Evaluation")
     print("="*80)
@@ -124,8 +156,8 @@ def main():
     print(f"Max steps: {MAX_STEPS}")
     print("="*80)
     print(f"{'Step':>8} | {'MM.Rew':>8} | {'Inv.Rew':>8} | {'R.PnL':>10} | {'U.PnL':>10} | "
-          f"{'Fees':>8} | {'Lev':>6} | {'Trades':>6} | {'Target':>12} | {'RiskAv':>8}")
-    print("-"*100)
+          f"{'Fees':>8} | {'Lev':>6} | {'Trades':>6} | {'Target':>12} | {'RiskAv':>8} | {'AMM-Tgt':>8}")
+    print("-"*115)
     
     try:
         while total_steps < MAX_STEPS:
@@ -162,6 +194,15 @@ def main():
             max_leverage = max(max_leverage, abs(leverage))
             target_inventory = _extract_info_value(env_info, 'target_inventory', 0, 0.0)
             risk_aversion = _extract_info_value(env_info, 'risk_aversion', 0, 0.5)
+            
+            # Track AMM cumulative flow and target inventory for correlation
+            amm_cumflow = float(obs[0, AMM_CUMFLOW_IDX]) if obs.ndim > 1 else float(obs[AMM_CUMFLOW_IDX])
+            amm_flow_history.append(amm_cumflow)
+            target_inv_history.append(target_inventory)
+            # Keep only last CORR_WINDOW values
+            if len(amm_flow_history) > CORR_WINDOW:
+                amm_flow_history.pop(0)
+                target_inv_history.pop(0)
             
             # Track target inventory changes
             if last_target_inventory is not None:
@@ -206,14 +247,27 @@ def main():
                 else:
                     updated = bool(updated)
                 
+                # Compute rolling correlation between AMM cumulative flow and target inventory
+                corr_str = "N/A"
+                if len(amm_flow_history) >= 20:  # Need at least 20 points for meaningful correlation
+                    amm_arr = np.array(amm_flow_history)
+                    tgt_arr = np.array(target_inv_history)
+                    # Check for zero variance
+                    if np.std(amm_arr) > 1e-9 and np.std(tgt_arr) > 1e-9:
+                        corr = np.corrcoef(amm_arr, tgt_arr)[0, 1]
+                        corr_str = f"{corr:+.3f}"
+                    else:
+                        corr_str = "0.000"
+                
                 # Display: Tgt = EMA-smoothed target from env (actual value used in strategy)
                 #         act = raw action (what C++ receives before EMA)
                 #         RiskAv = risk aversion parameter (γ) for A-S model
+                #         Corr = rolling correlation between AMM cumulative flow and target inventory
                 print(f"{total_steps:8d} | {mm_r:+8.2f} | {inv_r:+8.2f} | "
                       f"{realized_pnl:+10.4f} | {unrealized_pnl:+10.4f} | "
                       f"{fees:8.4f} | {leverage:6.2f}x | {trade_count:6d} | "
                       f"Tgt:{target_inventory:+.4f} (act:{scaled_action:+.4f}{'*' if updated else ''}) | "
-                      f"γ:{risk_aversion:.3f}")
+                      f"γ:{risk_aversion:.3f} | Corr:{corr_str}")
             
             # Debug: Print when inventory agent updates
             if 'updated_inventory' in info:
@@ -281,7 +335,8 @@ def main():
                     episode_inv_total[env_id] = 0
                     policy.reset_env(env_id)
             
-                obs = next_obs
+            # Update obs for next iteration (MUST be outside the for loop)
+            obs = next_obs
 
     except KeyboardInterrupt:
         print("\n\nEvaluation interrupted by user.")

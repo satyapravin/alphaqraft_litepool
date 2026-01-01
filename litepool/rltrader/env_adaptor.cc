@@ -92,10 +92,6 @@ void EnvAdaptor::quote(const RLAction& action) {
     this->strategy.quote(action, bid_prices, ask_prices);
 }
 
-bool EnvAdaptor::shouldRequote(const RLAction& action, double tick_threshold) {
-    return this->strategy.shouldRequote(action, bid_prices, ask_prices, tick_threshold);
-}
-
 void EnvAdaptor::reset() {
     max_realized_pnl = 0;
     max_unrealized_pnl = 0;
@@ -112,6 +108,16 @@ void EnvAdaptor::reset() {
     // Reset EMA smoothing for AMM signals
     flow_imbalance_ema_ = 0.0;
     inventory_delta_ema_ = 0.0;
+    
+    // Reset rolling P&L momentum and volatility tracking
+    prev_net_pnl_ = 0.0;
+    rolling_pnl_momentum_ = 0.0;
+    rolling_pnl_var_ = 0.0;
+    
+    // Reset price trend EMAs
+    price_ema_fast_ = 0.0;
+    price_ema_slow_ = 0.0;
+    price_emas_initialized_ = false;
     
     // Reset trade signal builder
     if (trade_signal_builder) {
@@ -347,15 +353,73 @@ void EnvAdaptor::computeState(OrderBook& book)
         state[38] = 0.0;
     }
     
-    // [39] Mid price change - normalized price return (for inventory agent to understand price direction)
+    // [39] Price trend signal - dual EMA crossover (fast vs slow)
+    // Positive = uptrend (fast EMA > slow EMA), Negative = downtrend
     double mid = 0.5 * (book.bid_prices[0] + book.ask_prices[0]);
-    if (mid > 1e-9 && prev_mid_price_ > 1e-9) {
-        double mid_change_pct = (mid - prev_mid_price_) / prev_mid_price_;
-        state[39] = std::tanh(mid_change_pct * 1000.0);  // Scale: ±0.1% maps to ±tanh(1) ≈ ±0.76
+    if (mid > 1e-9) {
+        if (!price_emas_initialized_) {
+            // Initialize both EMAs to current price on first valid mid
+            price_ema_fast_ = mid;
+            price_ema_slow_ = mid;
+            price_emas_initialized_ = true;
+            state[39] = 0.0;  // No trend signal on first step
+        } else {
+            // Update EMAs
+            price_ema_fast_ = PRICE_EMA_FAST_ALPHA * mid + (1.0 - PRICE_EMA_FAST_ALPHA) * price_ema_fast_;
+            price_ema_slow_ = PRICE_EMA_SLOW_ALPHA * mid + (1.0 - PRICE_EMA_SLOW_ALPHA) * price_ema_slow_;
+            
+            // Trend signal: (fast - slow) / slow, normalized
+            // Positive = price is trending up, Negative = trending down
+            if (price_ema_slow_ > 1e-9) {
+                double trend = (price_ema_fast_ - price_ema_slow_) / price_ema_slow_;
+                state[39] = std::tanh(trend * 1000.0);  // Scale: ±0.1% divergence = ±tanh(1)
+            } else {
+                state[39] = 0.0;
+            }
+        }
     } else {
-        state[39] = 0.0;  // No previous mid price
+        state[39] = 0.0;  // Invalid mid price
     }
-    prev_mid_price_ = mid;  // Update for next step
+    prev_mid_price_ = mid;  // Keep for other uses
+    
+    // [40] Rolling P&L momentum - EMA of net P&L deltas (using weighted avg unrealized)
+    // [41] P&L volatility - sqrt of EMA of squared deltas (stability indicator)
+    // Positive momentum = winning streak, Negative = losing streak
+    // High volatility = unstable returns, Low = stable
+    {
+        double initBal = strategy.getPosition().getInitialBalance();
+        if (initBal > 1e-9) {
+            // Use weighted average unrealized PnL for consistency
+            // inventoryPnL uses average entry price (more stable than LIFO mark-to-market)
+            double current_net_pnl = posInfo.realizedPnL + posInfo.inventoryPnL;
+            double pnl_delta = current_net_pnl - prev_net_pnl_;
+            
+            // Normalize by initial balance before computing EMA
+            double pnl_delta_normalized = pnl_delta / initBal;
+            
+            // Update EMA of P&L momentum
+            rolling_pnl_momentum_ = PNL_MOMENTUM_ALPHA * pnl_delta_normalized + 
+                                   (1.0 - PNL_MOMENTUM_ALPHA) * rolling_pnl_momentum_;
+            
+            // Update EMA of squared P&L deltas (for volatility)
+            double delta_squared = pnl_delta_normalized * pnl_delta_normalized;
+            rolling_pnl_var_ = PNL_MOMENTUM_ALPHA * delta_squared + 
+                              (1.0 - PNL_MOMENTUM_ALPHA) * rolling_pnl_var_;
+            
+            // [40] P&L momentum: ±0.1% of balance per step = ±tanh(1)
+            state[40] = std::tanh(rolling_pnl_momentum_ * 1000.0);
+            
+            // [41] P&L volatility: sqrt(EMA(delta²)), scaled
+            // High volatility (0.1% std per step) = tanh(1)
+            double pnl_volatility = std::sqrt(std::max(0.0, rolling_pnl_var_));
+            state[41] = std::tanh(pnl_volatility * 1000.0);
+            
+            prev_net_pnl_ = current_net_pnl;
+        } else {
+            state[40] = 0.0;
+            state[41] = 0.0;
+        }
+    }
     
     computeInfo(book);
 }

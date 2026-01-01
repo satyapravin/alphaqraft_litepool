@@ -50,6 +50,8 @@ void Strategy::reset() {
     this->price_history_.clear();
     this->last_bid_price = 0;
     this->last_ask_price = 0;
+    this->last_bid_action_ = 0.5;  // Reset spread action tracking
+    this->last_ask_action_ = 0.5;
     this->last_mid_price = 0;
     this->hit_leverage_limit_ = false;  // Reset leverage limit flag
     this->steps_since_last_fill_ = 0;   // Reset fill tracking
@@ -183,23 +185,51 @@ std::pair<double, double> Strategy::computeQuotePrices(
     
     // Inventory adjustment: positive inventory_error (too long) → widen bid, tighten ask
     //                     negative inventory_error (too short) → tighten bid, widen ask
+    // This helps the agent actually BUILD position when it wants to go long/short
+    // Without aggressive skewing, fills are too balanced and position stays near 0
     double inventory_adjustment = inventory_error * gamma * variance / TIME_HORIZON_SEC;
-    // Cap adjustment to reasonable range (1% of price max)
-    inventory_adjustment = std::clamp(inventory_adjustment, -mid_price * 0.01, mid_price * 0.01);
+    // Cap adjustment to reasonable range (2% of price max - increased from 1%)
+    inventory_adjustment = std::clamp(inventory_adjustment, -mid_price * 0.02, mid_price * 0.02);
     
     // Agent controls bid_spread and ask_spread in [0, 1] range
-    // These are base spreads, then we apply inventory adjustment for skewing
-    double bid_action = std::clamp(action.bid_spread, 0.0, 1.0) * vol_2min_;
-    double ask_action = std::clamp(action.ask_spread, 0.0, 1.0) * vol_2min_;
+    // These ADD spread on top of the base_spread_bps minimum
+    // This prevents the agent from quoting too tight and getting adversely selected
     
-
+    // Base spread from config (in basis points, convert to price units)
+    // 1 bps = 0.01% = 0.0001, so base_spread_bps * mid_price / 10000
+    double base_spread = mid_price * config.base_spread_bps / 10000.0;
+    
+    // Minimum spread: max of (base_spread, tick_size)
+    // This ensures even with action=0, we have meaningful spread to avoid adverse selection
+    double min_spread = std::max(base_spread, tick_size);
+    
+    // Agent action [0, 1] ADDS more spread on top of minimum
+    // action=0 → minimum spread (base_spread_bps) - tightest possible
+    // action=1 → minimum + volatility extra - widest
+    double vol_extra = std::max(vol_2min_, tick_size);  // Extra spread range based on volatility
+    double bid_action = min_spread + std::clamp(action.bid_spread, 0.0, 1.0) * vol_extra;
+    double ask_action = min_spread + std::clamp(action.ask_spread, 0.0, 1.0) * vol_extra;
+    
     double bid_spread = bid_action + inventory_adjustment;  // Widen bid when positive error
     double ask_spread = ask_action - inventory_adjustment;  // Tighten ask when positive error
     
-
-    // Ensure spreads are positive (can't be negative)
-    bid_spread = std::max(bid_spread, tick_size);
-    ask_spread = std::max(ask_spread, tick_size);
+    // Asymmetric floor: only protect the position-INCREASING side
+    // Allow the position-REDUCING side to go tight for faster offloading
+    double net_position = leverage;  // Positive = long, negative = short
+    
+    if (net_position > 0) {
+        // Agent is LONG: protect bid (would increase long), allow tight ask (reduces long)
+        bid_spread = std::max(bid_spread, min_spread);
+        ask_spread = std::max(ask_spread, tick_size);  // Minimum 1 tick
+    } else if (net_position < 0) {
+        // Agent is SHORT: protect ask (would increase short), allow tight bid (reduces short)
+        bid_spread = std::max(bid_spread, tick_size);  // Minimum 1 tick
+        ask_spread = std::max(ask_spread, min_spread);
+    } else {
+        // Flat: protect both sides equally
+        bid_spread = std::max(bid_spread, min_spread);
+        ask_spread = std::max(ask_spread, min_spread);
+    }
     
     // Quotes are placed around mid price
     double bid_price = mid_price - bid_spread;
@@ -250,14 +280,48 @@ void Strategy::quote(const RLAction& action,
     // - More realistic market making
     // ============================================================================
     
-    constexpr int NUM_LEVELS = 3;
+    constexpr int NUM_LEVELS = 5;
     
-    // Validate RL outputs are in expected range [-1, 1]
-    assert(action.bid_spread >= -1.0001 && action.bid_spread <= 1.0001);
-    assert(action.ask_spread >= -1.0001 && action.ask_spread <= 1.0001);
+    // Validate RL outputs are in expected range [0, 1]
+    assert(action.bid_spread >= -0.0001 && action.bid_spread <= 1.0001);
+    assert(action.ask_spread >= -0.0001 && action.ask_spread <= 1.0001);
+    
+    // Store spread actions for tracking
+    last_bid_action_ = std::clamp(action.bid_spread, 0.0, 1.0);
+    last_ask_action_ = std::clamp(action.ask_spread, 0.0, 1.0);
     
     // Early exit if prices invalid
     if (bid_prices[0] < 0.0001 || ask_prices[0] < 0.0001) return;
+    
+    // Force requote conditions:
+    // 1. First quote (no orders placed yet)
+    // 2. No active orders in book (they got filled - need to replace them)
+    // 3. Quotes are stale (too far from current mid - prevents stuck quotes)
+    bool first_quote = (last_bid_price < 0.0001 && last_ask_price < 0.0001);
+    bool no_active_orders = exchange.getBidOrders().empty() && exchange.getAskOrders().empty();
+    
+    // Stale quote detection: if quotes are too far from mid, force requote
+    // This prevents the agent from sitting on stale quotes that never fill
+    auto mid_price = (bid_prices[0] + ask_prices[0]) * 0.5;
+    bool stale_quotes = false;
+    if (last_bid_price > 0.0001 && last_ask_price > 0.0001 && mid_price > 0.0001) {
+        double bid_distance_bps = (mid_price - last_bid_price) / mid_price * 10000.0;
+        double ask_distance_bps = (last_ask_price - mid_price) / mid_price * 10000.0;
+        // If either quote is more than 5 bps from mid, force requote
+        stale_quotes = (bid_distance_bps > 5.0) || (ask_distance_bps > 5.0);
+    }
+    
+    bool force_requote = first_quote || no_active_orders || stale_quotes;
+    
+    // Agent controls requote decision: >0.3 = requote, <=0.3 = keep existing orders
+    // This gives the agent explicit control over quote update timing
+    // Skip quoting if agent says no requote (keep existing orders in the book)
+    // BUT always requote if forced (first call, no orders, or stale quotes)
+    if (!force_requote && action.should_requote <= 0.3) {
+        // Still update volatility even when not requoting
+        updateVolatility(mid_price);
+        return;
+    }
     
     auto tick_size = instrument.getTickSize();
     auto minAmount = instrument.getMinAmount();
@@ -269,22 +333,17 @@ void Strategy::quote(const RLAction& action,
     hit_leverage_limit_ = false;
     
     auto initBalance = position.getInitialBalance();
-    auto mid_price = (bid_prices[0] + ask_prices[0]) * 0.5;
     double best_bid = bid_prices[0];
     double best_ask = ask_prices[0];
     
     // Update volatility estimate for spread adjustment
     updateVolatility(mid_price);
     
-    // Compute base quote prices (for level 1) - A-S model returns quotes around reservation_price
     auto [base_bid_price, base_ask_price] = computeQuotePrices(action, mid_price, leverage, tick_size);
     auto [level_size, _] = computeQuoteSizes(action, initBalance);
     
-    // A-S model places quotes around reservation_price, not mid_price
-    // Calculate spreads from reservation_price (center of A-S quotes) for ladder spacing
-    double reservation_price = (base_bid_price + base_ask_price) * 0.5;  // Center of A-S quotes
-    double bid_spread_from_res = reservation_price - base_bid_price;  // Positive value
-    double ask_spread_from_res = base_ask_price - reservation_price;  // Positive value
+    double bid_spread_from_res = mid_price - base_bid_price;  // Positive value
+    double ask_spread_from_res = base_ask_price - mid_price;  // Positive value
     
     // Ensure minimum spread of 1 tick
     bid_spread_from_res = std::max(bid_spread_from_res, tick_size);
@@ -307,15 +366,14 @@ void Strategy::quote(const RLAction& action,
     last_bid_price = can_place_bids ? base_bid_price : 0.0;
     last_ask_price = can_place_asks ? base_ask_price : 0.0;
     
-    // Place ladder of orders around reservation_price (A-S model center)
     for (int level = 1; level <= NUM_LEVELS; ++level) {
-        // Spread increases with level: 1x, 2x, 3x base spread from reservation_price
         double level_bid_spread = bid_spread_from_res * level;
         double level_ask_spread = ask_spread_from_res * level;
         
-        double bid_price = reservation_price - level_bid_spread;
-        double ask_price = reservation_price + level_ask_spread;
-        
+        double bid_price = mid_price - level_bid_spread;
+        double ask_price = mid_price + level_ask_spread;
+
+
         // Round to tick size
         bid_price = std::floor(bid_price / tick_size) * tick_size;
         ask_price = std::ceil(ask_price / tick_size) * tick_size;
@@ -428,34 +486,3 @@ void Strategy::next() {
     }
 }
 
-bool Strategy::shouldRequote(const RLAction& action,
-                             FixedVector<double, 20>& bid_prices,
-                             FixedVector<double, 20>& ask_prices,
-                             double tick_threshold) {
-    // If no valid prices, always requote
-    if (bid_prices[0] < 0.0001 || ask_prices[0] < 0.0001) {
-        return true;
-    }
-    
-    // If no quotes placed yet, must requote
-    if (last_bid_price < 0.0001 || last_ask_price < 0.0001) {
-        return true;
-    }
-    
-    auto tick_size = instrument.getTickSize();
-    auto posInfo = position.getPositionInfo(bid_prices[0], ask_prices[0]);
-    auto leverage = posInfo.leverage;
-    auto mid_price = (bid_prices[0] + ask_prices[0]) * 0.5;
-    
-    // Compute what new quotes would be
-    auto [proposed_bid, proposed_ask] = computeQuotePrices(action, mid_price, leverage, tick_size);
-    
-    // Check if proposed quotes differ from current quotes by more than threshold
-    double bid_diff = std::abs(proposed_bid - last_bid_price);
-    double ask_diff = std::abs(proposed_ask - last_ask_price);
-    
-    double threshold_price = tick_size * tick_threshold;
-    
-    // Requote if either side differs by more than threshold
-    return (bid_diff > threshold_price) || (ask_diff > threshold_price);
-}

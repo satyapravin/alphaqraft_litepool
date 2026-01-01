@@ -38,7 +38,7 @@ class HierarchicalPolicy(nn.Module):
     
     def __init__(
         self,
-        obs_dim: int = 40,  # Full observation dimension (must match environment)
+        obs_dim: int = 42,  # Full observation dimension (must match environment)
         inventory_update_freq: int = 1,  # Default: every step (smoothed by EMA in C++)
         inventory_lstm: int = 32,
         mm_lstm: int = 64,
@@ -141,12 +141,12 @@ class HierarchicalPolicy(nn.Module):
         Forward pass for both agents.
         
         Args:
-            obs: Full observations [batch, 40]
+            obs: Full observations [batch, 42]
             deterministic: If True, use mean actions (no exploration)
             temperature: Scale exploration noise (0.0 = deterministic, 1.0 = full exploration)
             
         Returns:
-            action: Combined action [batch, 4] for environment (bid_spread, ask_spread, target_inventory, risk_aversion)
+            action: Combined action [batch, 5] for environment (bid_spread, ask_spread, requote, target_inventory, risk_aversion)
             log_probs: Dict with 'inventory' and 'mm' log probs
             values: Dict with 'inventory' and 'mm' values
         """
@@ -210,10 +210,11 @@ class HierarchicalPolicy(nn.Module):
             h, c = mm_hidden_new
             self.mm_hidden = (h.detach().clone(), c.detach().clone())
         
-        # Combine into environment action format: [bid_spread, ask_spread, target_inventory, risk_aversion]
+        # Combine into environment action format: [bid_spread, ask_spread, requote, target_inventory, risk_aversion]
         action = torch.cat([
             mm_action[:, 0:1],  # bid_spread
             mm_action[:, 1:2],  # ask_spread
+            mm_action[:, 2:3],  # requote decision
             self.current_targets,  # target_inventory
             self.current_risk_aversion,  # risk_aversion
         ], dim=-1)
@@ -246,12 +247,12 @@ class HierarchicalPolicy(nn.Module):
         Get action for environment (numpy interface).
         
         Args:
-            obs: Full observations [batch, 40]
+            obs: Full observations [batch, 42]
             deterministic: If True, use mean actions (temperature=0.0 for fully deterministic)
             temperature: Scale exploration noise (0.0 = deterministic, 1.0 = full exploration)
             
         Returns:
-            action: Combined action [batch, 4] (bid_spread, ask_spread, target_inventory, risk_aversion)
+            action: Combined action [batch, 5] (bid_spread, ask_spread, requote, target_inventory, risk_aversion)
             info: Additional info (log_probs, values, etc.)
         """
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
@@ -336,7 +337,7 @@ class HierarchicalPolicy(nn.Module):
 
 
 def create_hierarchical_policy(
-    obs_dim: int = 40,  # Full observation dimension (must match environment)
+    obs_dim: int = 42,  # Full observation dimension (must match environment)
     inventory_update_freq: int = 1,  # Default from config (1 = every step, smoothed by EMA in C++)
     device: str = 'cpu',
     target_range: float = 1.0,  # Default from config (matches hierarchical_config.py)

@@ -11,13 +11,13 @@ import torch.nn as nn
 
 class SharedEncoder(nn.Module):
     """
-    Shared encoder that processes all 40 observation dimensions.
+    Shared encoder that processes all 42 observation dimensions.
     Both MM and Inventory agents use this encoder, then apply task-specific attention.
     """
     
     def __init__(
         self,
-        obs_dim: int = 40,  # Full observation dimension
+        obs_dim: int = 42,  # Full observation dimension (updated from 40)
         hidden_dim: int = 128,
         encoder_layers: int = 2,
     ):

@@ -23,18 +23,17 @@ class MMAgent(nn.Module):
     
     Architecture: Shared Encoder + Attention + LSTM + Actor/Critic
     
-    Input observations (40 dims): All observations (shared with Inventory agent)
+    Input observations (42 dims): All observations (shared with Inventory agent)
     
-    Output (2 actions):
-        - bid_spread: [0, 1] → multiplies base_spread_bps to get actual bid spread
-        - ask_spread: [0, 1] → multiplies base_spread_bps to get actual ask spread
-        
-    Note: Requote is handled automatically by the environment (smart requote).
+    Output (3 actions):
+        - bid_spread: [0, 1] → adds to base spread (higher = wider spread)
+        - ask_spread: [0, 1] → adds to base spread (higher = wider spread)
+        - requote: [0, 1] → binary decision (>0.5 = requote, ≤0.5 = keep existing quotes)
     """
     
     def __init__(
         self,
-        obs_dim: int = 40,  # Full observation dimension
+        obs_dim: int = 42,  # Full observation dimension
         shared_encoder: Optional[SharedEncoder] = None,
         hidden_dim: int = 128,
         lstm_hidden: int = 64,
@@ -65,10 +64,12 @@ class MMAgent(nn.Module):
             batch_first=True,
         )
         
-        # Actor head: spread actions [0, 1] using Beta distribution
+        # Actor head: All 3 actions use Beta distribution [0, 1]
+        # - bid_spread, ask_spread: spread multipliers
+        # - requote: continuous value thresholded at 0.5 in C++
         # Output mean (via sigmoid) and concentration parameter (via softplus)
-        self.spread_mean = nn.Linear(lstm_hidden, 2)  # bid_spread, ask_spread mean
-        self.spread_concentration = nn.Linear(lstm_hidden, 2)  # concentration parameter for Beta
+        self.action_mean = nn.Linear(lstm_hidden, 3)  # bid_spread, ask_spread, requote
+        self.action_concentration = nn.Linear(lstm_hidden, 3)  # concentration for Beta
         
         # Critic head
         self.critic = nn.Linear(lstm_hidden, 1)
@@ -77,14 +78,14 @@ class MMAgent(nn.Module):
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize weights: gain ~1.0 for hidden layers and spread_mean, 0.01 for critic."""
+        """Initialize weights: gain ~1.0 for hidden layers and action heads, 0.01 for critic."""
         for name, m in self.named_modules():
             if isinstance(m, nn.Linear):
                 # Critic: use small gain for stability
                 if 'critic' in name:
                     nn.init.orthogonal_(m.weight, gain=0.01)
-                # spread_mean and spread_concentration: use standard gain to allow exploration
-                elif 'spread_mean' in name or 'spread_concentration' in name:
+                # action_mean and action_concentration: use standard gain to allow exploration
+                elif 'action_mean' in name or 'action_concentration' in name:
                     nn.init.orthogonal_(m.weight, gain=1.0)
                 elif 'attention' in name or 'lstm' in name:
                     # Attention and LSTM: use standard gain
@@ -93,15 +94,16 @@ class MMAgent(nn.Module):
                     # Hidden layers: use standard gain
                     nn.init.orthogonal_(m.weight, gain=1.0)
                 if m.bias is not None:
-                    if 'spread_mean' in name:
-                        # Initialize bias to small random values to break symmetry and encourage exploration
-                        # Small values (std=0.1) will map to roughly [0.4, 0.6] after sigmoid
+                    if 'action_mean' in name:
+                        # Initialize: [bid_spread, ask_spread, requote]
+                        # Spreads: small random for exploration (~0.4-0.6 after sigmoid)
+                        # Requote: positive bias so mean > 0.5 initially (encourages requoting)
                         nn.init.normal_(m.bias, mean=0.0, std=0.1)
-                    elif 'spread_concentration' in name:
-                        # Initialize concentration bias to encourage moderate exploration
-                        # Positive bias -> higher concentration -> less exploration initially
-                        # We want moderate exploration, so initialize to small positive value
-                        nn.init.constant_(m.bias, 1.0)  # After softplus, this gives ~1.31 concentration
+                        m.bias.data[2] = 0.5  # requote: sigmoid(0.5) ≈ 0.62 > 0.5
+                    elif 'action_concentration' in name:
+                        # Initialize concentration bias to encourage exploration
+                        # softplus(-1.0) + 1.0 ≈ 1.31 (more exploration)
+                        nn.init.constant_(m.bias, -1.0)
                     else:
                         nn.init.zeros_(m.bias)
             elif isinstance(m, nn.LSTM):
@@ -125,8 +127,8 @@ class MMAgent(nn.Module):
             hidden: LSTM hidden state tuple (h, c)
             
         Returns:
-            spread_mean: Mean of spread actions [batch, 2]
-            spread_concentration: Concentration for Beta distribution [batch, 2]
+            action_mean: Mean of all 3 actions [batch, 3] (bid_spread, ask_spread, requote)
+            action_concentration: Concentration for Beta distribution [batch, 3]
             value: State value [batch, 1]
             hidden: Updated LSTM hidden state
         """
@@ -145,7 +147,6 @@ class MMAgent(nn.Module):
         encoded = self.shared_encoder(obs)  # [batch, seq, hidden_dim]
         
         # Apply attention (allows focusing on relevant signals)
-        # Don't clone here - let attention handle it internally if needed
         attended = self.attention(encoded)  # [batch, seq, hidden_dim]
         
         # LSTM for temporal patterns
@@ -153,7 +154,6 @@ class MMAgent(nn.Module):
             hidden = self._init_hidden(batch_size, obs.device)
         else:
             # Detach and clone hidden states to prevent in-place modifications by LSTM
-            # This ensures they're completely independent of any computation graph
             h, c = hidden
             hidden = (h.detach().clone(), c.detach().clone())
         
@@ -162,16 +162,16 @@ class MMAgent(nn.Module):
         # Take last timestep
         last_out = lstm_out[:, -1, :]  # [batch, lstm_hidden]
         
-        # Actor output: spread actions [0, 1] - multiplies base_spread_bps
-        # Mean and concentration for Beta distribution
-        spread_mean = torch.sigmoid(self.spread_mean(last_out))  # [0, 1]
-        # Concentration parameter: use softplus to ensure positive, minimum 1.0 for numerical stability
-        spread_concentration = F.softplus(self.spread_concentration(last_out)) + 1.0
+        # Actor output: all 3 actions [0, 1] using Beta distribution
+        # [bid_spread, ask_spread, requote]
+        action_mean = torch.sigmoid(self.action_mean(last_out))  # [0, 1]
+        # Concentration parameter: clamp to [1.0, 2.0] for non-negative entropy
+        action_concentration = torch.clamp(F.softplus(self.action_concentration(last_out)) + 1.0, min=1.0, max=2.0)
         
         # Critic
         value = self.critic(last_out)
         
-        return spread_mean, spread_concentration, value, hidden
+        return action_mean, action_concentration, value, hidden
     
     def _init_hidden(self, batch_size: int, device: torch.device):
         """Initialize LSTM hidden state."""
@@ -196,33 +196,29 @@ class MMAgent(nn.Module):
             temperature: Scale concentration (0.0 = deterministic, 1.0 = full exploration)
             
         Returns:
-            action: Spread actions [batch, 2] (bid_spread, ask_spread)
+            action: Actions [batch, 3] (bid_spread, ask_spread, requote)
             log_prob: Log probability [batch, 1]
             value: State value [batch, 1]
             hidden: Updated hidden state
         """
-        spread_mean, spread_concentration, value, hidden = self.forward(obs, hidden)
+        action_mean, action_concentration, value, hidden = self.forward(obs, hidden)
         
-        if temperature == 0.0:
-            # Fully deterministic: use means (regardless of deterministic flag)
-            action = spread_mean
-            log_prob = torch.zeros(spread_mean.shape[0], 1, device=spread_mean.device)
-            return action, log_prob, value, hidden
+        if temperature == 0.0 or deterministic:
+            # Fully deterministic: use means directly
+            # requote is continuous [0,1], C++ will threshold at 0.5
+            log_prob = torch.zeros(action_mean.shape[0], 1, device=action_mean.device)
+            return action_mean, log_prob, value, hidden
         
-        # Beta distribution: alpha = mean * concentration, beta = (1 - mean) * concentration
-        # Temperature scales concentration: lower temperature = higher concentration = less exploration
-        effective_concentration = spread_concentration / (temperature + 1e-8)
-        alpha = spread_mean * effective_concentration
-        beta = (1.0 - spread_mean) * effective_concentration
-        
-        # Ensure minimum values for numerical stability
+        # Beta distribution for all 3 actions
+        effective_concentration = action_concentration / (temperature + 1e-8)
+        alpha = action_mean * effective_concentration
+        beta_param = (1.0 - action_mean) * effective_concentration
         alpha = torch.clamp(alpha, min=0.1)
-        beta = torch.clamp(beta, min=0.1)
+        beta_param = torch.clamp(beta_param, min=0.1)
         
-        # Create Beta distribution and sample
-        spread_dist = torch.distributions.Beta(alpha, beta)
-        action = spread_dist.sample()
-        log_prob = spread_dist.log_prob(action).sum(dim=-1, keepdim=True)
+        action_dist = torch.distributions.Beta(alpha, beta_param)
+        action = action_dist.sample()
+        log_prob = action_dist.log_prob(action).sum(dim=-1, keepdim=True)
         
         return action, log_prob, value, hidden
     
@@ -237,7 +233,7 @@ class MMAgent(nn.Module):
         
         Args:
             obs: Full observations [batch, obs_dim]
-            actions: Spread actions taken [batch, 2] (must be in [0, 1])
+            actions: Actions taken [batch, 3] (bid_spread, ask_spread, requote)
             hidden: LSTM hidden state
             
         Returns:
@@ -245,28 +241,24 @@ class MMAgent(nn.Module):
             entropy: Action entropy [batch, 1]
             value: State value [batch, 1]
         """
-        spread_mean, spread_concentration, value, _ = self.forward(obs, hidden)
+        action_mean, action_concentration, value, _ = self.forward(obs, hidden)
         
-        # Beta distribution: alpha = mean * concentration, beta = (1 - mean) * concentration
-        alpha = spread_mean * spread_concentration
-        beta = (1.0 - spread_mean) * spread_concentration
-        
-        # Ensure minimum values for numerical stability
+        # Beta distribution for all 3 actions
+        alpha = action_mean * action_concentration
+        beta_param = (1.0 - action_mean) * action_concentration
         alpha = torch.clamp(alpha, min=0.1)
-        beta = torch.clamp(beta, min=0.1)
+        beta_param = torch.clamp(beta_param, min=0.1)
         
-        # Clamp actions to valid Beta range [epsilon, 1-epsilon] to prevent NaN in log_prob
+        # Clamp actions to valid Beta range
         actions_clamped = torch.clamp(actions, min=1e-6, max=1.0 - 1e-6)
         
-        # Create Beta distribution and evaluate actions
-        spread_dist = torch.distributions.Beta(alpha, beta)
-        log_prob = spread_dist.log_prob(actions_clamped).sum(dim=-1, keepdim=True)
-        # Clamp to non-negative: Beta entropy can be negative for very small parameters due to numerical issues
-        entropy = torch.clamp(spread_dist.entropy(), min=0.0).sum(dim=-1, keepdim=True)
+        action_dist = torch.distributions.Beta(alpha, beta_param)
+        log_prob = action_dist.log_prob(actions_clamped).sum(dim=-1, keepdim=True)
+        entropy = action_dist.entropy().sum(dim=-1, keepdim=True)
         
         return log_prob, entropy, value
     
-# NOTE: MM agent uses all 40 observation dimensions via shared encoder + attention
+# NOTE: MM agent uses all 42 observation dimensions via shared encoder + attention
 # The attention mechanism learns to focus on microstructure signals dynamically
 # No need for observation extraction - both agents see everything
 

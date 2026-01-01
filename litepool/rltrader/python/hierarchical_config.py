@@ -4,15 +4,15 @@ from dataclasses import dataclass
 class HierarchicalConfig:
     num_envs: int = 8
     num_threads: int = 8
-    n_steps: int = 1800  
-    max_episode_steps: int = 1800-1 
+    n_steps: int = 18000  
+    max_episode_steps: int = 18000-1 
 
     inventory_update_freq: int = 1  # Every step (target is smoothed by 120-step EMA in strategy)
 
     # PPO hyperparameters
-    learning_rate: float = 1e-4
-    inv_learning_rate: float = 1e-4  # Same as MM agent LR for consistency
-    gamma: float = 0.995  # Discount factor (high for long-term credit assignment)
+    learning_rate: float = 1e-3
+    inv_learning_rate: float = 1e-3  # Same as MM agent LR for consistency
+    gamma: float = 0.99  # Discount factor (high for long-term credit assignment)
     gae_lambda: float = 0.95  # GAE lambda for advantage estimation
     gae_clip_delta: float = 2.0  # Clip TD errors in GAE computation
     normalize_gae: bool = True  # Normalize advantages after GAE computation (uses robust normalization)
@@ -20,17 +20,20 @@ class HierarchicalConfig:
     entropy_coef_mm: float = 0.5  # Entropy bonus for MM agent (encourages spread exploration)
     entropy_coef_inv: float = 1.0  # Higher entropy for inventory agent (encourages position exploration)
     value_coef: float = 0.2  # Value loss coefficient
-    max_grad_norm: float = 0.5  # Gradient clipping norm
+    max_grad_norm: float = 10.0  # Gradient clipping norm (increased from 0.5 to prevent value loss explosion)
     value_l2_reg: float = 1e-4  # L2 regularization for value function
     update_epochs: int = 4  # PPO update epochs per rollout
     minibatch_size: int = 256  # Minibatch size for PPO updates
 
     # Trading parameters
-    base_spread_bps: float = 1
+    # Base spread in basis points (1 bps = 0.01% of mid price)
+    # This is the MINIMUM spread - agent can only widen, not tighten below this
+    # For BTC at $100k: 2 bps = $20 total spread
+    base_spread_bps: float = 2.0  # Wider spread to reduce adverse selection (was 1)
     min_size_pct: float = 1
     max_size_pct: float = 25.0
-    balance: float = 2000.0
-    target_range: float = 1.0  # Inventory agent outputs actions in [-target_range, +target_range], used directly in C++
+    balance: float = 10000.0
+    target_range: float = 5  # Inventory agent outputs actions in [-target_range, +target_range], used directly in C++
 
     # Training
     total_epochs: int = 10000

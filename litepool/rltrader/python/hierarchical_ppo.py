@@ -6,13 +6,13 @@
 # - Inventory Agent (strategic): learns WHAT position to hold
 #   - Updates every step (smoothed by 120-step EMA in C++ strategy)
 #   - Reward: total P&L delta (spread capture + unrealized)
-#   - Observations: All 40 signals via shared encoder + attention (focuses on AMM flow)
+#   - Observations: All 42 signals via shared encoder + attention (focuses on AMM flow)
 #   - Outputs: target_inventory ∈ [-target_range, +target_range], risk_aversion ∈ [0, 1]
 #
 # - MM Agent (tactical): learns HOW to execute toward target
 #   - Updates every step (500ms)
 #   - Reward: spread capture (execution quality)
-#   - Observations: All 40 signals via shared encoder + attention (focuses on microstructure)
+#   - Observations: All 42 signals via shared encoder + attention (focuses on microstructure)
 #   - Outputs: bid_spread ∈ [0, 1], ask_spread ∈ [0, 1]
 
 # Ensure we use the local litepool, not system-installed version
@@ -51,6 +51,42 @@ def robust_normalize(advantages):
     
     # Soft clip extreme values
     return torch.tanh(normalized / 5.0) * 5.0
+
+
+class RunningMeanStd:
+    """
+    Track running mean/std for return normalization.
+    Prevents value loss explosion by keeping returns in a stable range.
+    Uses Welford's online algorithm for numerical stability.
+    """
+    def __init__(self, epsilon: float = 1e-4):
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = epsilon  # Small epsilon to avoid division by zero
+    
+    def update(self, x: np.ndarray):
+        """Update running statistics with a batch of values."""
+        batch_mean = np.mean(x)
+        batch_var = np.var(x)
+        batch_count = len(x)
+        
+        # Combine batch stats with running stats (parallel algorithm)
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+        
+        # Update mean
+        self.mean = self.mean + delta * batch_count / tot_count
+        
+        # Update variance (Welford's parallel algorithm)
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + delta**2 * self.count * batch_count / tot_count
+        self.var = M2 / tot_count
+        self.count = tot_count
+    
+    def normalize(self, x: np.ndarray) -> np.ndarray:
+        """Normalize values using running statistics."""
+        return (x - self.mean) / (np.sqrt(self.var) + 1e-8)
 
 
 import time
@@ -237,7 +273,7 @@ class HierarchicalPPOTrainer:
         
         # Policy
         self.policy = create_hierarchical_policy(
-            obs_dim=40,
+            obs_dim=42,
             inventory_update_freq=config.inventory_update_freq,
             device=str(device),
             target_range=config.target_range,
@@ -294,6 +330,10 @@ class HierarchicalPPOTrainer:
         self.best_reward = float('-inf')
         self.episode_rewards = []
         self.completed_episodes = []
+        
+        # Running return normalization to prevent value loss explosion
+        self.return_rms_mm = RunningMeanStd()
+        self.return_rms_inv = RunningMeanStd()
     
     def collect_rollout(self):
         """Collect rollout data."""
@@ -314,6 +354,19 @@ class HierarchicalPPOTrainer:
             # Get actions
             with torch.no_grad():
                 action, info = self.policy.get_action(obs)
+            
+            # Early exploration: randomly flip target inventory sign to force short exploration
+            # This decays over time: 30% flip rate at epoch 0, decaying to 0% by epoch 200
+            exploration_decay = max(0.0, 1.0 - self.epochs_completed / 200.0)
+            flip_prob = 0.3 * exploration_decay
+            flip_mask = None
+            if flip_prob > 0:
+                flip_mask = np.random.random(self.config.num_envs) < flip_prob
+                if flip_mask.any():
+                    # Flip target_inventory (action index 3) for selected envs
+                    action[flip_mask, 3] = -action[flip_mask, 3]
+                    # Also flip in info['targets'] for buffer storage consistency
+                    info['targets'][flip_mask] = -info['targets'][flip_mask]
             
             # Step environment
             next_obs, _, done, truncated, env_info = self.env.step(action)
@@ -343,12 +396,14 @@ class HierarchicalPPOTrainer:
             
             mm_reward = _extract_info_value(env_info, 'mm_reward', 0.0)
             inv_reward = _extract_info_value(env_info, 'inv_reward', 0.0)
-            realized_pnl = _extract_info_value(env_info, 'realized_pnl', 0.0)
-            unrealized_pnl = _extract_info_value(env_info, 'unrealized_pnl', 0.0)
-            spread_capture = _extract_info_value(env_info, 'spread_capture', 0.0)
+            realized_pnl = _extract_info_value(env_info, 'realized_pnl', 0.0)  # LIFO realized
+            unrealized_pnl = _extract_info_value(env_info, 'unrealized_pnl', 0.0)  # Weighted avg unrealized
+            spread_capture = _extract_info_value(env_info, 'spread_capture', 0.0)  # LIFO spread capture
             fees = _extract_info_value(env_info, 'fees', 0.0)
             trade_count = _extract_info_value(env_info, 'trade_count', 0)
             net_amount_btc = _extract_info_value(env_info, 'net_amount_btc', 0.0)
+            balance = _extract_info_value(env_info, 'balance', 0.0)
+            initial_balance = _extract_info_value(env_info, 'initial_balance', 0.0)
             
             for env_id in range(self.config.num_envs):
                 self.buffer.mm_rewards[step, env_id] = mm_reward[env_id]
@@ -358,11 +413,13 @@ class HierarchicalPPOTrainer:
                 episode_infos[env_id]['mm_reward'] = episode_infos[env_id].get('mm_reward', 0.0) + mm_reward[env_id]
                 episode_infos[env_id]['inv_reward'] = episode_infos[env_id].get('inv_reward', 0.0) + inv_reward[env_id]
                 episode_infos[env_id]['realized_pnl'] = episode_infos[env_id].get('realized_pnl', 0.0) + realized_pnl[env_id]
-                episode_infos[env_id]['unrealized_pnl'] = unrealized_pnl[env_id]
+                episode_infos[env_id]['unrealized_pnl'] = unrealized_pnl[env_id]  # Weighted avg unrealized
                 episode_infos[env_id]['spread_capture'] = episode_infos[env_id].get('spread_capture', 0.0) + spread_capture[env_id]
                 episode_infos[env_id]['fees'] = episode_infos[env_id].get('fees', 0.0) + fees[env_id]
                 episode_infos[env_id]['trade_count'] = episode_infos[env_id].get('trade_count', 0) + int(trade_count[env_id])
                 episode_infos[env_id]['net_amount_btc'] = net_amount_btc[env_id]
+                episode_infos[env_id]['balance'] = balance[env_id]  # Current balance (for weighted avg realized)
+                episode_infos[env_id]['initial_balance'] = initial_balance[env_id]
             
             # Handle done environments
             new_done = (done | truncated) & ~done_mask
@@ -393,6 +450,7 @@ class HierarchicalPPOTrainer:
                     episode_summary['fees'] = final_fees
                     episode_summary['trade_count'] = final_trade_count
                     episode_summary['net_amount_btc'] = final_net_amount_btc
+                # balance and initial_balance are already in episode_infos from accumulation
                 
                 self.completed_episodes.append(episode_summary)
                 self.episode_rewards.append(
@@ -429,6 +487,14 @@ class HierarchicalPPOTrainer:
             clip_delta=self.config.gae_clip_delta,
             normalize_gae=self.config.normalize_gae,
         )
+        
+        # Normalize returns using running statistics to prevent value loss explosion
+        # This keeps the value network targets in a stable range as training progresses
+        self.return_rms_mm.update(self.buffer.returns_mm.flatten())
+        self.buffer.returns_mm = self.return_rms_mm.normalize(self.buffer.returns_mm)
+        
+        self.return_rms_inv.update(self.buffer.returns_inv.flatten())
+        self.buffer.returns_inv = self.return_rms_inv.normalize(self.buffer.returns_inv)
     
     def update(self) -> Dict[str, float]:
         """Update policy using PPO."""
@@ -480,8 +546,8 @@ class HierarchicalPPOTrainer:
                 
                 # Minibatch tensors
                 obs_tensor = torch.from_numpy(flat_obs[mb_indices.cpu().numpy()]).float().to(self.device)
-                # MM agent only needs first 2 actions (bid_spread, ask_spread)
-                mm_actions_tensor = torch.from_numpy(flat_actions[mb_indices.cpu().numpy()][:, 0:2]).float().to(self.device)
+                # MM agent needs first 3 actions (bid_spread, ask_spread, requote)
+                mm_actions_tensor = torch.from_numpy(flat_actions[mb_indices.cpu().numpy()][:, 0:3]).float().to(self.device)
                 inv_actions_tensor = torch.from_numpy(flat_inv_actions[mb_indices.cpu().numpy()]).float().to(self.device)
                 old_log_probs_mm = torch.from_numpy(flat_log_probs_mm[mb_indices.cpu().numpy()]).float().to(self.device)
                 old_log_probs_inv = torch.from_numpy(flat_log_probs_inv[mb_indices.cpu().numpy()]).float().to(self.device)
@@ -550,10 +616,10 @@ class HierarchicalPPOTrainer:
                 
                 # Regularization
                 value_l2_reg_mm = torch.mean(mm_value ** 2)
-                # MM agent uses Beta distribution with spread_concentration, not log_std
+                # MM agent uses Beta distribution with action_concentration, not log_std
                 # Light regularization on concentration parameters to prevent extreme values
                 concentration_l2_reg_mm = torch.sum(
-                    (self.policy.mm_agent.spread_concentration.weight ** 2).sum(dim=1)
+                    (self.policy.mm_agent.action_concentration.weight ** 2).sum(dim=1)
                 )
                 concentration_l2_reg_mm = 1e-4 * concentration_l2_reg_mm  # Light regularization
                 
@@ -679,14 +745,17 @@ class HierarchicalPPOTrainer:
         if self.completed_episodes:
             print("\nCompleted Episodes:")
             for i, ep in enumerate(self.completed_episodes, 1):
-                # Net PnL = Realized + Unrealized - Fees
-                # Fees are negative for maker rebates (we earn money), positive for taker fees (we pay)
-                true_net = ep['realized_pnl'] + ep['unrealized_pnl'] - ep.get('fees', 0.0)
+                # Net PnL (Weighted Avg) = (balance - initial_balance) + unrealized_pnl
+                # Both components use weighted average accounting for consistency
+                balance = ep.get('balance', 0.0)
+                initial_balance = ep.get('initial_balance', 0.0)
+                weighted_avg_realized = balance - initial_balance  # Realized P&L on weighted avg basis
+                weighted_avg_net = weighted_avg_realized + ep['unrealized_pnl']  # Net P&L (all weighted avg)
                 print(f"Ep {i}: MM Rew {ep['mm_reward']:.2f} | Inv Rew {ep['inv_reward']:.2f} | "
-                      f"R.PnL ${ep['realized_pnl']:7.2f} | "
+                      f"R.PnL ${weighted_avg_realized:7.2f} | "
                       f"SprdCap ${ep['spread_capture']:6.2f} | "
                       f"U.PnL ${ep['unrealized_pnl']:7.2f} | "
-                      f"Net ${true_net:7.2f} | "
+                      f"Net ${weighted_avg_net:7.2f} | "
                       f"Trades {ep['trade_count']:4d} | "
                       f"Pos {ep['net_amount_btc']:+.5f} BTC")
             print()
@@ -749,8 +818,11 @@ class HierarchicalPPOTrainer:
                 avg_unrealized = np.mean([ep['unrealized_pnl'] for ep in self.completed_episodes])
                 avg_fees = np.mean([ep['fees'] for ep in self.completed_episodes])
                 avg_trades = np.mean([ep['trade_count'] for ep in self.completed_episodes])
-                avg_net = np.mean([ep['realized_pnl'] + ep['unrealized_pnl'] - ep.get('fees', 0.0) 
-                              for ep in self.completed_episodes])
+                # Net PnL (Weighted Avg) = (balance - initial_balance) + unrealized_pnl
+                avg_net = np.mean([
+                    (ep.get('balance', 0.0) - ep.get('initial_balance', 0.0)) + ep['unrealized_pnl']
+                    for ep in self.completed_episodes
+                ])
                 
                 self.tb_writer.add_scalar('Episode/MM_Reward', avg_episode_mm_rew, step)
                 self.tb_writer.add_scalar('Episode/Inv_Reward', avg_episode_inv_rew, step)
@@ -776,9 +848,9 @@ class HierarchicalPPOTrainer:
         print(f"MM Agent: updates every step (500ms)")
         print(f"Steps per epoch: {self.config.n_steps}")
         print(f"Total epochs: {self.config.total_epochs}")
-        print(f"Observations: 40 signals (13 market + 4 AMM + 8 trade + 11 agent state + 4 quote info)")
-        print(f"Actions: 4 (bid_spread, ask_spread, target_inventory, risk_aversion)")
-        print(f"Smart requote: only when prices change by >2 ticks")
+        print(f"Observations: 42 signals (13 market + 4 AMM + 8 trade + 11 agent state + 4 quote + 2 trend/vol)")
+        print(f"Actions: 5 (bid_spread, ask_spread, requote, target_inventory, risk_aversion)")
+        print(f"Requote: controlled by agent's binary requote action")
         print("="*80 + "\n")
         
         for epoch in range(self.config.total_epochs):
@@ -840,6 +912,9 @@ class HierarchicalPPOTrainer:
             'epochs_completed': self.epochs_completed,
             'best_reward': self.best_reward,
             'config': self.config,
+            # Running return normalization stats (prevents value loss explosion on resume)
+            'return_rms_mm': {'mean': self.return_rms_mm.mean, 'var': self.return_rms_mm.var, 'count': self.return_rms_mm.count},
+            'return_rms_inv': {'mean': self.return_rms_inv.mean, 'var': self.return_rms_inv.var, 'count': self.return_rms_inv.count},
         }
         torch.save(checkpoint, path)
         print(f"  Saved checkpoint: {path}")
@@ -892,6 +967,21 @@ class HierarchicalPPOTrainer:
             self.global_step = checkpoint.get('global_step', 0)
             self.epochs_completed = checkpoint.get('epochs_completed', 0)
             self.best_reward = checkpoint.get('best_reward', float('-inf'))
+            
+            # Load running return normalization stats if available
+            if 'return_rms_mm' in checkpoint:
+                rms_mm = checkpoint['return_rms_mm']
+                self.return_rms_mm.mean = rms_mm['mean']
+                self.return_rms_mm.var = rms_mm['var']
+                self.return_rms_mm.count = rms_mm['count']
+                print(f"  Loaded return_rms_mm: mean={rms_mm['mean']:.4f}, std={np.sqrt(rms_mm['var']):.4f}")
+            
+            if 'return_rms_inv' in checkpoint:
+                rms_inv = checkpoint['return_rms_inv']
+                self.return_rms_inv.mean = rms_inv['mean']
+                self.return_rms_inv.var = rms_inv['var']
+                self.return_rms_inv.count = rms_inv['count']
+                print(f"  Loaded return_rms_inv: mean={rms_inv['mean']:.4f}, std={np.sqrt(rms_inv['var']):.4f}")
             
             print(f"Loaded checkpoint from {path}")
             print(f"  Resuming from epoch {self.epochs_completed}, step {self.global_step}")

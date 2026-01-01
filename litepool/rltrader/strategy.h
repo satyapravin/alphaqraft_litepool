@@ -83,13 +83,6 @@ namespace RLTrader {
         
         // Process fills from exchange
         void next();
-        
-        // Check if proposed quotes differ significantly from current quotes
-        // Returns true if we should requote (prices differ by more than tick_threshold ticks)
-        bool shouldRequote(const RLAction& action,
-                          FixedVector<double, 20>& bid_prices,
-                          FixedVector<double, 20>& ask_prices,
-                          double tick_threshold = 2.0);
 
     protected:
         // Avellaneda-Stoikov inspired quoting model
@@ -124,10 +117,23 @@ namespace RLTrader {
         double last_ask_price = 0.0;
         double last_mid_price = 0.0;
         
+        // Track last spread actions for stability penalty
+        double last_bid_action_ = 0.5;
+        double last_ask_action_ = 0.5;
+    
+    public:
+        // Getters for spread actions (used by stability penalty in reward)
+        double getLastBidAction() const { return last_bid_action_; }
+        double getLastAskAction() const { return last_ask_action_; }
+    
+    protected:
+        
         // Volatility tracking (2-minute window)
-        std::deque<double> price_history_;    // Price history for 2-minute volatility calculation
-        double vol_2min_ = 0.0;               // 2-minute volatility estimate
-        static constexpr int VOL_WINDOW_STEPS = 240;  // 2 minutes = 240 steps at 0.5s per step
+        std::deque<double> price_history_;    // Price history for volatility calculation
+        double vol_2min_ = 0.0;               // Short-term volatility estimate (kept name for compatibility)
+        // 30 seconds = 60 steps at 0.5s per step
+        // Shorter window = faster reaction to volatility spikes = better spread adjustment
+        static constexpr int VOL_WINDOW_STEPS = 60;
         
         // Leverage limit tracking
         bool hit_leverage_limit_ = false;     // True if leverage hit ±1.0 and quoting stopped
@@ -142,7 +148,10 @@ namespace RLTrader {
         bool first_call_ = true;               // First call flag (for detecting changes without fills)
         
         // Model parameters
-        static constexpr double TARGET_EMA_ALPHA = 0.0058;   // Target inventory smoothing (120 step half-life = 60 sec)
-        // Alpha = 0.0058 gives half-life of ~120 steps: 0.5 = (1 - alpha)^n → n ≈ 120
+        // TARGET_EMA_ALPHA controls how quickly target_inventory responds to agent actions
+        // Higher alpha = faster response, lower alpha = smoother but slower
+        // For market making with 500ms steps, we want reasonably fast response
+        // Alpha = 0.1 gives half-life of ~7 steps (3.5 sec): 0.5 = (1 - 0.1)^7 ≈ 0.478
+        static constexpr double TARGET_EMA_ALPHA = 0.01;
     };
 }

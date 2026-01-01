@@ -80,7 +80,7 @@ def load_model_and_env():
         balance=2000.0,  # Initial balance (will be fetched from exchange in prod)
         start=1,
         max_episode_steps=MAX_STEPS,
-        base_spread_bps=1.0,  # Match training config
+        base_spread_bps=config.base_spread_bps,  # Use training config value
         min_size_pct=1.0,     # Match training config
         max_size_pct=25.0,    # Match training config
     )

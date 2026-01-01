@@ -25,8 +25,9 @@
 
 namespace RLTrader {
 
-// Observation space: 13 market + 4 AMM flow + 8 trade + 11 agent state + 1 previous spread + 2 bid/ask distances + 1 mid_change = 40 signals
-constexpr int OBS_DIM = 40;
+// Observation space: 13 market + 4 AMM flow + 8 trade + 11 agent state + 1 previous spread + 2 bid/ask distances 
+//                   + 1 price_trend + 1 rolling_pnl + 1 pnl_volatility = 42 signals
+constexpr int OBS_DIM = 42;
 
 class EnvAdaptor { 
 public:
@@ -34,9 +35,6 @@ public:
     ~EnvAdaptor()  = default;
     
     void quote(const RLAction& action);
-    
-    // Check if proposed quotes differ significantly from current quotes
-    bool shouldRequote(const RLAction& action, double tick_threshold = 2.0);
 
     void reset() ;
     void syncTradeReader(long long book_start_timestamp);  // Sync trade reader to book's starting timestamp
@@ -64,6 +62,21 @@ private:
     double flow_imbalance_ema_ = 0.0;
     double inventory_delta_ema_ = 0.0;
     static constexpr double AMM_SIGNAL_EMA_ALPHA = 0.1;  // ~7 step half-life for smoothing noisy signals
+    
+    // Rolling P&L momentum - EMA of per-step net P&L delta (using weighted avg unrealized)
+    // Helps inventory agent see if it's on a winning or losing streak
+    double prev_net_pnl_ = 0.0;           // Previous step's net P&L (realized + weighted avg unrealized)
+    double rolling_pnl_momentum_ = 0.0;   // EMA of P&L deltas
+    double rolling_pnl_var_ = 0.0;        // EMA of squared P&L deltas (for volatility)
+    static constexpr double PNL_MOMENTUM_ALPHA = 0.05;  // ~14 step half-life (~7 sec window)
+    
+    // Price trend signal using dual EMAs (fast vs slow)
+    // Positive = price trending up, Negative = trending down
+    double price_ema_fast_ = 0.0;         // Fast EMA (~10 step half-life = 5 sec)
+    double price_ema_slow_ = 0.0;         // Slow EMA (~60 step half-life = 30 sec)
+    bool price_emas_initialized_ = false;
+    static constexpr double PRICE_EMA_FAST_ALPHA = 0.07;   // ~10 step half-life
+    static constexpr double PRICE_EMA_SLOW_ALPHA = 0.012;  // ~60 step half-life
     
     // Cached signals from last tick (updated in next() loop, used in computeState())
     std::vector<double> last_market_signals_;
