@@ -33,7 +33,7 @@ class HierarchicalPolicy(nn.Module):
     Combined action sent to environment: [bid_spread, ask_spread, target_inventory, risk_aversion]
     (4 dimensions total)
     
-    Note: Requote is handled automatically by the environment (smart requote).
+    Note: Agent always requotes every step (no requote action).
     """
     
     def __init__(
@@ -146,7 +146,7 @@ class HierarchicalPolicy(nn.Module):
             temperature: Scale exploration noise (0.0 = deterministic, 1.0 = full exploration)
             
         Returns:
-            action: Combined action [batch, 5] for environment (bid_spread, ask_spread, requote, target_inventory, risk_aversion)
+            action: Combined action [batch, 4] for environment (bid_spread, ask_spread, target_inventory, risk_aversion)
             log_probs: Dict with 'inventory' and 'mm' log probs
             values: Dict with 'inventory' and 'mm' values
         """
@@ -210,11 +210,10 @@ class HierarchicalPolicy(nn.Module):
             h, c = mm_hidden_new
             self.mm_hidden = (h.detach().clone(), c.detach().clone())
         
-        # Combine into environment action format: [bid_spread, ask_spread, requote, target_inventory, risk_aversion]
+        # Combine into environment action format: [bid_spread, ask_spread, target_inventory, risk_aversion]
         action = torch.cat([
             mm_action[:, 0:1],  # bid_spread
             mm_action[:, 1:2],  # ask_spread
-            mm_action[:, 2:3],  # requote decision
             self.current_targets,  # target_inventory
             self.current_risk_aversion,  # risk_aversion
         ], dim=-1)
@@ -252,7 +251,7 @@ class HierarchicalPolicy(nn.Module):
             temperature: Scale exploration noise (0.0 = deterministic, 1.0 = full exploration)
             
         Returns:
-            action: Combined action [batch, 5] (bid_spread, ask_spread, requote, target_inventory, risk_aversion)
+            action: Combined action [batch, 4] (bid_spread, ask_spread, target_inventory, risk_aversion)
             info: Additional info (log_probs, values, etc.)
         """
         obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)

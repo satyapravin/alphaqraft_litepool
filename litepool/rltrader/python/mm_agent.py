@@ -25,10 +25,9 @@ class MMAgent(nn.Module):
     
     Input observations (42 dims): All observations (shared with Inventory agent)
     
-    Output (3 actions):
+    Output (2 actions):
         - bid_spread: [0, 1] → adds to base spread (higher = wider spread)
         - ask_spread: [0, 1] → adds to base spread (higher = wider spread)
-        - requote: [0, 1] → binary decision (>0.5 = requote, ≤0.5 = keep existing quotes)
     """
     
     def __init__(
@@ -64,12 +63,11 @@ class MMAgent(nn.Module):
             batch_first=True,
         )
         
-        # Actor head: All 3 actions use Beta distribution [0, 1]
+        # Actor head: 2 actions use Beta distribution [0, 1]
         # - bid_spread, ask_spread: spread multipliers
-        # - requote: continuous value thresholded at 0.5 in C++
         # Output mean (via sigmoid) and concentration parameter (via softplus)
-        self.action_mean = nn.Linear(lstm_hidden, 3)  # bid_spread, ask_spread, requote
-        self.action_concentration = nn.Linear(lstm_hidden, 3)  # concentration for Beta
+        self.action_mean = nn.Linear(lstm_hidden, 2)  # bid_spread, ask_spread
+        self.action_concentration = nn.Linear(lstm_hidden, 2)  # concentration for Beta
         
         # Critic head
         self.critic = nn.Linear(lstm_hidden, 1)
@@ -95,11 +93,9 @@ class MMAgent(nn.Module):
                     nn.init.orthogonal_(m.weight, gain=1.0)
                 if m.bias is not None:
                     if 'action_mean' in name:
-                        # Initialize: [bid_spread, ask_spread, requote]
+                        # Initialize: [bid_spread, ask_spread]
                         # Spreads: small random for exploration (~0.4-0.6 after sigmoid)
-                        # Requote: positive bias so mean > 0.5 initially (encourages requoting)
                         nn.init.normal_(m.bias, mean=0.0, std=0.1)
-                        m.bias.data[2] = 0.5  # requote: sigmoid(0.5) ≈ 0.62 > 0.5
                     elif 'action_concentration' in name:
                         # Initialize concentration bias to encourage exploration
                         # softplus(-1.0) + 1.0 ≈ 1.31 (more exploration)
@@ -127,8 +123,8 @@ class MMAgent(nn.Module):
             hidden: LSTM hidden state tuple (h, c)
             
         Returns:
-            action_mean: Mean of all 3 actions [batch, 3] (bid_spread, ask_spread, requote)
-            action_concentration: Concentration for Beta distribution [batch, 3]
+            action_mean: Mean of 2 actions [batch, 2] (bid_spread, ask_spread)
+            action_concentration: Concentration for Beta distribution [batch, 2]
             value: State value [batch, 1]
             hidden: Updated LSTM hidden state
         """
@@ -162,8 +158,8 @@ class MMAgent(nn.Module):
         # Take last timestep
         last_out = lstm_out[:, -1, :]  # [batch, lstm_hidden]
         
-        # Actor output: all 3 actions [0, 1] using Beta distribution
-        # [bid_spread, ask_spread, requote]
+        # Actor output: 2 actions [0, 1] using Beta distribution
+        # [bid_spread, ask_spread]
         action_mean = torch.sigmoid(self.action_mean(last_out))  # [0, 1]
         # Concentration parameter: clamp to [1.0, 2.0] for non-negative entropy
         action_concentration = torch.clamp(F.softplus(self.action_concentration(last_out)) + 1.0, min=1.0, max=2.0)
@@ -196,7 +192,7 @@ class MMAgent(nn.Module):
             temperature: Scale concentration (0.0 = deterministic, 1.0 = full exploration)
             
         Returns:
-            action: Actions [batch, 3] (bid_spread, ask_spread, requote)
+            action: Actions [batch, 2] (bid_spread, ask_spread)
             log_prob: Log probability [batch, 1]
             value: State value [batch, 1]
             hidden: Updated hidden state
@@ -205,11 +201,10 @@ class MMAgent(nn.Module):
         
         if temperature == 0.0 or deterministic:
             # Fully deterministic: use means directly
-            # requote is continuous [0,1], C++ will threshold at 0.5
             log_prob = torch.zeros(action_mean.shape[0], 1, device=action_mean.device)
             return action_mean, log_prob, value, hidden
         
-        # Beta distribution for all 3 actions
+        # Beta distribution for 2 actions
         effective_concentration = action_concentration / (temperature + 1e-8)
         alpha = action_mean * effective_concentration
         beta_param = (1.0 - action_mean) * effective_concentration
@@ -233,7 +228,7 @@ class MMAgent(nn.Module):
         
         Args:
             obs: Full observations [batch, obs_dim]
-            actions: Actions taken [batch, 3] (bid_spread, ask_spread, requote)
+            actions: Actions taken [batch, 2] (bid_spread, ask_spread)
             hidden: LSTM hidden state
             
         Returns:
@@ -243,7 +238,7 @@ class MMAgent(nn.Module):
         """
         action_mean, action_concentration, value, _ = self.forward(obs, hidden)
         
-        # Beta distribution for all 3 actions
+        # Beta distribution for 2 actions
         alpha = action_mean * action_concentration
         beta_param = (1.0 - action_mean) * action_concentration
         alpha = torch.clamp(alpha, min=0.1)

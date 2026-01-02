@@ -179,7 +179,6 @@ TEST_CASE("env adaptor test") {
 	action.bid_spread = 0.01;
 	action.ask_spread = 0.01;
 	action.target_inventory = 0.01;
-	action.should_requote = 0.01;
 	adaptor.quote(action);
 
 	for (int ii=0; ii < 500; ++ii) {
@@ -188,7 +187,6 @@ TEST_CASE("env adaptor test") {
 		action.bid_spread = 0.0;
 		action.ask_spread = 0.0;
 		action.target_inventory = 0.01;
-		action.should_requote = 0.01;
 		adaptor.quote(action);
 	}
 
@@ -692,7 +690,6 @@ TEST_CASE("test of inverse strategy") {
 	action.bid_spread = 0.0;
 	action.ask_spread = 0.0;
 	action.target_inventory = 0.0;
-	action.should_requote = 1.0;
 	strategy.quote(action, book.bid_prices, book.ask_prices);
 	exch.next_read(slot, book);
 	const auto& bids = exch.getBidOrders();
@@ -723,7 +720,6 @@ TEST_CASE("test of normal strategy") {
 	action.bid_spread = 0.0;
 	action.ask_spread = 0.0;
 	action.target_inventory = 0.0;
-	action.should_requote = 1.0;
 	strategy.quote(action, book.bid_prices, book.ask_prices);
 	exch.next_read(slot, book);
 	const auto& bids = exch.getBidOrders();

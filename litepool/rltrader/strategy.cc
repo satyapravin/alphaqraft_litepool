@@ -195,9 +195,32 @@ std::pair<double, double> Strategy::computeQuotePrices(
     
     // Inventory adjustment based on A-S model
     // Scale: inventory_error * gamma * variance gives reasonable skew
-    double inventory_adjustment = inventory_error * gamma * variance;
+    double inventory_adjustment = inventory_error * gamma * variance / 50;
     // Cap adjustment to reasonable range (2% of price max)
     inventory_adjustment = std::clamp(inventory_adjustment, -mid_price * 0.02, mid_price * 0.02);
+    
+    // =========================================================================
+    // Emergency Skew: Force position reduction when leverage exceeds threshold
+    // =========================================================================
+    // When |leverage| > 1, add aggressive skew to offload position
+    // This is a safety mechanism to prevent blow-ups from large positions
+    constexpr double LEVERAGE_THRESHOLD = 1;
+    constexpr double EMERGENCY_SKEW_BPS = 50.0;  // 50 bps extra skew per 0.1 leverage excess (aggressive)
+    
+    double abs_leverage = std::abs(leverage);
+    if (abs_leverage > LEVERAGE_THRESHOLD) {
+        double excess_leverage = abs_leverage - LEVERAGE_THRESHOLD;
+        // Skew in price units: excess * bps_per_excess * mid_price / 10000
+        double emergency_skew = excess_leverage * EMERGENCY_SKEW_BPS * mid_price / 10000.0;
+        
+        if (leverage > 0) {
+            // Too long: widen bid more, tighten ask more (regardless of target)
+            inventory_adjustment += emergency_skew;
+        } else {
+            // Too short: tighten bid more, widen ask more  
+            inventory_adjustment -= emergency_skew;
+        }
+    }
     
     // Base spread from config (in basis points, convert to price units)
     double base_spread = mid_price * config.base_spread_bps / 10000.0;
@@ -256,7 +279,7 @@ std::pair<double, double> Strategy::computeQuoteSizes(
     const RLAction& action,
     double init_balance) {
     
-    constexpr double SIZE_PER_LEVEL_PCT = 0.5;
+    constexpr double SIZE_PER_LEVEL_PCT = 0.25;
     double size_usd = SIZE_PER_LEVEL_PCT / 100.0 * init_balance;
     
     return {size_usd, size_usd};
@@ -281,7 +304,7 @@ void Strategy::quote(const RLAction& action,
     // - More realistic market making
     // ============================================================================
     
-    constexpr int NUM_LEVELS = 5;
+    constexpr int NUM_LEVELS = 10;
     
     // Validate RL outputs are in expected range [0, 1]
     assert(action.bid_spread >= -0.0001 && action.bid_spread <= 1.0001);
@@ -294,36 +317,7 @@ void Strategy::quote(const RLAction& action,
     // Early exit if prices invalid
     if (bid_prices[0] < 0.0001 || ask_prices[0] < 0.0001) return;
     
-    // Force requote conditions:
-    // 1. First quote (no orders placed yet)
-    // 2. No active orders in book (they got filled - need to replace them)
-    // 3. Quotes are stale (too far from current mid - prevents stuck quotes)
-    bool first_quote = (last_bid_price < 0.0001 && last_ask_price < 0.0001);
-    bool no_active_orders = exchange.getBidOrders().empty() && exchange.getAskOrders().empty();
-    
-    // Stale quote detection: if quotes are too far from mid, force requote
-    // This prevents the agent from sitting on stale quotes that never fill
     auto mid_price = (bid_prices[0] + ask_prices[0]) * 0.5;
-    bool stale_quotes = false;
-    if (last_bid_price > 0.0001 && last_ask_price > 0.0001 && mid_price > 0.0001) {
-        double bid_distance_bps = (mid_price - last_bid_price) / mid_price * 10000.0;
-        double ask_distance_bps = (last_ask_price - mid_price) / mid_price * 10000.0;
-        // If either quote is more than 5 bps from mid, force requote
-        stale_quotes = (bid_distance_bps > 5.0) || (ask_distance_bps > 5.0);
-    }
-    
-    bool force_requote = first_quote || no_active_orders || stale_quotes;
-    
-    // Agent controls requote decision: >0.3 = requote, <=0.3 = keep existing orders
-    // This gives the agent explicit control over quote update timing
-    // Skip quoting if agent says no requote (keep existing orders in the book)
-    // BUT always requote if forced (first call, no orders, or stale quotes)
-    if (!force_requote && action.should_requote <= 0.8) {
-        // Still update volatility even when not requoting
-        updateVolatility(mid_price);
-        return;
-    }
-    
     auto tick_size = instrument.getTickSize();
     auto minAmount = instrument.getMinAmount();
     auto posInfo = position.getPositionInfo(bid_prices[0], ask_prices[0]);
@@ -359,8 +353,8 @@ void Strategy::quote(const RLAction& action,
     // Check position limits - prevent placing orders that would push leverage beyond limits
     // Use stricter check: only place if current leverage is well within limits (95% threshold)
     // This prevents fills from pushing leverage too far beyond the limit
-    bool can_place_bids = (level_size >= minAmount) && (leverage < config.max_leverage * 0.95);
-    bool can_place_asks = (level_size >= minAmount) && (leverage > -config.max_leverage * 0.95);
+    bool can_place_bids = (level_size >= minAmount) && (leverage < config.max_leverage * 2.95);
+    bool can_place_asks = (level_size >= minAmount) && (leverage > -config.max_leverage * 2.95);
     
     // Store first level prices for diagnostics
     last_mid_price = mid_price;

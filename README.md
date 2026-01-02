@@ -21,21 +21,21 @@ Traditional market makers face an impossible choice:
 │                        INVENTORY AGENT (Strategic)                        │
 │  "What position should I hold given market conditions?"                   │
 │                                                                           │
-│  • Observes: AMM flow signals, trade pressure, volatility                 │
-│  • Decides: Target inventory level (±10% leverage)                        │
-│  • Reward: Unrealized P&L changes (learns market direction)               │
-│  • Updates: Every 100 steps (50 seconds) - strategic time scale           │
-└────────────────────────────────┬─────────────────────────────────────────┘
-                                 │ target_inventory
-                                 ▼
+│  • Observes: AMM flow signals, trade pressure, P&L momentum, price trend  │
+│  • Decides: Target inventory level (±100% leverage) + risk aversion (γ)   │
+│  • Reward: LIFO unrealized P&L changes (learns market direction)          │
+│  • Updates: Every 10 steps (5 seconds) - strategic time scale             │
+└────────────────────────────────────┬─────────────────────────────────────┘
+                                     │ target_inventory, risk_aversion
+                                     ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                      MARKET MAKING AGENT (Tactical)                       │
 │  "How do I efficiently reach that target while capturing spread?"         │
 │                                                                           │
 │  • Observes: Microstructure signals + target from Inventory Agent         │
-│  • Decides: Bid/ask spreads (smart requote handles timing)                │
-│  • Reward: Spread capture + fee rebates - inactivity penalty              │
-│  • Updates: Every step (500ms) - tactical time scale                      │
+│  • Decides: Bid/ask spreads (always requotes every step)                  │
+│  • Reward: Spread capture + fee rebates                                   │
+│  • Updates: Every step (1 second) - tactical time scale                   │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -44,11 +44,11 @@ Traditional market makers face an impossible choice:
 | Benefit | Explanation |
 |---------|-------------|
 | **No Reward Gaming** | MM agent can't inflate rewards by only opening positions - it's paid for round-trips |
-| **Smart Requoting** | Can't avoid fills by never requoting - requotes triggered automatically by market moves |
 | **Clean Separation** | Inventory agent learns *when* to be long/short; MM agent learns *how* to get there |
-| **Different Time Scales** | Strategic decisions (seconds) don't interfere with tactical execution (milliseconds) |
+| **Different Time Scales** | Strategic decisions (seconds) don't interfere with tactical execution (100ms ticks) |
 | **Interpretable** | Can analyze each agent's learned behavior independently |
 | **Trend + Spread** | Captures directional moves (via inventory) while earning spread (via MM) |
+| **Risk Control** | Inventory agent also controls risk aversion (γ) for Avellaneda-Stoikov model |
 
 ---
 
@@ -58,55 +58,73 @@ The key insight: **each agent optimizes what it can control**.
 
 | Agent | Reward | Controls | Signal |
 |-------|--------|----------|--------|
-| **Inventory** | `Δ(unrealized_pnl)` | When to be long/short/flat | Market direction |
-| **MM** | `spread_capture + fees` | Quote pricing, execution timing | Execution quality |
+| **Inventory** | `Δ(lifo_unrealized_pnl)` | When to be long/short/flat, risk level | Market direction |
+| **MM** | `spread_capture + fees` | Quote pricing | Execution quality |
 
 ```cpp
 // MM Agent: optimizes spread capture (LIFO) + fee rebates
-mm_reward = (spread_capture_delta + fee_delta) × 10,000
-mm_reward -= 0.001 if no fills this step  // inactivity penalty
+mm_reward = (spread_capture_delta + fee_delta) × REWARD_SCALE
 
-// Inventory Agent: optimizes unrealized P&L (market direction)
-inv_reward = unrealized_pnl_delta × 10,000
-
-// Combined reward = total wealth change
-total_reward = mm_reward + inv_reward
+// Inventory Agent: optimizes LIFO unrealized P&L (market direction)
+inv_reward = lifo_unrealized_pnl_delta × REWARD_SCALE
 ```
 
-**Inactivity Penalty**: The MM agent receives a small penalty (-0.001) for each step without fills, preventing it from learning to avoid trading entirely.
-
-**Spread Capture vs Realized P&L**: We use LIFO-matched spread capture rather than average-cost realized P&L because:
+**LIFO Accounting**: Both agents use Last-In-First-Out matching for P&L:
 - Directly measures round-trip profitability
 - Dense signal: every completed round-trip provides feedback
 - Rewards actual market making behavior (buy low, sell high)
 
+**Fee Rebates**: Negative fees mean the agent EARNS rebates (maker orders). The `maker_fee = -0.000025` means earning 2.5 bps on each fill.
+
 ---
 
-## 🔬 Observation Space (36 signals)
+## 🔬 Observation Space (42 signals)
 
 ### Market Microstructure (13)
-Bid-ask spread, depth imbalance, order flow, volatility regime, price trend
+| Index | Signal | Description |
+|-------|--------|-------------|
+| 0 | `bid_ask_spread` | Current spread in bps |
+| 1 | `depth_imbalance` | (bid_depth - ask_depth) / total |
+| 2-5 | `order_flow_*` | Directional flow indicators |
+| 6-8 | `volatility_*` | Short/medium/long volatility |
+| 9-12 | `trend_*` | Price trend indicators |
 
 ### AMM Flow Signals (4)
-Simulated AMM V3 concentrated liquidity signals: net flow, imbalance, inventory delta, cumulative flow
+| Index | Signal | Description |
+|-------|--------|-------------|
+| 13 | `amm_net_flow` | Net AMM trading flow |
+| 14 | `amm_imbalance` | AMM inventory imbalance |
+| 15 | `amm_inventory_delta` | Change in AMM inventory |
+| 16 | `amm_cumulative_flow` | Decaying cumulative flow (60s half-life) |
 
 ### Trade Feed Signals (8)
-Real trade data: buy/sell volume, intensity, price impact, pressure indicators
+| Index | Signal | Description |
+|-------|--------|-------------|
+| 17-18 | `buy/sell_volume` | Trade volumes by side |
+| 19-20 | `buy/sell_intensity` | Trade frequency |
+| 21-22 | `price_impact_*` | Market impact estimates |
+| 23-24 | `pressure_*` | Buying/selling pressure |
 
-### Agent State (11)
-| Signal | Index | Purpose |
-|--------|-------|---------|
-| `leverage` | 25 | Current position risk |
-| `position` | 26 | Normalized position size |
-| `unrealized_pnl` | 27 | Mark-to-market P&L |
-| `realized_pnl` | 28 | Locked-in P&L |
-| `spread_capture` | 29 | LIFO round-trip profit |
-| `deviation_from_target` | 30 | Distance from target inventory |
-| `unrealized_pnl_pct` | 31 | P&L as % of position |
-| `target_inventory_ema` | 32 | Smoothed target (what agent asked for) |
-| `entry_price_distance` | 33 | Distance from avg entry to current mid |
-| `time_since_last_fill` | 34 | Steps since last trade |
-| `quote_mid_distance` | 35 | How far quotes are from mid (bps) |
+### Agent State (17)
+| Index | Signal | Description |
+|-------|--------|-------------|
+| 25 | `leverage` | Current position leverage |
+| 26 | `position` | Normalized position size |
+| 27 | `unrealized_pnl` | Mark-to-market P&L (weighted avg) |
+| 28 | `realized_pnl` | Locked-in P&L (weighted avg) |
+| 29 | `spread_capture` | LIFO round-trip profit |
+| 30 | `deviation_from_target` | Distance from target inventory |
+| 31 | `unrealized_pnl_pct` | P&L as % of position |
+| 32 | `target_inventory_ema` | Smoothed target (what agent asked for) |
+| 33 | `entry_price_distance` | Distance from avg entry to current mid |
+| 34 | `time_since_last_fill` | Steps since last trade |
+| 35 | `quote_mid_distance` | How far quotes are from mid (bps) |
+| 36 | `lifo_unrealized_pnl` | LIFO unrealized P&L |
+| 37 | `lifo_realized_pnl` | LIFO realized P&L |
+| 38 | `fees` | Cumulative fees (negative = rebates earned) |
+| 39 | `price_trend` | Dual EMA price trend signal |
+| 40 | `rolling_pnl_momentum` | EMA of P&L changes |
+| 41 | `rolling_pnl_volatility` | Volatility of P&L changes |
 
 ---
 
@@ -127,11 +145,11 @@ Real trade data: buy/sell volume, intensity, price impact, pressure indicators
 
 | Component | Description |
 |-----------|-------------|
-| `inventory_agent.py` | MLP [64, 32] - learns target inventory (1 action) |
-| `mm_agent.py` | MLP [128, 64] + LSTM - learns bid/ask spreads (2 actions) |
-| `hierarchical_policy.py` | Coordinates both agents, combines 3 actions |
-| `hierarchical_ppo.py` | Joint training with separate reward streams |
-| `metric_logger.py` | TensorBoard logging for training analysis |
+| `inventory_agent.py` | Shared Encoder + LSTM - learns target inventory + risk aversion (2 actions) |
+| `mm_agent.py` | Shared Encoder + Attention + LSTM - learns bid/ask spreads (2 actions) |
+| `hierarchical_policy.py` | Coordinates both agents, combines 4 actions |
+| `hierarchical_ppo.py` | Joint PPO training with separate reward streams |
+| `shared_encoder.py` | MLP encoder shared between agents |
 
 ---
 
@@ -140,10 +158,7 @@ Real trade data: buy/sell volume, intensity, price impact, pressure indicators
 ### Build
 
 ```bash
-mkdir -p build && cd build
-cmake .. && make -j$(nproc)
-cp lib/rltrader_litepool.so ../litepool/rltrader/
-pip install -e ..
+pip install -e . --no-build-isolation
 ```
 
 ### Train
@@ -175,12 +190,12 @@ tensorboard --logdir=runs/ --port=6006
 ================================================================================
 Hierarchical PPO Training - Two-Agent Market Making
 ================================================================================
-Inventory Agent: updates every 100 steps (50 sec)
-MM Agent: updates every step (500ms)
+Inventory Agent: updates every 10 steps (5 sec)
+MM Agent: updates every step (1 sec)
 Steps per epoch: 4096
-Observations: 36 signals (13 market + 4 AMM + 8 trade + 11 agent state)
-Actions: 3 (bid_spread, ask_spread, target_inventory)
-Smart Requote: automatic when prices change >2 ticks
+Observations: 42 signals
+Actions: 4 (bid_spread, ask_spread, target_inventory, risk_aversion)
+Requote: always requote every step (no agent control)
 ================================================================================
 
 Epoch    10 | Step   40960 | MM.Rew  0.45 | Inv.Rew  2.31 | SprdCap $ 0.42 | ...
@@ -191,33 +206,41 @@ Epoch    10 | Step   40960 | MM.Rew  0.45 | Inv.Rew  2.31 | SprdCap $ 0.42 | ...
 | Metric | Description |
 |--------|-------------|
 | `MM.Rew` | Market Making reward (spread capture + fees) |
-| `Inv.Rew` | Inventory reward (unrealized P&L delta) |
+| `Inv.Rew` | Inventory reward (LIFO unrealized P&L delta) |
 | `SprdCap` | LIFO spread capture (what MM optimizes) |
 | `U.PnL` | Unrealized P&L (what Inventory optimizes) |
 
 ---
 
-## 🎯 Action Space (3 dimensions)
+## 🎯 Action Space (4 dimensions)
 
-| Action | Range | Description |
-|--------|-------|-------------|
-| `bid_spread` | [-1, 1] | Bid quote width (0.5x - 50x base spread) |
-| `ask_spread` | [-1, 1] | Ask quote width (0.5x - 50x base spread) |
-| `target_inventory` | [-1, 1] | Target leverage (±10%) |
+| Action | Range | Agent | Description |
+|--------|-------|-------|-------------|
+| `bid_spread` | [0, 1] | MM | Bid quote width multiplier |
+| `ask_spread` | [0, 1] | MM | Ask quote width multiplier |
+| `target_inventory` | [-1, 1] | Inventory | Target leverage (±100%) |
+| `risk_aversion` | [0, 0.1] | Inventory | Avellaneda-Stoikov γ parameter |
 
-Quote skew is automatically computed from `(current_leverage - target_inventory)` to push the position toward target.
+### Quoting Mechanism
 
-### Smart Requote Logic
+The strategy uses Avellaneda-Stoikov with inventory skew:
+- Base spread determined by `base_spread_bps` config
+- Agent adjusts spread via `bid_spread` and `ask_spread` multipliers
+- Inventory skew automatically pushes quotes to reduce position toward target
+- Emergency skew activates when leverage exceeds threshold (1x) to aggressively offload
 
-Instead of giving the agent a `requote` action (which it learned to game), requotes are triggered automatically:
+### Ladder Quoting
 
-| Condition | Behavior |
-|-----------|----------|
-| **Price change > 2 ticks** | Requote to track the market |
-| **First step / No active orders** | Always requote |
-| **After a fill** | Requote to replenish liquidity |
+Orders are placed at multiple price levels (10 levels per side):
+- Level 1: 1x base spread (closest to mid)
+- Level 2: 2x base spread
+- ...
+- Level 10: 10x base spread (furthest from mid)
 
-This prevents the agent from avoiding fills by never requoting, while reducing unnecessary order churn.
+This provides:
+- Natural dollar-cost averaging on large moves
+- Reduced adverse selection (only closest levels fill on small moves)
+- More rebate opportunities (multiple fills)
 
 ---
 
@@ -239,16 +262,16 @@ exchange,symbol,timestamp,local_timestamp,id,side,price,amount
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `NUM_ENVS` | 6 | Parallel environments |
-| `N_STEPS` | 4096 | Steps per epoch |
-| `GAMMA` | 0.995 | Discount factor |
-| `BASE_SPREAD_BPS` | 5.0 | Base spread (bps) |
-| `ticks_per_step` | 5 | Ticks per RL step (500ms) |
-| `inventory_update_freq` | 100 | Steps between inventory updates |
-| `OBS_DIM` | 36 | Observation dimensions |
-| `ACTION_DIM` | 3 | Action dimensions |
-| `REQUOTE_TICK_THRESHOLD` | 2.0 | Ticks before auto-requote |
-| `INACTIVITY_PENALTY` | 0.001 | MM penalty per step without fills |
+| `num_envs` | 8 | Parallel environments |
+| `n_steps` | 4096 | Steps per epoch |
+| `gamma` | 0.99 | Discount factor |
+| `base_spread_bps` | 2.0 | Base spread (bps) |
+| `ticks_per_step` | 10 | Ticks per RL step (1 second) |
+| `inventory_update_freq` | 10 | Steps between inventory updates |
+| `OBS_DIM` | 42 | Observation dimensions |
+| `ACTION_DIM` | 4 | Action dimensions |
+| `max_leverage` | 3.0 | Maximum allowed leverage |
+| `initial_balance` | 10000 | Starting balance (USD) |
 
 ---
 

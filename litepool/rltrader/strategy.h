@@ -48,9 +48,6 @@ namespace RLTrader {
         // Risk aversion parameter (γ) for Avellaneda-Stoikov model: [0, 1]
         // Higher γ = more risk averse = wider spreads and stronger inventory adjustment
         double risk_aversion = 0.5;
-        
-        // Requote decision: >0 means requote, <=0 means keep existing orders
-        double should_requote = 0.0;
     };
 
     class Strategy {
@@ -156,7 +153,7 @@ namespace RLTrader {
         static constexpr double TARGET_EMA_HALFLIFE_SEC = 60.0;  // 60 sec half-life for smooth target transitions
         
         // Computed alpha (set by setStepDuration based on step_duration_sec)
-        double step_duration_sec_ = 0.5;      // Default: 5 ticks × 100ms
-        double target_ema_alpha_ = 0.001;     // Will be recomputed based on step duration
+        double step_duration_sec_ = 1;      // Default: 5 ticks × 100ms
+        double target_ema_alpha_ = 0.002;     // Will be recomputed based on step duration
     };
 }
