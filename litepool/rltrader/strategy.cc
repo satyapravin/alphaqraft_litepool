@@ -193,37 +193,49 @@ std::pair<double, double> Strategy::computeQuotePrices(
     double target_leverage = target_inventory_ema;
     double inventory_error = leverage - target_leverage;  // Positive = too long
     
-    // Inventory adjustment based on A-S model
-    // Scale: inventory_error * gamma * variance gives reasonable skew
-    double inventory_adjustment = inventory_error * gamma * variance / 50;
-    // Cap adjustment to reasonable range (2% of price max)
-    inventory_adjustment = std::clamp(inventory_adjustment, -mid_price * 0.02, mid_price * 0.02);
+    // =========================================================================
+    // Inventory Skew: Proportional adjustment based on inventory error
+    // =========================================================================
+    // inventory_error = leverage - target_leverage
+    // Example: at -1.0x wanting -0.1x → error = -0.9 (too short by 0.9)
+    //
+    // BASE_SKEW_BPS = 3 bps per 1.0 leverage error (conservative)
+    // gamma (0 to 0.1) scales this: at gamma=0.05 → multiplier = 1.0
+    // 
+    // Error of 0.9 with gamma=0.05: 0.9 * 3 * 1.0 = 2.7 bps
+    // =========================================================================
+    // gamma in [0, 0.1] → multiplier in [0.5, 1.5]
+    double skew_bps = inventory_error * action.base_spread_bps * gamma;
+    double inventory_adjustment = skew_bps * mid_price / 10000.0;
     
     // =========================================================================
-    // Emergency Skew: Force position reduction when leverage exceeds threshold
+    // Emergency Skew: Extra push when LEVERAGE exceeds threshold
     // =========================================================================
-    // When |leverage| > 1, add aggressive skew to offload position
-    // This is a safety mechanism to prevent blow-ups from large positions
-    constexpr double LEVERAGE_THRESHOLD = 1;
-    constexpr double EMERGENCY_SKEW_BPS = 50.0;  // 50 bps extra skew per 0.1 leverage excess (aggressive)
+    // When |leverage| > 0.5, add extra skew to reduce position
+    constexpr double LEVERAGE_THRESHOLD = 0.75;
+    constexpr double EMERGENCY_SKEW_BPS = 5.0;  // 5 bps per 0.1 excess leverage
     
     double abs_leverage = std::abs(leverage);
     if (abs_leverage > LEVERAGE_THRESHOLD) {
-        double excess_leverage = abs_leverage - LEVERAGE_THRESHOLD;
-        // Skew in price units: excess * bps_per_excess * mid_price / 10000
-        double emergency_skew = excess_leverage * EMERGENCY_SKEW_BPS * mid_price / 10000.0;
+        double excess = abs_leverage - LEVERAGE_THRESHOLD;
+        double emergency_skew = excess * EMERGENCY_SKEW_BPS * mid_price / 10000.0;
         
         if (leverage > 0) {
-            // Too long: widen bid more, tighten ask more (regardless of target)
+            // Too long: add to inventory_adjustment (widen bid)
             inventory_adjustment += emergency_skew;
         } else {
-            // Too short: tighten bid more, widen ask more  
+            // Too short: subtract from inventory_adjustment (widen ask)
             inventory_adjustment -= emergency_skew;
         }
     }
     
-    // Base spread from config (in basis points, convert to price units)
-    double base_spread = mid_price * config.base_spread_bps / 10000.0;
+    // Cap adjustment to reasonable range (10 bps max)
+    double max_adj = mid_price * 0.001;  // 10 bps
+    inventory_adjustment = std::clamp(inventory_adjustment, -max_adj, max_adj);
+    
+    // Base spread from RL action (in basis points, convert to price units)
+    // Agent outputs base_spread_bps in [0, 2], directly controlling spread width
+    double base_spread = mid_price * action.base_spread_bps / 10000.0;
     
     // Minimum spread: max of (base_spread, tick_size)
     double min_spread = std::max(base_spread, tick_size);
@@ -277,12 +289,55 @@ std::pair<double, double> Strategy::computeQuotePrices(
 
 std::pair<double, double> Strategy::computeQuoteSizes(
     const RLAction& action,
-    double init_balance) {
+    double init_balance,
+    double leverage,
+    double target_inventory) {
     
-    constexpr double SIZE_PER_LEVEL_PCT = 0.25;
-    double size_usd = SIZE_PER_LEVEL_PCT / 100.0 * init_balance;
+    // =========================================================================
+    // Asymmetric Quote Sizing based on inventory vs target
+    // =========================================================================
+    // The side that REDUCES position gets LARGER size (want more fills)
+    // The side that INCREASES position gets SMALLER size (want fewer fills)
+    //
+    // If leverage > target (too long):  want to sell → larger ask, smaller bid
+    // If leverage < target (too short): want to buy  → larger bid, smaller ask
+    //
+    // Size range: 1% (position-increasing) to 5% (position-reducing)
+    // Scaling: proportional to |leverage - target|
+    // =========================================================================
+    constexpr double MIN_SIZE_PCT = 1.0;   // Position-increasing side
+    constexpr double MAX_SIZE_PCT = 5.0;   // Position-reducing side
+    constexpr double DEVIATION_FOR_MAX = 1.0;  // At 1.0 deviation, use max asymmetry
+    constexpr int NUM_LEVELS = 3;
     
-    return {size_usd, size_usd};
+    double deviation = leverage - target_inventory;  // Positive = too long, Negative = too short
+    double abs_deviation = std::abs(deviation);
+    double t = std::min(abs_deviation / DEVIATION_FOR_MAX, 1.0);  // 0 to 1
+    
+    // Compute asymmetric sizes
+    double reducing_size_pct = MIN_SIZE_PCT + t * (MAX_SIZE_PCT - MIN_SIZE_PCT);  // 1% to 5%
+    double increasing_size_pct = MIN_SIZE_PCT;  // Always 1% for position-increasing side
+    
+    double bid_size_pct, ask_size_pct;
+    if (deviation > 0) {
+        // Too long: want to SELL → larger ask, smaller bid
+        bid_size_pct = increasing_size_pct;
+        ask_size_pct = reducing_size_pct;
+    } else if (deviation < 0) {
+        // Too short: want to BUY → larger bid, smaller ask
+        bid_size_pct = reducing_size_pct;
+        ask_size_pct = increasing_size_pct;
+    } else {
+        // On target: equal sizes at minimum
+        bid_size_pct = MIN_SIZE_PCT;
+        ask_size_pct = MIN_SIZE_PCT;
+    }
+    
+    // Per-level sizes
+    double bid_size_usd = (bid_size_pct / NUM_LEVELS) / 100.0 * init_balance;
+    double ask_size_usd = (ask_size_pct / NUM_LEVELS) / 100.0 * init_balance;
+    
+    return {bid_size_usd, ask_size_usd};
 }
 
 void Strategy::quote(const RLAction& action,
@@ -304,7 +359,7 @@ void Strategy::quote(const RLAction& action,
     // - More realistic market making
     // ============================================================================
     
-    constexpr int NUM_LEVELS = 10;
+    constexpr int NUM_LEVELS = 3;
     
     // Validate RL outputs are in expected range [0, 1]
     assert(action.bid_spread >= -0.0001 && action.bid_spread <= 1.0001);
@@ -335,7 +390,7 @@ void Strategy::quote(const RLAction& action,
     updateVolatility(mid_price);
     
     auto [base_bid_price, base_ask_price] = computeQuotePrices(action, mid_price, leverage, tick_size);
-    auto [level_size, _] = computeQuoteSizes(action, initBalance);
+    auto [bid_size_usd, ask_size_usd] = computeQuoteSizes(action, initBalance, leverage, target_inventory_ema);
     
     double bid_spread_from_res = mid_price - base_bid_price;  // Positive value
     double ask_spread_from_res = base_ask_price - mid_price;  // Positive value
@@ -347,14 +402,15 @@ void Strategy::quote(const RLAction& action,
     // Cancel existing orders before placing new ones
     exchange.cancelOrders();
     
-    // Convert size to trade amount
-    level_size = instrument.getTradeAmount(level_size, mid_price);
+    // Convert sizes to trade amounts (asymmetric based on inventory deviation)
+    double bid_level_size = instrument.getTradeAmount(bid_size_usd, mid_price);
+    double ask_level_size = instrument.getTradeAmount(ask_size_usd, mid_price);
     
     // Check position limits - prevent placing orders that would push leverage beyond limits
     // Use stricter check: only place if current leverage is well within limits (95% threshold)
     // This prevents fills from pushing leverage too far beyond the limit
-    bool can_place_bids = (level_size >= minAmount) && (leverage < config.max_leverage * 2.95);
-    bool can_place_asks = (level_size >= minAmount) && (leverage > -config.max_leverage * 2.95);
+    bool can_place_bids = (bid_level_size >= minAmount) && (leverage < config.max_leverage * 2.95);
+    bool can_place_asks = (ask_level_size >= minAmount) && (leverage > -config.max_leverage * 2.95);
     
     // Store first level prices for diagnostics
     last_mid_price = mid_price;
@@ -381,14 +437,14 @@ void Strategy::quote(const RLAction& action,
             ask_price = best_bid + tick_size * level;
         }
         
-        // Place bid at this level
+        // Place bid at this level (asymmetric size based on inventory deviation)
         if (can_place_bids && bid_price > 0) {
-            this->exchange.quote(std::to_string(++order_id), OrderSide::BUY, bid_price, level_size);
+            this->exchange.quote(std::to_string(++order_id), OrderSide::BUY, bid_price, bid_level_size);
         }
         
-        // Place ask at this level
+        // Place ask at this level (asymmetric size based on inventory deviation)
         if (can_place_asks && ask_price > 0) {
-            this->exchange.quote(std::to_string(++order_id), OrderSide::SELL, ask_price, level_size);
+            this->exchange.quote(std::to_string(++order_id), OrderSide::SELL, ask_price, ask_level_size);
         }
 
         if (leverage >= 1.0 || leverage <= -1.0) {

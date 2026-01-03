@@ -29,7 +29,7 @@ class HierarchicalConfig:
     # Base spread in basis points (1 bps = 0.01% of mid price)
     # This is the MINIMUM spread - agent can only widen, not tighten below this
     # For BTC at $100k: 2 bps = $20 total spread
-    base_spread_bps: float = 0.1  # Wider spread to reduce adverse selection (was 1)
+    base_spread_bps: float = 1  # Wider spread to reduce adverse selection (was 1)
     min_size_pct: float = 1
     max_size_pct: float = 25.0
     balance: float = 10000.0

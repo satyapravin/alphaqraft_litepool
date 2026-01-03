@@ -25,9 +25,10 @@ class MMAgent(nn.Module):
     
     Input observations (42 dims): All observations (shared with Inventory agent)
     
-    Output (2 actions):
-        - bid_spread: [0, 1] → adds to base spread (higher = wider spread)
-        - ask_spread: [0, 1] → adds to base spread (higher = wider spread)
+    Output (3 actions):
+        - bid_spread: [0, 1] → multiplier on base spread for bid side
+        - ask_spread: [0, 1] → multiplier on base spread for ask side
+        - base_spread_bps: [0.5, 3] → learned base spread width in basis points
     """
     
     def __init__(
@@ -63,11 +64,12 @@ class MMAgent(nn.Module):
             batch_first=True,
         )
         
-        # Actor head: 2 actions use Beta distribution [0, 1]
-        # - bid_spread, ask_spread: spread multipliers
+        # Actor head: 3 actions use Beta distribution [0, 1]
+        # - bid_spread, ask_spread: spread multipliers [0, 1]
+        # - base_spread_bps: base spread in bps [0.5, 3] (scaled from [0, 1])
         # Output mean (via sigmoid) and concentration parameter (via softplus)
-        self.action_mean = nn.Linear(lstm_hidden, 2)  # bid_spread, ask_spread
-        self.action_concentration = nn.Linear(lstm_hidden, 2)  # concentration for Beta
+        self.action_mean = nn.Linear(lstm_hidden, 3)  # bid_spread, ask_spread, base_spread_bps
+        self.action_concentration = nn.Linear(lstm_hidden, 3)  # concentration for Beta
         
         # Critic head
         self.critic = nn.Linear(lstm_hidden, 1)
@@ -93,13 +95,15 @@ class MMAgent(nn.Module):
                     nn.init.orthogonal_(m.weight, gain=1.0)
                 if m.bias is not None:
                     if 'action_mean' in name:
-                        # Initialize: [bid_spread, ask_spread]
+                        # Initialize: [bid_spread, ask_spread, base_spread_bps]
                         # Spreads: small random for exploration (~0.4-0.6 after sigmoid)
+                        # base_spread_bps: bias toward 0.5 (1 bps after scaling)
                         nn.init.normal_(m.bias, mean=0.0, std=0.1)
                     elif 'action_concentration' in name:
-                        # Initialize concentration bias to encourage exploration
-                        # softplus(-1.0) + 1.0 ≈ 1.31 (more exploration)
-                        nn.init.constant_(m.bias, -1.0)
+                        # Initialize concentration to get UNIFORM distribution (entropy = 0)
+                        # For mean = 0.5, we need concentration = 2.0 to get α=1, β=1 (uniform)
+                        # softplus(0.54) + 1.0 ≈ 2.0
+                        nn.init.constant_(m.bias, 0.54)
                     else:
                         nn.init.zeros_(m.bias)
             elif isinstance(m, nn.LSTM):
@@ -123,8 +127,8 @@ class MMAgent(nn.Module):
             hidden: LSTM hidden state tuple (h, c)
             
         Returns:
-            action_mean: Mean of 2 actions [batch, 2] (bid_spread, ask_spread)
-            action_concentration: Concentration for Beta distribution [batch, 2]
+            action_mean: Mean of 3 actions [batch, 3] (bid_spread, ask_spread, base_spread_bps)
+            action_concentration: Concentration for Beta distribution [batch, 3]
             value: State value [batch, 1]
             hidden: Updated LSTM hidden state
         """
@@ -158,8 +162,8 @@ class MMAgent(nn.Module):
         # Take last timestep
         last_out = lstm_out[:, -1, :]  # [batch, lstm_hidden]
         
-        # Actor output: 2 actions [0, 1] using Beta distribution
-        # [bid_spread, ask_spread]
+        # Actor output: 3 actions [0, 1] using Beta distribution
+        # [bid_spread, ask_spread, base_spread_bps (scaled)]
         action_mean = torch.sigmoid(self.action_mean(last_out))  # [0, 1]
         # Concentration parameter: clamp to [1.0, 2.0] for non-negative entropy
         action_concentration = torch.clamp(F.softplus(self.action_concentration(last_out)) + 1.0, min=1.0, max=2.0)
@@ -192,7 +196,7 @@ class MMAgent(nn.Module):
             temperature: Scale concentration (0.0 = deterministic, 1.0 = full exploration)
             
         Returns:
-            action: Actions [batch, 2] (bid_spread, ask_spread)
+            action: Actions [batch, 3] (bid_spread, ask_spread, base_spread_bps)
             log_prob: Log probability [batch, 1]
             value: State value [batch, 1]
             hidden: Updated hidden state
@@ -201,10 +205,13 @@ class MMAgent(nn.Module):
         
         if temperature == 0.0 or deterministic:
             # Fully deterministic: use means directly
+            # Scale base_spread_bps from [0, 1] to [0.5, 3]
+            action = action_mean.clone()
+            action[:, 2] = action[:, 2] * 2.5 + 0.5  # base_spread_bps: [0, 1] -> [0.5, 3]
             log_prob = torch.zeros(action_mean.shape[0], 1, device=action_mean.device)
-            return action_mean, log_prob, value, hidden
+            return action, log_prob, value, hidden
         
-        # Beta distribution for 2 actions
+        # Beta distribution for 3 actions
         effective_concentration = action_concentration / (temperature + 1e-8)
         alpha = action_mean * effective_concentration
         beta_param = (1.0 - action_mean) * effective_concentration
@@ -212,8 +219,14 @@ class MMAgent(nn.Module):
         beta_param = torch.clamp(beta_param, min=0.1)
         
         action_dist = torch.distributions.Beta(alpha, beta_param)
-        action = action_dist.sample()
-        log_prob = action_dist.log_prob(action).sum(dim=-1, keepdim=True)
+        action_raw = action_dist.sample()  # [0, 1] for all actions
+        log_prob = action_dist.log_prob(action_raw).sum(dim=-1, keepdim=True)
+        
+        # Scale base_spread_bps from [0, 1] to [0.5, 3]
+        # Jacobian correction: log(2.5) for the scaling (affine transform y = 2.5x + 0.5)
+        action = action_raw.clone()
+        action[:, 2] = action_raw[:, 2] * 2.5 + 0.5
+        log_prob = log_prob - torch.log(torch.tensor(2.5, device=log_prob.device))
         
         return action, log_prob, value, hidden
     
@@ -228,7 +241,7 @@ class MMAgent(nn.Module):
         
         Args:
             obs: Full observations [batch, obs_dim]
-            actions: Actions taken [batch, 2] (bid_spread, ask_spread)
+            actions: Actions taken [batch, 3] (bid_spread, ask_spread, base_spread_bps)
             hidden: LSTM hidden state
             
         Returns:
@@ -238,18 +251,25 @@ class MMAgent(nn.Module):
         """
         action_mean, action_concentration, value, _ = self.forward(obs, hidden)
         
-        # Beta distribution for 2 actions
+        # Beta distribution for 3 actions
         alpha = action_mean * action_concentration
         beta_param = (1.0 - action_mean) * action_concentration
         alpha = torch.clamp(alpha, min=0.1)
         beta_param = torch.clamp(beta_param, min=0.1)
         
+        # Unscale base_spread_bps from [0.5, 3] back to [0, 1] for Beta distribution
+        actions_unscaled = actions.clone()
+        actions_unscaled[:, 2] = (actions[:, 2] - 0.5) / 2.5
+        
         # Clamp actions to valid Beta range
-        actions_clamped = torch.clamp(actions, min=1e-6, max=1.0 - 1e-6)
+        actions_clamped = torch.clamp(actions_unscaled, min=1e-6, max=1.0 - 1e-6)
         
         action_dist = torch.distributions.Beta(alpha, beta_param)
         log_prob = action_dist.log_prob(actions_clamped).sum(dim=-1, keepdim=True)
         entropy = action_dist.entropy().sum(dim=-1, keepdim=True)
+        
+        # Jacobian correction for base_spread_bps scaling (y = 2.5x + 0.5)
+        log_prob = log_prob - torch.log(torch.tensor(2.5, device=log_prob.device))
         
         return log_prob, entropy, value
     

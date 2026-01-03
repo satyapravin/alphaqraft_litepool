@@ -110,11 +110,11 @@ class RlTraderEnvFns {
 
   template <typename Config>
   static decltype(auto) ActionSpec(const Config& conf) {
-    // 4-action space: bid_spread, ask_spread, target_inventory, risk_aversion
-    // MM agent: bid_spread [0,1], ask_spread [0,1]
-    // Inv agent: target_inventory [-1,1], risk_aversion [0,1]
-    return MakeDict("action"_.Bind(Spec<float>({4}, {{  0.,  0., -1.,  0.0 },
-                                                     {  1.,  1.,  1.,  0.1 }})));
+    // 5-action space: bid_spread, ask_spread, base_spread_bps, target_inventory, risk_aversion
+    // MM agent: bid_spread [0,1], ask_spread [0,1], base_spread_bps [0.5,3]
+    // Inv agent: target_inventory [-1,1], risk_aversion [0,0.1]
+    return MakeDict("action"_.Bind(Spec<float>({5}, {{  0.,  0., 0.5, -1.,  0.0 },
+                                                     {  1.,  1., 3.0,  1.,  0.1 }})));
   }
 };
 
@@ -306,13 +306,14 @@ class RlTraderEnv : public Env<RlTraderEnvSpec> {
       
       ++step_count;  // Keep counter for potential future use 
       RLTrader::RLAction action;
-      // 4-action space: bid_spread, ask_spread, target_inventory, risk_aversion
-      // MM agent controls: bid_spread [0,1], ask_spread [0,1]
-      // Inv agent controls: target_inventory [-1,1], risk_aversion [0,1]
+      // 5-action space: bid_spread, ask_spread, base_spread_bps, target_inventory, risk_aversion
+      // MM agent controls: bid_spread [0,1], ask_spread [0,1], base_spread_bps [0.5,3]
+      // Inv agent controls: target_inventory [-1,1], risk_aversion [0,0.1]
       action.bid_spread       = static_cast<double>(action_dict["action"_][0]);
       action.ask_spread       = static_cast<double>(action_dict["action"_][1]);
-      action.target_inventory = static_cast<double>(action_dict["action"_][2]);
-      action.risk_aversion    = static_cast<double>(action_dict["action"_][3]);
+      action.base_spread_bps  = static_cast<double>(action_dict["action"_][2]);
+      action.target_inventory = static_cast<double>(action_dict["action"_][3]);
+      action.risk_aversion    = static_cast<double>(action_dict["action"_][4]);
       
       // Update target inventory and risk aversion (direct assignment, no smoothing)
       strategy_ptr->updateTargetInventory(action.target_inventory, action.risk_aversion);

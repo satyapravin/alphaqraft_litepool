@@ -118,13 +118,12 @@ class InventoryAgent(nn.Module):
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)  # sigmoid(0) = 0.5 (moderate risk)
                 elif 'target_inv_concentration' in name or 'risk_aversion_concentration' in name:
-                    # Lower initial concentration = higher variance = more exploration
-                    # Start with MINIMUM concentration for maximum exploration of both directions
+                    # Initialize concentration to get UNIFORM distribution (entropy = 0)
+                    # For mean = 0.5, we need concentration = 2.0 to get α=1, β=1 (uniform)
+                    # softplus(0.54) + 1.0 ≈ 1.0 + 1.0 = 2.0
                     nn.init.orthogonal_(m.weight, gain=0.3)  # Low gain to keep concentration stable
                     if m.bias is not None:
-                        # softplus(-2.0) + 1.0 ≈ 0.13 + 1.0 = 1.13 (near minimum, max exploration)
-                        # This ensures Beta distribution is U-shaped, exploring extremes
-                        nn.init.constant_(m.bias, -2.0)
+                        nn.init.constant_(m.bias, 0.54)  # softplus(0.54) + 1.0 ≈ 2.0 → uniform
                 elif 'focused_encoder' in name:
                     # Focused encoder: standard initialization
                     nn.init.orthogonal_(m.weight, gain=1.0)
@@ -132,8 +131,8 @@ class InventoryAgent(nn.Module):
                         nn.init.zeros_(m.bias)
                 elif 'critic' in name:
                     nn.init.orthogonal_(m.weight, gain=0.01)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
                 else:
                     # Hidden layers: use standard gain
                     nn.init.orthogonal_(m.weight, gain=1.0)
@@ -371,17 +370,14 @@ class InventoryAgent(nn.Module):
         # Total Jacobian = 2 * target_range * 0.1 = 0.2 * target_range
         log_prob = (target_log_prob + risk_log_prob).sum(dim=-1, keepdim=True) - torch.log(torch.tensor(0.2 * self.target_range, device=obs.device))
         
-        # Entropy: for transformed variable y = a*x + b, H(y) = H(x) + log|a|
-        # target_inventory: |a| = 2 * target_range
-        # risk_aversion: |a| = 0.1
-        # Total Jacobian correction = log(2 * target_range) + log(0.1) = log(0.2 * target_range)
-        # Beta entropy CAN be negative for concentrated distributions - don't clamp, keep gradient signal
+        # Entropy: use RAW Beta entropy without Jacobian correction
+        # The Jacobian correction is a constant offset that doesn't reflect exploration
+        # For PPO entropy bonus, we care about the SHAPE of the distribution, not the absolute value
+        # Beta entropy CAN be negative for concentrated distributions - that's fine
         target_entropy = target_dist.entropy()
         risk_entropy = risk_dist.entropy()
-        # Add Jacobian correction for both transformations
-        # log(2 * target_range) + log(0.1) = log(0.2 * target_range)
-        jacobian_correction = torch.log(torch.tensor(0.2 * self.target_range, device=obs.device))
-        entropy = (target_entropy + risk_entropy).sum(dim=-1, keepdim=True) + jacobian_correction
+        # Sum entropies without Jacobian - this reflects actual exploration behavior
+        entropy = (target_entropy + risk_entropy).sum(dim=-1, keepdim=True)
         
         return log_prob, entropy, value
     

@@ -33,13 +33,16 @@ namespace RLTrader {
         double base_spread_bps = 5.0;         // Base spread in basis points (5 bps = 0.05%)
     };
 
-    // RL action outputs - 4-action space (bid_spread, ask_spread, target_inventory, risk_aversion)
+    // RL action outputs - 5-action space (bid_spread, ask_spread, base_spread_bps, target_inventory, risk_aversion)
     struct RLAction {
         // Bid spread control: [0, 1] → multiplier on base spread for bid side
         double bid_spread = 0.0;
         
         // Ask spread control: [0, 1] → multiplier on base spread for ask side
         double ask_spread = 0.0;
+        
+        // Base spread in basis points: [0, 2] → learned base spread width
+        double base_spread_bps = 1.0;
         
         // Target inventory: [-1, 1] → scaled to ±target_range target leverage
         // Positive = target long position, Negative = target short position
@@ -93,10 +96,12 @@ namespace RLTrader {
             double leverage,
             double tick_size);
         
-        // Compute order sizes
+        // Compute order sizes - dynamic based on deviation from target
         virtual std::pair<double, double> computeQuoteSizes(
             const RLAction& action,
-            double init_balance);
+            double init_balance,
+            double leverage,
+            double target_inventory);
         
         // Update volatility estimate from mid-price changes
         void updateVolatility(double mid_price);

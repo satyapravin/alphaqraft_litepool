@@ -546,8 +546,8 @@ class HierarchicalPPOTrainer:
                 
                 # Minibatch tensors
                 obs_tensor = torch.from_numpy(flat_obs[mb_indices.cpu().numpy()]).float().to(self.device)
-                # MM agent needs first 2 actions (bid_spread, ask_spread)
-                mm_actions_tensor = torch.from_numpy(flat_actions[mb_indices.cpu().numpy()][:, 0:2]).float().to(self.device)
+                # MM agent needs first 3 actions (bid_spread, ask_spread, base_spread_bps)
+                mm_actions_tensor = torch.from_numpy(flat_actions[mb_indices.cpu().numpy()][:, 0:3]).float().to(self.device)
                 inv_actions_tensor = torch.from_numpy(flat_inv_actions[mb_indices.cpu().numpy()]).float().to(self.device)
                 old_log_probs_mm = torch.from_numpy(flat_log_probs_mm[mb_indices.cpu().numpy()]).float().to(self.device)
                 old_log_probs_inv = torch.from_numpy(flat_log_probs_inv[mb_indices.cpu().numpy()]).float().to(self.device)
@@ -849,7 +849,7 @@ class HierarchicalPPOTrainer:
         print(f"Steps per epoch: {self.config.n_steps}")
         print(f"Total epochs: {self.config.total_epochs}")
         print(f"Observations: 42 signals (13 market + 4 AMM + 8 trade + 11 agent state + 4 quote + 2 trend/vol)")
-        print(f"Actions: 4 (bid_spread, ask_spread, target_inventory, risk_aversion)")
+        print(f"Actions: 5 (bid_spread, ask_spread, base_spread_bps, target_inventory, risk_aversion)")
         print(f"Requote: always requote every step (no agent control)")
         print("="*80 + "\n")
         
